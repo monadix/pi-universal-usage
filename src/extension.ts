@@ -739,14 +739,18 @@ export class UniversalUsageHost {
   }
 
   /**
-   * May this selection event still define the host's binding? The live selection
-   * is authoritative: an event for a model Pi has already replaced describes no
-   * reachable route, and handling it would cancel the newer selection's work and
-   * clear its accepted view before the post-resolution route check could reject
-   * the event. An equivalent selection object (same logical model, same routing)
-   * is still current and is adopted normally.
+   * May this selection event still define the host's binding? A disposed host is
+   * done: Pi invalidates the old runner's context after `session_shutdown`, so its
+   * guarded getters throw, and an event an earlier handler already started may
+   * still reach this handler afterwards. Then the live selection is authoritative:
+   * an event for a model Pi has already replaced describes no reachable route,
+   * and handling it would cancel the newer selection's work and clear its accepted
+   * view before the post-resolution route check could reject the event. An
+   * equivalent selection object (same logical model, same routing) is still
+   * current and is adopted normally.
    */
   private selectionEventHolds(model: Model<any>, ctx: ExtensionContext): boolean {
+    if (this.disposed) return false;
     return this.routeHolds(bindSelection(model), ctx);
   }
 

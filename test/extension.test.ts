@@ -2976,6 +2976,59 @@ describe("host routing binding", () => {
     host.shutdown(fake.ctx);
   });
 
+  it("ignores a held selection event after shutdown invalidated its context", async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let held = false;
+    const modelA = fakeModel({ provider: "provider-a", id: "chat-a", baseUrl: "https://a.example.com/v1" });
+    const modelB = fakeModel({ provider: "provider-b", id: "chat-b", baseUrl: "https://b.example.com/v1" });
+    const { fetchImpl, calls } = sequenceFetch([codexBody(12)]);
+    const { pi, registry } = buildHost({
+      fetchImpl,
+      models: [modelA, modelB],
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false }),
+    });
+    const selection = { current: modelA };
+    const fake = fakeContext({ modelRef: selection, registry });
+    await pi.emit("session_start", { type: "session_start" }, fake.ctx);
+
+    // An earlier extension holds B's selection event across a shutdown.
+    const handlers = pi.handlers.get("model_select");
+    assert.ok(handlers);
+    handlers.unshift(async (event: { model: ReturnType<typeof fakeModel> }) => {
+      if (event.model !== modelB) return;
+      held = true;
+      await gate;
+    });
+    selection.current = modelB;
+    const pending = pi.emit("model_select", { type: "model_select", model: modelB, previousModel: modelA, source: "set" }, fake.ctx);
+    await waitFor(() => held);
+
+    await pi.emit("session_shutdown", { type: "session_shutdown" }, fake.ctx);
+    // Pi invalidates the old runner's context after shutdown: its guarded getters
+    // now throw, and the emission that already started still resumes.
+    let modelReads = 0;
+    Object.defineProperty(fake.ctx, "model", {
+      get() {
+        modelReads += 1;
+        throw new Error("STALE_CONTEXT_MODEL");
+      },
+      configurable: true,
+    });
+    const statusesAfterShutdown = fake.statuses.length;
+
+    release?.();
+    await pending;
+
+    assert.equal(modelReads, 0, "a disposed host never reads the invalidated context");
+    assert.equal(fake.statuses.length, statusesAfterShutdown, "no footer is painted");
+    assert.equal(pi.entries.length + fake.widgets.length + fake.notifications.length, 0, "nothing is published");
+    assert.equal(calls.length, 0, "no work is started");
+  });
+
   it("keeps the captured route and resolver input when the selected model is mutated in place", async () => {
     const model = fakeModel({
       provider: "cpa",
