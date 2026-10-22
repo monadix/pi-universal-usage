@@ -2946,6 +2946,36 @@ describe("host routing binding", () => {
     host.shutdown(fake.ctx);
   });
 
+  it("still adopts an equivalent selection event object", async () => {
+    const active = fakeModel({
+      provider: "cpa",
+      id: "chat",
+      baseUrl: "https://a.example/v1",
+      headers: { Authorization: "Bearer synthetic-a", "ChatGPT-Account-Id": "a" },
+    });
+    // The live selection and the event describe the same route with recased,
+    // reordered headers, so the event is current although it is another object.
+    const live = modelWithHeaders(active, { "chatgpt-account-id": "a", authorization: "Bearer synthetic-a" });
+    const { fetchImpl, calls } = sequenceFetch([codexBody(21)]);
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [active, live],
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false }),
+    });
+    const fake = fakeContext({ modelRef: { current: live }, registry });
+    await pi.emit("session_start", { type: "session_start" }, fake.ctx);
+
+    await pi.emit("model_select", { type: "model_select", model: active, previousModel: live, source: "set" }, fake.ctx);
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /automatic refresh is off/);
+
+    await host.refreshActive(fake.ctx, { reason: "interval" });
+    assert.equal(calls.length, 1);
+    assert.match(calls[0]?.url ?? "", /a\.example/);
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /21%/);
+    host.shutdown(fake.ctx);
+  });
+
   it("keeps the captured route and resolver input when the selected model is mutated in place", async () => {
     const model = fakeModel({
       provider: "cpa",
