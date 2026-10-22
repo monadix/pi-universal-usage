@@ -317,6 +317,10 @@ export class UsageMonitor {
 
     const plan = planEndpoints(target, provider, config);
     if (plan.kind === "none") {
+      // A forced `/usage` refresh must not erase a known passive measurement
+      // just because this target has no requestable endpoint.
+      const retained = this.retainPassiveSnapshot(target, entry, plan.notice);
+      if (retained !== undefined) return retained;
       const snapshot = emptySnapshot(target, plan.status, this.now(), plan.notice);
       entry.snapshot = snapshot;
       entry.nextAttemptAt = this.now() + AUTH_FAILURE_BACKOFF_MS;
@@ -549,6 +553,23 @@ export class UsageMonitor {
     entry.nextAttemptAt = this.now() + (lastStatus === "unsupported" ? AUTH_FAILURE_BACKOFF_MS : FAILURE_BACKOFF_MS);
     entry.snapshot = failureSnapshot(target, lastStatus, this.now(), lastError, entry.nextAttemptAt);
     return entry.snapshot;
+  }
+
+  /**
+   * When no endpoint can be requested, the logical model that produced a passive
+   * header measurement keeps it, with its original timestamp so its age stays
+   * honest; the endpoint limitation becomes its notice when it has none. Another
+   * model's passive data is never reused, and an explicit disable is handled
+   * before planning so it never reaches here.
+   */
+  private retainPassiveSnapshot(target: ResolvedTarget, entry: Entry, notice: string): TargetSnapshot | undefined {
+    const existing = entry.snapshot;
+    if (existing === undefined || existing.source !== "headers") return undefined;
+    if (existing.identity.modelId !== target.identity.modelId) return undefined;
+    const retained: TargetSnapshot = existing.notice === undefined ? { ...existing, notice } : existing;
+    entry.snapshot = retained;
+    entry.nextAttemptAt = this.now() + AUTH_FAILURE_BACKOFF_MS;
+    return retained;
   }
 
   /**

@@ -211,7 +211,10 @@ creating a 1 ms timer.
   to one hour. An optional sibling endpoint (for example OpenRouter account
   credits) keeps its own retry deadline after a 429 or 503, so it is not
   re-requested early while the required result keeps refreshing. `/usage` forces
-  a refresh.
+  a refresh; when the target has no requestable endpoint, that forced refresh
+  keeps the same model's passive header measurement with its original timestamp
+  (adding the endpoint limitation as a notice when it has none), so asking for
+  the detailed report cannot erase known data.
 - Concurrent refreshes for the same identity share one request sequence. The
   active provider is re-resolved before each refresh, so rotated credentials and
   changed auth base URLs take effect without a restart.

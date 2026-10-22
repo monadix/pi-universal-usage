@@ -335,6 +335,66 @@ describe("UsageMonitor", () => {
     assert.equal(calls.length, 0);
   });
 
+  it("keeps a same-model passive measurement when a forced refresh has no endpoint", async () => {
+    const target = await targetFor({ provider: "openai", baseUrl: "https://api.openai.com/v1" });
+    const { fetchImpl, calls } = sequenceFetch([textResponse("unused")]);
+    const monitor = monitorWith(fetchImpl);
+    const passive = monitor.applyPassiveHeaders(
+      target,
+      { "x-ratelimit-limit-requests": "100", "x-ratelimit-remaining-requests": "25" },
+      200,
+      config,
+    );
+    assert.equal(passive?.metrics[0]?.usedPercent, 75);
+
+    // `/usage` forces a refresh; with no requestable endpoint the known
+    // measurement must survive with its original timestamp.
+    const forced = await monitor.refresh(target, undefined, config, { force: true });
+    assert.equal(forced.source, "headers");
+    assert.equal(forced.status, "ok");
+    assert.equal(forced.fetchedAt, passive?.fetchedAt);
+    assert.deepEqual(forced.metrics, passive?.metrics);
+    assert.match(forced.notice ?? "", /no subscription quota endpoint is requested/);
+    assert.equal(await monitor.refresh(target, undefined, config), forced);
+    assert.equal(calls.length, 0);
+  });
+
+  it("does not serve another model's passive measurement when no endpoint is requestable", async () => {
+    const modelA = fakeModel({ provider: "openai", id: "chat-a", baseUrl: "https://api.openai.com/v1" });
+    const modelB = fakeModel({ provider: "openai", id: "chat-b", baseUrl: "https://api.openai.com/v1" });
+    const registry = fakeRegistry({ apiKey: "test-key" }, [modelA, modelB]);
+    const resolvedA = await resolveTarget(registry, modelA, { allowInsecureHttp: true });
+    const resolvedB = await resolveTarget(registry, modelB, { allowInsecureHttp: true });
+    assert.equal(resolvedA.ok && resolvedB.ok, true);
+    if (!resolvedA.ok || !resolvedB.ok) return;
+    assert.equal(resolvedA.target.identity.key, resolvedB.target.identity.key);
+
+    const monitor = monitorWith(sequenceFetch([textResponse("unused")]).fetchImpl);
+    const passiveA = monitor.applyPassiveHeaders(
+      resolvedA.target,
+      { "x-codex-secondary-used-percent": "90" },
+      200,
+      config,
+    );
+    assert.equal(passiveA?.metrics[0]?.usedPercent, 90);
+
+    const forcedB = await monitor.refresh(resolvedB.target, undefined, config, { force: true });
+    assert.deepEqual(forcedB.metrics, []);
+    assert.notEqual(forcedB.status, "ok");
+  });
+
+  it("does not retain a passive measurement past an explicit disable", async () => {
+    const target = await targetFor({ provider: "openai", baseUrl: "https://api.openai.com/v1" });
+    const { fetchImpl, calls } = sequenceFetch([textResponse("unused")]);
+    const monitor = monitorWith(fetchImpl);
+    monitor.applyPassiveHeaders(target, { "x-ratelimit-limit-requests": "100", "x-ratelimit-remaining-requests": "25" }, 200, config);
+    const disabled = await monitor.refresh(target, { enabled: false }, config, { force: true });
+    assert.equal(disabled.status, "unsupported");
+    assert.match(disabled.notice ?? "", /disabled/);
+    assert.deepEqual(disabled.metrics, []);
+    assert.equal(calls.length, 0);
+  });
+
   it("reuses an account-level endpoint snapshot across models of one provider", async () => {
     const modelA = fakeModel({ provider: "deepseek", id: "chat-a", baseUrl: "https://api.deepseek.com" });
     const modelB = fakeModel({ provider: "deepseek", id: "chat-b", baseUrl: "https://api.deepseek.com" });
