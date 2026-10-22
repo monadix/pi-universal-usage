@@ -211,10 +211,14 @@ describe("pi extension wiring", () => {
     const modelA = fakeModel({ provider: "provider-a", id: "chat-a", baseUrl: "https://a.example.com/v1" });
     const modelB = fakeModel({ provider: "provider-b", id: "chat-b", baseUrl: "https://b.example.com/v1" });
     const { pi, host, registry } = buildHost({ fetchImpl, models: [modelA, modelB] });
-    const fakeA = fakeContext({ model: modelA, registry });
+    // Pi installs the new selection before it emits model_select, so the live
+    // getter already reads modelB when the handler runs.
+    const selection = { current: modelA };
+    const fakeA = fakeContext({ modelRef: selection, registry });
     await pi.emit("session_start", { type: "session_start" }, fakeA.ctx);
     await waitFor(() => fakeA.statuses.length > 0);
 
+    selection.current = modelB;
     await pi.emit("model_select", { type: "model_select", model: modelB, previousModel: modelA, source: "set" }, fakeA.ctx);
     const afterSwitch = fakeA.statuses[fakeA.statuses.length - 1];
     assert.match(String(afterSwitch), /provider-b/);
@@ -518,8 +522,10 @@ describe("pi extension wiring", () => {
       models: [modelA, modelB],
       config: normalizeConfig({ refreshSeconds: 300, autoRefresh: false }),
     });
-    const fake = fakeContext({ model: modelA, registry });
+    const selection = { current: modelA };
+    const fake = fakeContext({ modelRef: selection, registry });
     await pi.emit("session_start", { type: "session_start" }, fake.ctx);
+    selection.current = modelB;
     await pi.emit("model_select", { type: "model_select", model: modelB, previousModel: modelA, source: "set" }, fake.ctx);
     await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal(calls.length, 0);
@@ -579,9 +585,11 @@ describe("pi extension wiring", () => {
     const modelA = fakeModel({ provider: "cpa", id: "chat-a", baseUrl: "http://localhost:8317/v1" });
     const modelB = fakeModel({ provider: "cpa", id: "chat-b", baseUrl: "http://localhost:8317/v1" });
     const { pi, host, registry } = buildHost({ fetchImpl, models: [modelA, modelB] });
-    const fake = fakeContext({ model: modelA, registry });
+    const selection = { current: modelA };
+    const fake = fakeContext({ modelRef: selection, registry });
     await pi.emit("session_start", { type: "session_start" }, fake.ctx);
     await waitFor(() => call === 1);
+    selection.current = modelB;
     await pi.emit("model_select", { type: "model_select", model: modelB, previousModel: modelA, source: "set" }, fake.ctx);
     await waitFor(() => call === 2);
     release?.();
@@ -982,11 +990,13 @@ describe("pi extension wiring", () => {
     // Same provider, origin, and credential: only the selected model changed.
     const modelB = fakeModel({ provider: "cpa", id: "chat-b", baseUrl: "http://localhost:8317/v1" });
     const { pi, host, registry, advance } = buildHost({ fetchImpl, models: [modelA, modelB] });
-    const fake = fakeContext({ model: modelA, registry, idle: false });
+    const selection = { current: modelA };
+    const fake = fakeContext({ modelRef: selection, registry, idle: false });
     await pi.emit("session_start", { type: "session_start" }, fake.ctx);
     await waitFor(() => fake.statuses.length > 0);
     await pi.emit("turn_start", { type: "turn_start", turnIndex: 0, timestamp: Date.now() }, fake.ctx);
 
+    selection.current = modelB;
     await pi.emit("model_select", { type: "model_select", model: modelB, previousModel: modelA, source: "set" }, fake.ctx);
     await new Promise((resolve) => setTimeout(resolve, 10));
     const afterSwitch = String(fake.statuses[fake.statuses.length - 1]);
@@ -2733,6 +2743,99 @@ describe("host routing binding", () => {
     assert.equal(calls.length, 0);
     // Neither the failure nor a follow-on request may describe the old route.
     assert.deepEqual(fake.statuses, ["cpa: checking usage..."]);
+    host.shutdown(fake.ctx);
+  });
+
+  it("stops a held request when another model is installed before its selection event", async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const calls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      calls.push(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+      await gate;
+      return codexBody(77);
+    }) as typeof fetch;
+    const modelA = fakeModel({ provider: "cpa", id: "chat-a", baseUrl: "http://a.example.com/v1" });
+    const modelB = fakeModel({ provider: "cpa", id: "chat-b", baseUrl: "http://b.example.com/v1" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [modelA, modelB],
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false }),
+    });
+    const selection = { current: modelA };
+    const fake = fakeContext({ modelRef: selection, registry, idle: false });
+    await host.activate(fake.ctx, modelA, { refresh: false });
+    await pi.emit("turn_start", { type: "turn_start", turnIndex: 0, timestamp: Date.now() }, fake.ctx);
+    const pending = host.report(fake.ctx as unknown as ExtensionCommandContext, "");
+    await waitFor(() => calls.length === 1);
+    const statusesBefore = fake.statuses.length;
+
+    // Pi installs the new selection before it emits model_select and awaits an
+    // earlier extension handler first, so this host has not seen the event yet.
+    selection.current = modelB;
+    release?.();
+    await pending;
+
+    assert.equal(calls.length, 1, "the replaced selection issues no follow-on request");
+    assert.equal(fake.statuses.length, statusesBefore, "the replaced selection paints no footer");
+    assert.equal(pi.entries.length + fake.widgets.length + fake.notifications.length, 0, "it publishes no report");
+
+    // The turn that began under A cannot lend its headers to the installed B.
+    await pi.emit(
+      "after_provider_response",
+      { status: 200, headers: { "x-codex-secondary-used-percent": "90", "x-codex-secondary-window-minutes": "10080" } },
+      fake.ctx,
+    );
+    assert.equal(fake.statuses.length, statusesBefore, "no passive measurement is attributed");
+
+    // The event that follows still adopts the installed selection and its work.
+    await pi.emit("model_select", { type: "model_select", model: modelB, previousModel: modelA, source: "set" }, fake.ctx);
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /automatic refresh is off/);
+    await host.refreshActive(fake.ctx, { reason: "interval" });
+    assert.equal(calls.length, 2);
+    assert.match(calls[1] ?? "", /b\.example\.com/);
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /77%/);
+    host.shutdown(fake.ctx);
+  });
+
+  it("does not adopt a held credential resolution for a model that is no longer selected", async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let held = false;
+    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
+      if (model.id === "chat-a" && !held) {
+        held = true;
+        return { apiKey: "key-a", source: "stored", wait: gate };
+      }
+      return { apiKey: "key-b", source: "stored" };
+    };
+    const { fetchImpl, calls } = sequenceFetch([codexBody(33)]);
+    const modelA = fakeModel({ provider: "cpa", id: "chat-a", baseUrl: "http://a.example.com/v1" });
+    const modelB = fakeModel({ provider: "cpa", id: "chat-b", baseUrl: "http://b.example.com/v1" });
+    const { pi, host, registry } = buildHost({ fetchImpl, models: [modelA, modelB], auth, timers: false });
+    const selection = { current: modelA };
+    const fake = fakeContext({ modelRef: selection, registry });
+
+    const activation = host.activate(fake.ctx, modelA);
+    await waitFor(() => held);
+    selection.current = modelB;
+    release?.();
+    await activation;
+
+    assert.equal(calls.length, 0, "the replaced selection starts no request");
+    assert.deepEqual(fake.statuses, ["cpa: checking usage..."]);
+
+    // The pending event still activates the model Pi already installed.
+    await pi.emit("model_select", { type: "model_select", model: modelB, previousModel: modelA, source: "set" }, fake.ctx);
+    await host.refreshActive(fake.ctx, { reason: "interval" });
+    assert.equal(calls.length, 1);
+    assert.match(calls[0]?.url ?? "", /b\.example\.com/);
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /33%/);
     host.shutdown(fake.ctx);
   });
 

@@ -714,15 +714,21 @@ export class UniversalUsageHost {
   }
 
   /**
-   * True when the live selection still routes the captured logical model the same
-   * way. Pi suppresses `model_select` when provider, model id, and type are
-   * unchanged, even if the new model object points at another base URL or
-   * routing header, so only the live model getter reveals such a change. A
-   * different logical model emits `model_select` and starts a new generation.
+   * True when the live selection is still the captured logical model and routes
+   * it the same way. Pi suppresses `model_select` when provider, model id, and
+   * type are unchanged, even if the new model object points at another base URL
+   * or routing header, so only the live model getter reveals such a change. A
+   * different logical model does emit `model_select`, but Pi installs it before
+   * the event reaches this host and awaits earlier extension handlers first:
+   * during that window the live getter already reads the new model while this
+   * host still holds the old generation and binding, so a defined selection that
+   * is no longer the captured model revokes the lease instead of waiting for the
+   * switch to be handled.
    */
   private routeHolds(selection: SelectionBinding, ctx: ExtensionContext): boolean {
     const selected = ctx.model;
-    if (selected === undefined || !sameLogicalModel(selected, selection.model)) return true;
+    if (selected === undefined) return true;
+    if (!sameLogicalModel(selected, selection.model)) return false;
     return modelRoutingSignature(selected) === selection.routing;
   }
 
