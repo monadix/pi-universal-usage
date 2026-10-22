@@ -989,4 +989,108 @@ describe("pi extension wiring", () => {
     assert.equal(calls.length, 0);
     host.shutdown(fake.ctx);
   });
+
+  it("stops a report when the active credential rotates while another provider's credential is pending", async () => {
+    let currentKey = "key-a";
+    let holdDeepseek = false;
+    let heldStarted = false;
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const calls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      calls.push(url);
+      if (url.includes("api.deepseek.com")) {
+        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
+      }
+      return codexBody(15);
+    }) as typeof fetch;
+    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
+      if (model.provider === "deepseek" && holdDeepseek) {
+        heldStarted = true;
+        return { apiKey: "test-key", baseUrl: model.baseUrl, wait: gate };
+      }
+      return { apiKey: currentKey, source: "stored" };
+    };
+    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
+    const deepseek = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [cpa, deepseek],
+      auth,
+      config: normalizeConfig({ providers: { deepseek: { enabled: true } } }),
+    });
+    const activation = fakeContext({ model: cpa, registry, mode: "rpc" });
+    await pi.emit("model_select", { type: "model_select", model: cpa, previousModel: undefined, source: "set" }, activation.ctx);
+
+    const fake = fakeContext({ model: cpa, registry });
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    holdDeepseek = true;
+    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => heldStarted);
+    // The active provider's own snapshot is already collected.
+    assert.equal(calls.length, 1);
+
+    // Rotate the active credential; an interval refresh reconciles the new
+    // source without a logical-model switch while the report still waits.
+    currentKey = "key-b";
+    await host.refreshActive(fake.ctx, { reason: "interval" });
+    const callsAfterRotation = calls.length;
+    assert.equal(callsAfterRotation, 2);
+
+    release?.();
+    await pending;
+    assert.equal(calls.length, callsAfterRotation);
+    assert.equal(fake.widgets.length, 0);
+    assert.equal(fake.notifications.length, 0);
+    host.shutdown(activation.ctx);
+  });
+
+  it("stops a report when the active credential rotates while another provider's request is pending", async () => {
+    let currentKey = "key-a";
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const calls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      calls.push(url);
+      if (url.includes("api.deepseek.com")) {
+        await gate;
+        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
+      }
+      return codexBody(15);
+    }) as typeof fetch;
+    const auth = (): FakeAuth => ({ apiKey: currentKey, source: "stored" });
+    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
+    const deepseek = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [cpa, deepseek],
+      auth,
+      config: normalizeConfig({ providers: { deepseek: { enabled: true } } }),
+    });
+    const activation = fakeContext({ model: cpa, registry, mode: "rpc" });
+    await pi.emit("model_select", { type: "model_select", model: cpa, previousModel: undefined, source: "set" }, activation.ctx);
+
+    const fake = fakeContext({ model: cpa, registry });
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => calls.some((url) => url.includes("api.deepseek.com")));
+
+    // The pending provider answer belongs to the rotated source and must not be
+    // published under it.
+    currentKey = "key-b";
+    await host.refreshActive(fake.ctx, { reason: "interval" });
+    release?.();
+    await pending;
+    assert.equal(fake.widgets.length, 0);
+    assert.equal(fake.notifications.length, 0);
+    host.shutdown(activation.ctx);
+  });
 });

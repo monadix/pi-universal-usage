@@ -235,11 +235,13 @@ creating a 1 ms timer.
   the result generation so a late answer cannot paint the new provider. A
   cancelled run never writes its snapshot or retry deadline into the cache a
   replacement refresh now owns.
-- A `/usage` report belongs to the activation generation it started in. When a
-  model switch or shutdown lands while it is still resolving a non-active
-  provider's credential or awaiting a request, the report ends silently: it
-  starts no further provider work and never publishes a cancelled snapshot
-  through a context Pi has already invalidated.
+- A `/usage` report belongs to the activation generation and effective source
+  it anchored after the active provider's own reconciliation. When a model
+  switch, shutdown, or later credential/routing change lands while it is still
+  resolving another provider's credential or awaiting a request, the report ends
+  silently: it starts no further provider work, never mixes measurements from
+  two credential sources, and never publishes through a context Pi has already
+  invalidated.
 - Shutdown (quit, reload, session replacement) aborts requests, clears the
   timer, removes the footer entry, and is idempotent.
 - Background refresh never runs outside TUI mode.

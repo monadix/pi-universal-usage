@@ -359,24 +359,36 @@ export class UniversalUsageHost {
       .filter((part) => part !== "");
 
     const snapshots: TargetSnapshot[] = [];
+    // The effective source this report belongs to. The active provider is
+    // reported first, so its own reconciliation re-anchors the guard; a source
+    // change caused by later work (a rotated credential or a changed same-ID
+    // route) cancels the report instead of publishing older measurements.
+    let source = this.activeSourceToken();
     // The active target is always included; other providers only when the user
     // opted into them before the session (explicit config entries) or asked.
     for (const model of this.reportModels(ctx, requested)) {
-      const snapshot = await this.snapshotForModel(ctx, model, generation);
-      // A model switch or shutdown cancels the report silently: it must not
-      // fetch the next provider or publish measurements from an older session.
-      if (this.reportCancelled(generation)) return;
+      const isActive = this.isCurrentModel(model);
+      const snapshot = await this.snapshotForModel(ctx, model, generation, isActive ? undefined : source);
+      if (isActive) source = this.activeSourceToken();
+      // A model switch, shutdown, or effective source change cancels the report
+      // silently: it must not fetch the next provider or publish measurements
+      // from an older source.
+      if (this.reportCancelled(generation, source)) return;
       if (snapshot !== undefined) snapshots.push(snapshot);
     }
-    if (this.reportCancelled(generation)) return;
+    if (this.reportCancelled(generation, source)) return;
     const active = this.lastSnapshot;
-    if (active !== undefined && !snapshots.some((snapshot) => snapshot.identity.key === active.identity.key)) {
+    const activeTargetKey = this.active?.target?.identity.key;
+    // With no reconciled target the last snapshot is this attempt's failure
+    // state; with one, a key mismatch means it belongs to an older source.
+    const activeIsCurrent = active !== undefined && (activeTargetKey === undefined || active.identity.key === activeTargetKey);
+    if (activeIsCurrent && !snapshots.some((snapshot) => snapshot.identity.key === active.identity.key)) {
       snapshots.unshift(active);
     }
 
     const lines = formatReport(snapshots, this.config, this.now());
     // Pi rejects a stale context after a reload; stop before touching it.
-    if (this.reportCancelled(generation)) return;
+    if (this.reportCancelled(generation, source)) return;
     if (ctx.hasUI) {
       ctx.ui.setWidget(REPORT_WIDGET_KEY, lines);
       ctx.ui.notify("pi-universal-usage: report updated", "info");
@@ -385,9 +397,24 @@ export class UniversalUsageHost {
     }
   }
 
-  /** A report may only continue and publish within the activation generation it started in. */
-  private reportCancelled(generation: number): boolean {
-    return this.disposed || generation !== this.generation;
+  /**
+   * The effective credential/routing source, or `-` when no target is
+   * reconciled. The identity key already covers provider, origin, base path,
+   * auth source, and the auth/routing header fingerprint.
+   */
+  private activeSourceToken(): string {
+    return this.active?.target?.identity.key ?? "-";
+  }
+
+  /**
+   * A report may only continue and publish within the activation generation it
+   * started in. When a source token is supplied, the effective credential and
+   * routing must also be unchanged; the active provider's own reconciliation is
+   * exempt because it re-anchors the report.
+   */
+  private reportCancelled(generation: number, source?: string): boolean {
+    if (this.disposed || generation !== this.generation) return true;
+    return source !== undefined && this.activeSourceToken() !== source;
   }
 
   /** Idempotent cleanup for reload, session replacement, and quit. */
@@ -443,12 +470,13 @@ export class UniversalUsageHost {
     ctx: ExtensionCommandContext,
     model: Model<any>,
     generation: number,
+    source?: string,
   ): Promise<TargetSnapshot | undefined> {
     if (this.active !== undefined && this.isCurrentModel(model)) {
       return this.refreshActive(ctx, { reason: "command", force: true, model });
     }
     const resolution = await resolveTarget(ctx.modelRegistry, model, { allowInsecureHttp: true });
-    if (this.reportCancelled(generation)) return undefined;
+    if (this.reportCancelled(generation, source)) return undefined;
     if (!resolution.ok) {
       return {
         identity: resolution.identity,
@@ -467,7 +495,7 @@ export class UniversalUsageHost {
     );
     // The monitor may return a cancelled or post-shutdown placeholder snapshot;
     // a stale report discards it instead of reporting it as quota data.
-    if (this.reportCancelled(generation)) return undefined;
+    if (this.reportCancelled(generation, source)) return undefined;
     return snapshot;
   }
 
