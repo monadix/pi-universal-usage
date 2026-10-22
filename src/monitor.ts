@@ -3,7 +3,8 @@
  * endpoint caching, negative caching/backoff, duplicate-refresh deduplication,
  * and cancellation. Each target entry owns at most one run, which carries both
  * the promise concurrent refreshes join and the controller that cancels it.
- * Nothing here writes to a provider or mutates Pi state.
+ * Passive header parsing is display-only and never touches the cache. Nothing
+ * here writes to a provider or mutates Pi state.
  */
 
 import { planEndpoints, type EndpointPlan, type PlannedRequest } from "./endpoints.ts";
@@ -38,10 +39,8 @@ interface OptionalDeferral {
 }
 
 /**
- * One entry-owned refresh run. The promise concurrent refreshes join, the
- * controller that cancels the request sequence, and the continuation authority
- * of the caller that started it travel together, so joining, aborting, detaching
- * and ownership checks all consult a single index.
+ * One entry-owned refresh run: the promise concurrent refreshes join and the
+ * controller that cancels the request sequence.
  */
 interface Run {
   readonly controller: AbortController;
@@ -51,12 +50,6 @@ interface Run {
    * network await already owns its entry.
    */
   promise: Promise<TargetSnapshot>;
-  /**
-   * The starting caller's own continuation authority, when it supplied one. It
-   * stays with this run: a joiner never inherits it, and a run whose owner has
-   * lost that authority is replaced instead of joined.
-   */
-  mayContinue?: () => boolean;
 }
 
 interface Entry {
@@ -213,15 +206,13 @@ export class UsageMonitor {
 
   /**
    * Refresh one target. Concurrent calls for the same identity share one request
-   * sequence, and a joined account-scoped result is theirs too; a passive header
-   * measurement of another logical model is not. A run is only joined while the
-   * caller that started it still holds its own continuation authority.
+   * sequence and its account-scoped result.
    */
   refresh(
     target: ResolvedTarget,
     provider: ProviderConfig | undefined,
     config: UsageConfig,
-    options: { force?: boolean; signal?: AbortSignal; mayContinue?: () => boolean } = {},
+    options: { force?: boolean; signal?: AbortSignal } = {},
   ): Promise<TargetSnapshot> {
     if (this.closed) return Promise.resolve(emptySnapshot(target, "unknown", this.now(), "monitor is shut down"));
     const key = target.identity.key;
@@ -232,42 +223,19 @@ export class UsageMonitor {
     }
     const current = entry;
     if (options.force !== true && current.nextAttemptAt > this.now()) {
-      const cached = this.reusableSnapshot(current, target);
+      const cached = current.snapshot;
       if (cached !== undefined) return Promise.resolve(cached);
       return Promise.resolve(emptySnapshot(target, "unknown", this.now(), "waiting before the next attempt"));
     }
-    if (current.run !== undefined) {
-      const joined = current.run;
-      // Continuation authority belongs to the caller that started the run. A
-      // caller that still holds a valid lease must not inherit a cancellation
-      // decided by an owner that has since lost its own, so such a run is
-      // detached and the eligible caller starts fresh work instead. A run with no
-      // caller-supplied check, and one whose owner is still eligible, is shared.
-      if (joined.mayContinue === undefined || joined.mayContinue()) {
-        return joined.promise.then((snapshot) => {
-          // Joining shares the run's account-scoped endpoint result. A passive
-          // header measurement belongs to the model whose inference produced it,
-          // so it is answered for this model without reading back or writing the
-          // cache. That continuation must never start work either: the run can be
-          // cancelled after it produced this result but before its cleanup leaves
-          // the entry, which leaves nothing for cancel() to abort.
-          if (!this.measuresOtherModel(snapshot, target)) return snapshot;
-          if (joined.controller.signal.aborted || options.signal?.aborted === true) {
-            return cancelledSnapshot(target, this.now());
-          }
-          return emptySnapshot(target, "unknown", this.now(), "waiting before the next attempt");
-        });
-      }
-      this.detach(current, joined);
-    }
+    if (current.run !== undefined) return current.run.promise;
 
     // One record owns the request sequence and the controller that cancels it.
     // Install it before any work starts, so even a path that answers without a
     // network await is joinable and cancellable through its entry; its promise
     // is attached immediately below.
-    const run = { controller: new AbortController(), mayContinue: options.mayContinue } as Run;
+    const run: Run = { controller: new AbortController() } as Run;
     current.run = run;
-    run.promise = this.executeRun(target, provider, config, current, run, options.signal, options.mayContinue).finally(() => {
+    run.promise = this.executeRun(target, provider, config, current, run, options.signal).finally(() => {
       // A cancelled entry may already have installed a replacement run.
       if (current.run === run) current.run = undefined;
     });
@@ -275,13 +243,13 @@ export class UsageMonitor {
   }
 
   /**
-   * Apply passive response headers from an inference response to the active
-   * target. The caller is responsible for attribution; this only merges the
-   * parsed header dimensions when they carry data. An explicitly disabled
-   * provider stays disabled: a live response must not revive its footer or
-   * replace the cached disabled state.
+   * Parse passive response headers from an inference response for the active
+   * target. The result is display-only: it is never written into the cache, so a
+   * later refresh can never serve it back and `/usage` never sees it. The caller
+   * owns attribution; an explicitly disabled provider produces nothing, so a live
+   * response cannot revive a disabled footer.
    */
-  applyPassiveHeaders(
+  passiveSnapshot(
     target: ResolvedTarget,
     headers: Record<string, string>,
     status: number,
@@ -292,22 +260,13 @@ export class UsageMonitor {
     const now = this.now();
     const results = parseHeaderPayload(headers, status, now);
     if (results.length === 0) return undefined;
-    const entry = this.entries.get(target.identity.key) ?? { nextAttemptAt: 0 };
-    this.entries.set(target.identity.key, entry);
-
-    // A fresh endpoint snapshot is more complete than response headers.
-    const existing = entry.snapshot;
-    if (existing !== undefined && existing.source === "http" && now - existing.fetchedAt <= config.refreshSeconds * 1000) {
-      return existing;
-    }
-
     const metrics: UsageMetric[] = [];
     for (const result of results) {
       for (const metric of result.metrics) metrics.push(metric);
     }
     const rejected = results.some((result) => result.rateLimited === true) || status === 429;
     const notice = mergeNotice(...results.map((result) => result.notice));
-    const snapshot: TargetSnapshot = {
+    return {
       identity: target.identity,
       status: rejected ? "rate-limited" : "ok",
       scheme: results[0]?.scheme,
@@ -317,8 +276,6 @@ export class UsageMonitor {
       fetchedAt: now,
       source: "headers",
     };
-    entry.snapshot = snapshot;
-    return snapshot;
   }
 
   /**
@@ -364,9 +321,7 @@ export class UsageMonitor {
   /**
    * Run one request sequence for an installed run, forwarding the caller's
    * cancellation onto the run's own controller. Cancellation detaches first, so
-   * a replacement never joins work its parent aborted. A caller-supplied
-   * continuation check is consulted before every request: it is the caller's own
-   * authority, not this entry's ownership.
+   * a replacement never joins work its parent aborted.
    */
   private async executeRun(
     target: ResolvedTarget,
@@ -375,7 +330,6 @@ export class UsageMonitor {
     entry: Entry,
     run: Run,
     parent: AbortSignal | undefined,
-    mayContinue: (() => boolean) | undefined,
   ): Promise<TargetSnapshot> {
     const abortFromParent = () => this.detach(entry, run);
     const forwardParent = parent !== undefined && !parent.aborted;
@@ -387,7 +341,7 @@ export class UsageMonitor {
         this.detach(entry, run);
         return cancelledSnapshot(target, this.now());
       }
-      return await this.runPlan(target, provider, config, entry, run, mayContinue);
+      return await this.runPlan(target, provider, config, entry, run);
     } finally {
       if (forwardParent) parent?.removeEventListener("abort", abortFromParent);
     }
@@ -399,7 +353,6 @@ export class UsageMonitor {
     config: UsageConfig,
     entry: Entry,
     run: Run,
-    mayContinue: (() => boolean) | undefined,
   ): Promise<TargetSnapshot> {
     const signal = run.controller.signal;
     if (provider?.enabled === false) {
@@ -411,10 +364,6 @@ export class UsageMonitor {
 
     const plan = planEndpoints(target, provider, config);
     if (plan.kind === "none") {
-      // A forced `/usage` refresh must not erase a known passive measurement
-      // just because this target has no requestable endpoint.
-      const retained = this.retainPassiveSnapshot(target, entry, plan.notice);
-      if (retained !== undefined) return retained;
       const snapshot = emptySnapshot(target, plan.status, this.now(), plan.notice);
       entry.snapshot = snapshot;
       entry.nextAttemptAt = this.now() + AUTH_FAILURE_BACKOFF_MS;
@@ -434,11 +383,6 @@ export class UsageMonitor {
       // A cancelled or replaced run must not start another request or write
       // optional-sibling state.
       if (!this.isOwned(entry, run)) return cancelledSnapshot(target, this.now());
-      // The caller may also lose its own authority while this sequence runs - a
-      // silent same-ID routing change emits no event and aborts no run - so it
-      // rechecks that authority before each request instead of only after the
-      // whole sequence returns.
-      if (mayContinue !== undefined && !mayContinue()) return cancelledSnapshot(target, this.now());
       // An optional sibling that asked for a retry window is skipped until it
       // elapses; the required result keeps refreshing meanwhile.
       if (request.optional === true) {
@@ -657,22 +601,6 @@ export class UsageMonitor {
   }
 
   /**
-   * When no endpoint can be requested, the logical model that produced a passive
-   * header measurement keeps it, with its original timestamp so its age stays
-   * honest; the endpoint limitation becomes its notice when it has none. Another
-   * model's passive data is never reused, and an explicit disable is handled
-   * before planning so it never reaches here.
-   */
-  private retainPassiveSnapshot(target: ResolvedTarget, entry: Entry, notice: string): TargetSnapshot | undefined {
-    const existing = entry.snapshot;
-    if (existing === undefined || existing.source !== "headers" || this.measuresOtherModel(existing, target)) return undefined;
-    const retained: TargetSnapshot = existing.notice === undefined ? { ...existing, notice } : existing;
-    entry.snapshot = retained;
-    entry.nextAttemptAt = this.now() + AUTH_FAILURE_BACKOFF_MS;
-    return retained;
-  }
-
-  /**
    * Remember an optional endpoint's retry deadline, so a `Retry-After` from a
    * sibling request is honored instead of being retried every refresh.
    */
@@ -685,27 +613,6 @@ export class UsageMonitor {
     const deferred = entry.optionalRetry ?? new Map<string, OptionalDeferral>();
     entry.optionalRetry = deferred;
     deferred.set(request.url.href, { nextAttemptAt, reason });
-  }
-
-  /**
-   * The cache key is account-level, so endpoint results are shared across the
-   * models of one credential route. A passive header snapshot instead measures
-   * one logical model's inference response: another model of the same account
-   * must not inherit it while the retry gate blocks a fresh attempt.
-   */
-  private reusableSnapshot(entry: Entry, target: ResolvedTarget): TargetSnapshot | undefined {
-    const snapshot = entry.snapshot;
-    if (snapshot === undefined || this.measuresOtherModel(snapshot, target)) return undefined;
-    return snapshot;
-  }
-
-  /**
-   * A passive header snapshot measures one logical model's inference response, so
-   * only that model may read it back: the cache key is account-level, but the
-   * measurement is not. Endpoint results belong to the account and are shared.
-   */
-  private measuresOtherModel(snapshot: TargetSnapshot, target: ResolvedTarget): boolean {
-    return snapshot.source === "headers" && snapshot.identity.modelId !== target.identity.modelId;
   }
 
   /**

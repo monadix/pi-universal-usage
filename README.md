@@ -220,37 +220,24 @@ creating a 1 ms timer.
   to one hour. An optional sibling endpoint (for example OpenRouter account
   credits) keeps its own retry deadline after a 429 or 503, so it is not
   re-requested early while the required result keeps refreshing. `/usage` forces
-  a refresh; when the target has no requestable endpoint, that forced refresh
-  keeps the same model's passive header measurement with its original timestamp
-  (adding the endpoint limitation as a notice when it has none), so asking for
-  the detailed report cannot erase known data.
+  a refresh.
 - Concurrent refreshes for the same identity share one request sequence. The
   active provider is re-resolved before each refresh, so rotated credentials and
   changed auth base URLs take effect without a restart.
-- `after_provider_response` headers update the footer only while Pi is busy,
-  only when a `turn_start` bound the current turn to the active target, and only
-  when the headers carry a quota dimension. A model or credential switch inside
-  a turn discards passive attribution until the next turn; a fresh endpoint
-  snapshot always wins over passive headers. Pi emits no `model_select` when a
-  selection keeps the provider, model id, and type but changes the base URL, so
-  the turn boundary and the response both compare the selected model's routing:
-  attribution is refused instead of filing that route's headers under the
-  previously bound one. A passive measurement stays bound to the logical model
-  whose inference response produced it: another model of the same provider and
-  credential route still shares the account-level endpoint cache and its retry
-  gate, but never inherits that measurement.
-- A model switch cancels in-flight work, detaches the cancelled request so a
-  replacement starts fresh, clears the previous provider's snapshot, and marks
-  the result generation so a late answer cannot paint the new provider. A
-  cancelled run never writes its snapshot or retry deadline into the cache a
+- `after_provider_response` headers paint the footer only while Pi is busy, only
+  when a `turn_start` bound the current turn to the active target, and only when
+  the headers carry a quota dimension. The parsed value is transient: it is not
+  cached and `/usage` never reports it, so the next scheduled or manual refresh
+  replaces it.
+- Every asynchronous path captures one coarse stamp - activation generation plus
+  the selection's provider, model id, API, and base URL - and publishes only
+  while the live selection still stamps the same. A model switch clears the
+  previous provider's snapshot, and a late answer cannot paint the new provider.
+  A cancelled run never writes its snapshot or retry deadline into the cache a
   replacement refresh now owns.
-- A `/usage` report belongs to the activation generation and effective source
-  it anchored after the active provider's own reconciliation. When a model
-  switch, shutdown, or later credential/routing change lands while it is still
-  resolving another provider's credential or awaiting a request, the report ends
-  silently: it starts no further provider work, never mixes measurements from
-  two credential sources, and never publishes through a context Pi has already
-  invalidated.
+- A `/usage` report reads providers one at a time and makes one stamp check
+  before publishing. A report that spans a model switch, a shutdown, or a route
+  change is discarded silently and publishes nothing.
 - Shutdown (quit, reload, session replacement) aborts requests, clears the
   timer, removes the footer entry, and is idempotent.
 - Background refresh never runs outside TUI mode.
@@ -291,6 +278,19 @@ run.
 
 ## Known limitations
 
+- Passive response headers are display-only. They are not stored, so `/usage`
+  never reports them, they do not survive a forced refresh that finds no
+  requestable endpoint, and a provider with a fresh endpoint snapshot may have
+  its footer briefly replaced by a coarser header value until the next refresh.
+- A same-model selection change that only alters a model-level routing header is
+  not detected: the stamp covers provider, model id, API, and base URL. The
+  previous route's footer value stays until the next selection event or refresh.
+- A `/usage` run that spans a selection change is discarded without explanation.
+  Its remaining provider reads still run, but nothing is published.
+- Concurrent refreshes of one identity share HTTP sequences inside the monitor,
+  but a duplicate refresh call is not joined across callers: it may issue its own
+  sequence. A request that was already in flight can still publish its
+  measurement after a later refresh reported a failure for the same selection.
 - No quota interface is claimed for providers without one. OpenAI API-key and
   Anthropic API-key credentials expose no subscription endpoint; only passive
   response headers are shown.

@@ -271,10 +271,10 @@ describe("UsageMonitor", () => {
     assert.match(fileConfig.problems.join(" "), /deepseek\.path must be an absolute path/);
   });
 
-  it("applies passive headers when no fresh endpoint snapshot exists", async () => {
+  it("parses passive headers without caching them", async () => {
     const target = await targetFor({ provider: "openai", baseUrl: "https://gateway.example.com/v1" });
     const monitor = monitorWith(sequenceFetch([textResponse("")]).fetchImpl);
-    const snapshot = monitor.applyPassiveHeaders(
+    const snapshot = monitor.passiveSnapshot(
       target,
       { "x-codex-secondary-used-percent": "55", "x-codex-secondary-window-minutes": "10080" },
       200,
@@ -284,140 +284,9 @@ describe("UsageMonitor", () => {
     assert.equal(snapshot.source, "headers");
     assert.equal(snapshot.scheme, "codex-headers");
     assert.equal(snapshot.metrics[0]?.usedPercent, 55);
-    assert.equal(monitor.snapshotFor(target.identity.key), snapshot);
-  });
-
-  it("keeps a fresh endpoint snapshot over response headers", async () => {
-    const target = await targetFor({ provider: "deepseek", baseUrl: "https://api.deepseek.com" });
-    const { fetchImpl } = sequenceFetch([
-      jsonResponse({ is_available: true, balance_infos: [{ currency: "USD", total_balance: "9" }] }),
-    ]);
-    const monitor = monitorWith(fetchImpl);
-    const http = await monitor.refresh(target, undefined, config);
-    const passive = monitor.applyPassiveHeaders(target, { "x-ratelimit-limit-requests": "10" }, 200, config);
-    assert.equal(passive, http);
-  });
-
-  it("does not serve a passive snapshot cached by another logical model", async () => {
-    const modelA = fakeModel({ provider: "openai", id: "chat-a", baseUrl: "https://api.openai.com/v1" });
-    const modelB = fakeModel({ provider: "openai", id: "chat-b", baseUrl: "https://api.openai.com/v1" });
-    const registry = fakeRegistry({ apiKey: "test-key" }, [modelA, modelB]);
-    const resolvedA = await resolveTarget(registry, modelA, { allowInsecureHttp: true });
-    const resolvedB = await resolveTarget(registry, modelB, { allowInsecureHttp: true });
-    assert.equal(resolvedA.ok && resolvedB.ok, true);
-    if (!resolvedA.ok || !resolvedB.ok) return;
-    // Same provider, origin, credential, and routing: one account-level entry.
-    assert.equal(resolvedA.target.identity.key, resolvedB.target.identity.key);
-
-    const { fetchImpl, calls } = sequenceFetch([textResponse("unused")]);
-    const monitor = monitorWith(fetchImpl);
-    const forA = await monitor.refresh(resolvedA.target, undefined, config);
-    assert.equal(forA.status, "unsupported");
-    assert.equal(calls.length, 0);
-
-    const passiveA = monitor.applyPassiveHeaders(
-      resolvedA.target,
-      { "x-codex-secondary-used-percent": "90", "x-codex-secondary-window-minutes": "10080" },
-      200,
-      config,
-    );
-    assert.equal(passiveA?.metrics[0]?.usedPercent, 90);
-
-    // The same model keeps serving its own passive measurement from the cache.
-    assert.equal(await monitor.refresh(resolvedA.target, undefined, config), passiveA);
-
-    // Another model of the same account must not inherit A's passive measurement.
-    const forB = await monitor.refresh(resolvedB.target, undefined, config);
-    assert.notEqual(forB, passiveA);
-    assert.equal(forB.metrics.length, 0);
-    assert.notEqual(forB.status, "ok");
-    assert.match(forB.notice ?? "", /waiting before the next attempt/);
-    assert.equal(calls.length, 0);
-  });
-
-  it("keeps a same-model passive measurement when a forced refresh has no endpoint", async () => {
-    const target = await targetFor({ provider: "openai", baseUrl: "https://api.openai.com/v1" });
-    const { fetchImpl, calls } = sequenceFetch([textResponse("unused")]);
-    const monitor = monitorWith(fetchImpl);
-    const passive = monitor.applyPassiveHeaders(
-      target,
-      { "x-ratelimit-limit-requests": "100", "x-ratelimit-remaining-requests": "25" },
-      200,
-      config,
-    );
-    assert.equal(passive?.metrics[0]?.usedPercent, 75);
-
-    // `/usage` forces a refresh; with no requestable endpoint the known
-    // measurement must survive with its original timestamp.
-    const forced = await monitor.refresh(target, undefined, config, { force: true });
-    assert.equal(forced.source, "headers");
-    assert.equal(forced.status, "ok");
-    assert.equal(forced.fetchedAt, passive?.fetchedAt);
-    assert.deepEqual(forced.metrics, passive?.metrics);
-    assert.match(forced.notice ?? "", /no subscription quota endpoint is requested/);
-    assert.equal(await monitor.refresh(target, undefined, config), forced);
-    assert.equal(calls.length, 0);
-  });
-
-  it("does not serve another model's passive measurement when no endpoint is requestable", async () => {
-    const modelA = fakeModel({ provider: "openai", id: "chat-a", baseUrl: "https://api.openai.com/v1" });
-    const modelB = fakeModel({ provider: "openai", id: "chat-b", baseUrl: "https://api.openai.com/v1" });
-    const registry = fakeRegistry({ apiKey: "test-key" }, [modelA, modelB]);
-    const resolvedA = await resolveTarget(registry, modelA, { allowInsecureHttp: true });
-    const resolvedB = await resolveTarget(registry, modelB, { allowInsecureHttp: true });
-    assert.equal(resolvedA.ok && resolvedB.ok, true);
-    if (!resolvedA.ok || !resolvedB.ok) return;
-    assert.equal(resolvedA.target.identity.key, resolvedB.target.identity.key);
-
-    const monitor = monitorWith(sequenceFetch([textResponse("unused")]).fetchImpl);
-    const passiveA = monitor.applyPassiveHeaders(
-      resolvedA.target,
-      { "x-codex-secondary-used-percent": "90" },
-      200,
-      config,
-    );
-    assert.equal(passiveA?.metrics[0]?.usedPercent, 90);
-
-    const forcedB = await monitor.refresh(resolvedB.target, undefined, config, { force: true });
-    assert.deepEqual(forcedB.metrics, []);
-    assert.notEqual(forcedB.status, "ok");
-  });
-
-  it("does not hand an in-flight join another model's passive measurement", async () => {
-    const modelA = fakeModel({ provider: "openai", id: "chat-a", baseUrl: "https://api.openai.com/v1" });
-    const modelB = fakeModel({ provider: "openai", id: "chat-b", baseUrl: "https://api.openai.com/v1" });
-    const registry = fakeRegistry({ apiKey: "test-key" }, [modelA, modelB]);
-    const resolvedA = await resolveTarget(registry, modelA, { allowInsecureHttp: true });
-    const resolvedB = await resolveTarget(registry, modelB, { allowInsecureHttp: true });
-    assert.equal(resolvedA.ok && resolvedB.ok, true);
-    if (!resolvedA.ok || !resolvedB.ok) return;
-    // Same provider, origin, and credential: one account-level entry.
-    assert.equal(resolvedA.target.identity.key, resolvedB.target.identity.key);
-
-    const { fetchImpl, calls } = sequenceFetch([textResponse("unused")]);
-    const monitor = monitorWith(fetchImpl);
-    const passiveA = monitor.applyPassiveHeaders(
-      resolvedA.target,
-      { "x-codex-secondary-used-percent": "90" },
-      200,
-      config,
-    );
-    assert.equal(passiveA?.metrics[0]?.usedPercent, 90);
-
-    // A no-endpoint run retains A's passive snapshot synchronously while its
-    // promise and cleanup are still pending, so B joins it without awaiting.
-    const forcedA = monitor.refresh(resolvedA.target, undefined, config, { force: true });
-    const forcedB = monitor.refresh(resolvedB.target, undefined, config, { force: true });
-    const [forA, forB] = await Promise.all([forcedA, forcedB]);
-
-    // The model that produced the measurement keeps it.
-    assert.equal(forA.source, "headers");
-    assert.equal(forA.metrics[0]?.usedPercent, 90);
-    // The joining model never inherits it.
-    assert.deepEqual(forB.metrics, []);
-    assert.notEqual(forB.status, "ok");
-    assert.notEqual(forB.source, "headers");
-    assert.equal(calls.length, 0);
+    // Display-only: the measurement never enters the cache a later refresh or
+    // report would read back.
+    assert.equal(monitor.snapshotFor(target.identity.key), undefined);
   });
 
   it("shares an endpoint result with a joining model of the same account", async () => {
@@ -451,133 +320,6 @@ describe("UsageMonitor", () => {
     assert.equal(a.status, "ok");
   });
 
-  it("does not restart a joined refresh after its run was cancelled", async () => {
-    const modelA = fakeModel({ provider: "openai", id: "chat-a", baseUrl: "https://api.openai.com/v1" });
-    const modelB = fakeModel({ provider: "openai", id: "chat-b", baseUrl: "https://api.openai.com/v1" });
-    const modelC = fakeModel({ provider: "openai", id: "chat-c", baseUrl: "https://api.openai.com/v1" });
-    const registry = fakeRegistry({ apiKey: "test-key" }, [modelA, modelB, modelC]);
-    const resolvedA = await resolveTarget(registry, modelA, { allowInsecureHttp: true });
-    const resolvedB = await resolveTarget(registry, modelB, { allowInsecureHttp: true });
-    const resolvedC = await resolveTarget(registry, modelC, { allowInsecureHttp: true });
-    assert.equal(resolvedA.ok && resolvedB.ok && resolvedC.ok, true);
-    if (!resolvedA.ok || !resolvedB.ok || !resolvedC.ok) return;
-    // One account-level entry for all three models.
-    assert.equal(resolvedA.target.identity.key, resolvedB.target.identity.key);
-    assert.equal(resolvedA.target.identity.key, resolvedC.target.identity.key);
-
-    const { fetchImpl, calls } = sequenceFetch([textResponse("unused")]);
-    const monitor = monitorWith(fetchImpl);
-    monitor.applyPassiveHeaders(resolvedA.target, { "x-codex-secondary-used-percent": "90" }, 200, config);
-
-    // A's no-endpoint run has already retained its snapshot while its promise is
-    // pending, so B joins it; cancelling detaches and aborts that run.
-    const forcedA = monitor.refresh(resolvedA.target, undefined, config, { force: true });
-    const forcedB = monitor.refresh(resolvedB.target, undefined, config, { force: true });
-    monitor.cancel();
-    const replacement = monitor.applyPassiveHeaders(
-      resolvedC.target,
-      { "x-codex-secondary-used-percent": "25" },
-      200,
-      config,
-    );
-    assert.equal(replacement?.metrics[0]?.usedPercent, 25);
-
-    const [forA, forB] = await Promise.all([forcedA, forcedB]);
-    // The cancelled join carries no measurement and starts no replacement run,
-    // so the newer measurement of another model survives untouched.
-    assert.equal(forA.metrics[0]?.usedPercent, 90);
-    assert.deepEqual(forB.metrics, []);
-    assert.notEqual(forB.status, "ok");
-    const cached = monitor.snapshotFor(resolvedC.target.identity.key);
-    assert.equal(cached?.metrics[0]?.usedPercent, 25);
-    assert.equal(cached?.identity.modelId, "chat-c");
-    assert.equal(calls.length, 0);
-  });
-
-  it("does not restart a joined refresh whose caller was already cancelled", async () => {
-    const modelA = fakeModel({ provider: "openai", id: "chat-a", baseUrl: "https://api.openai.com/v1" });
-    const modelB = fakeModel({ provider: "openai", id: "chat-b", baseUrl: "https://api.openai.com/v1" });
-    const modelC = fakeModel({ provider: "openai", id: "chat-c", baseUrl: "https://api.openai.com/v1" });
-    const registry = fakeRegistry({ apiKey: "test-key" }, [modelA, modelB, modelC]);
-    const resolvedA = await resolveTarget(registry, modelA, { allowInsecureHttp: true });
-    const resolvedB = await resolveTarget(registry, modelB, { allowInsecureHttp: true });
-    const resolvedC = await resolveTarget(registry, modelC, { allowInsecureHttp: true });
-    assert.equal(resolvedA.ok && resolvedB.ok && resolvedC.ok, true);
-    if (!resolvedA.ok || !resolvedB.ok || !resolvedC.ok) return;
-    assert.equal(resolvedA.target.identity.key, resolvedC.target.identity.key);
-
-    const { fetchImpl, calls } = sequenceFetch([textResponse("unused")]);
-    const monitor = monitorWith(fetchImpl);
-    monitor.applyPassiveHeaders(resolvedA.target, { "x-codex-secondary-used-percent": "90" }, 200, config);
-
-    const controller = new AbortController();
-    const forcedA = monitor.refresh(resolvedA.target, undefined, config, { force: true });
-    const forcedB = monitor.refresh(resolvedB.target, undefined, config, { force: true, signal: controller.signal });
-    controller.abort();
-    monitor.applyPassiveHeaders(resolvedC.target, { "x-codex-secondary-used-percent": "25" }, 200, config);
-
-    const [forA, forB] = await Promise.all([forcedA, forcedB]);
-    assert.equal(forA.metrics[0]?.usedPercent, 90);
-    assert.equal(forB.status, "error");
-    assert.deepEqual(forB.metrics, []);
-    assert.equal(monitor.snapshotFor(resolvedC.target.identity.key)?.metrics[0]?.usedPercent, 25);
-    assert.equal(calls.length, 0);
-  });
-
-  it("does not let a join overwrite work cancelled after the owner finished", async () => {
-    const modelA = fakeModel({ provider: "openai", id: "chat-a", baseUrl: "https://api.openai.com/v1" });
-    const modelB = fakeModel({ provider: "openai", id: "chat-b", baseUrl: "https://api.openai.com/v1" });
-    const modelC = fakeModel({ provider: "openai", id: "chat-c", baseUrl: "https://api.openai.com/v1" });
-    const registry = fakeRegistry({ apiKey: "test-key" }, [modelA, modelB, modelC]);
-    const resolvedA = await resolveTarget(registry, modelA, { allowInsecureHttp: true });
-    const resolvedB = await resolveTarget(registry, modelB, { allowInsecureHttp: true });
-    const resolvedC = await resolveTarget(registry, modelC, { allowInsecureHttp: true });
-    assert.equal(resolvedA.ok && resolvedB.ok && resolvedC.ok, true);
-    if (!resolvedA.ok || !resolvedB.ok || !resolvedC.ok) return;
-    assert.equal(resolvedA.target.identity.key, resolvedC.target.identity.key);
-
-    const { fetchImpl, calls } = sequenceFetch([textResponse("unused")]);
-    const monitor = monitorWith(fetchImpl);
-    monitor.applyPassiveHeaders(resolvedA.target, { "x-codex-secondary-used-percent": "90" }, 200, config);
-
-    // The owner's observer runs before the joiner's continuation and its cleanup
-    // has already removed the run from the entry, so cancel() has nothing left to
-    // abort. The outstanding join must still not start work afterwards.
-    const owner = monitor.refresh(resolvedA.target, undefined, config, { force: true });
-    let replacement: ReturnType<typeof monitor.applyPassiveHeaders>;
-    const cancelledAfterOwner = owner.then(() => {
-      monitor.cancel();
-      replacement = monitor.applyPassiveHeaders(
-        resolvedC.target,
-        { "x-codex-secondary-used-percent": "25" },
-        200,
-        config,
-      );
-    });
-    const joiner = monitor.refresh(resolvedB.target, undefined, config, { force: true });
-
-    const [, forB] = await Promise.all([cancelledAfterOwner, joiner]);
-    assert.equal(replacement?.metrics[0]?.usedPercent, 25);
-    assert.deepEqual(forB.metrics, []);
-    assert.notEqual(forB.status, "ok");
-    const cached = monitor.snapshotFor(resolvedC.target.identity.key);
-    assert.equal(cached?.metrics[0]?.usedPercent, 25);
-    assert.equal(cached?.identity.modelId, "chat-c");
-    assert.equal(calls.length, 0);
-  });
-
-  it("does not retain a passive measurement past an explicit disable", async () => {
-    const target = await targetFor({ provider: "openai", baseUrl: "https://api.openai.com/v1" });
-    const { fetchImpl, calls } = sequenceFetch([textResponse("unused")]);
-    const monitor = monitorWith(fetchImpl);
-    monitor.applyPassiveHeaders(target, { "x-ratelimit-limit-requests": "100", "x-ratelimit-remaining-requests": "25" }, 200, config);
-    const disabled = await monitor.refresh(target, { enabled: false }, config, { force: true });
-    assert.equal(disabled.status, "unsupported");
-    assert.match(disabled.notice ?? "", /disabled/);
-    assert.deepEqual(disabled.metrics, []);
-    assert.equal(calls.length, 0);
-  });
-
   it("ignores passive response headers for an explicitly disabled provider", async () => {
     const target = await targetFor({ provider: "openai", baseUrl: "https://api.openai.com/v1" });
     const { fetchImpl, calls } = sequenceFetch([textResponse("unused")]);
@@ -590,7 +332,7 @@ describe("UsageMonitor", () => {
 
     // The inference response still arrives; it must not overwrite the disabled
     // snapshot or produce a snapshot the footer would paint.
-    const passive = monitor.applyPassiveHeaders(
+    const passive = monitor.passiveSnapshot(
       target,
       { "x-ratelimit-limit-requests": "100", "x-ratelimit-remaining-requests": "25" },
       200,
@@ -898,7 +640,7 @@ describe("UsageMonitor", () => {
   it("keeps an overall passive rejection without window metrics", async () => {
     const target = await targetFor({ provider: "anthropic", baseUrl: "https://api.anthropic.com", api: "anthropic-messages", apiKey: "sk-ant-oat-x" });
     const monitor = monitorWith(sequenceFetch([textResponse("")]).fetchImpl);
-    const snapshot = monitor.applyPassiveHeaders(target, { "anthropic-ratelimit-unified-status": "rejected" }, 429, config);
+    const snapshot = monitor.passiveSnapshot(target, { "anthropic-ratelimit-unified-status": "rejected" }, 429, config);
     assert.ok(snapshot);
     assert.equal(snapshot.status, "rate-limited");
     assert.equal(snapshot.scheme, "anthropic-headers");
