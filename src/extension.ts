@@ -432,6 +432,10 @@ export class UniversalUsageHost {
       .map((part) => part.trim())
       .filter((part) => part !== "");
 
+    // While the initial activation is still resolving there is no adopted binding
+    // to compare against, yet the command reports the live selection. Capture it
+    // so this report's work keeps matching the route it started from.
+    const unadopted = this.active === undefined ? this.captureSelected(ctx) : undefined;
     const snapshots: TargetSnapshot[] = [];
     // The effective source this report belongs to. The active provider is
     // reported first, so its own reconciliation re-anchors the guard; a source
@@ -445,15 +449,15 @@ export class UniversalUsageHost {
       const snapshot =
         target.kind === "unresolved"
           ? this.unresolvedSnapshot(target.providerId)
-          : await this.snapshotForModel(ctx, target.model, generation, isActive ? undefined : source);
+          : await this.snapshotForModel(ctx, target.model, generation, isActive ? undefined : source, unadopted);
       if (isActive) source = this.activeSourceToken();
       // A model switch, shutdown, or effective source change cancels the report
       // silently: it must not fetch the next provider or publish measurements
       // from an older source.
-      if (!this.reportStillValid(generation, source, ctx)) return;
+      if (!this.reportStillValid(generation, source, ctx, unadopted)) return;
       if (snapshot !== undefined) snapshots.push(snapshot);
     }
-    if (!this.reportStillValid(generation, source, ctx)) return;
+    if (!this.reportStillValid(generation, source, ctx, unadopted)) return;
     const active = this.lastSnapshot;
     const activeTargetKey = this.active?.target?.identity.key;
     // With no reconciled target the last snapshot is this attempt's failure
@@ -465,7 +469,7 @@ export class UniversalUsageHost {
 
     const lines = formatReport(snapshots, this.config, this.now());
     // Pi rejects a stale context after a reload; stop before touching it.
-    if (!this.reportStillValid(generation, source, ctx)) return;
+    if (!this.reportStillValid(generation, source, ctx, unadopted)) return;
     if (ctx.hasUI) {
       ctx.ui.setWidget(REPORT_WIDGET_KEY, lines);
       ctx.ui.notify("pi-universal-usage: report updated", "info");
@@ -485,12 +489,24 @@ export class UniversalUsageHost {
 
   /**
    * Report work is bound to the activation generation and effective source it
-   * started with. The route it may publish under is the one the current binding
-   * captured: the active provider's own reconciliation re-anchors both, while a
-   * live selection that moved without an event invalidates either kind of work.
+   * started with. The route it may publish under is the current binding, because
+   * the active provider's own reconciliation re-anchors both; while no binding
+   * has been adopted yet, the route the command captured before its first await
+   * is the one its work must still match.
    */
-  private reportStillValid(generation: number, source: string | undefined, ctx: ExtensionContext): boolean {
-    return this.holdsWork({ generation, selection: this.active?.selection, source }, ctx);
+  private reportStillValid(
+    generation: number,
+    source: string | undefined,
+    ctx: ExtensionContext,
+    unadopted: SelectionBinding | undefined,
+  ): boolean {
+    return this.holdsWork({ generation, selection: this.active?.selection ?? unadopted, source }, ctx);
+  }
+
+  /** The live selection, captured for work that has no adopted binding to compare against yet. */
+  private captureSelected(ctx: ExtensionContext): SelectionBinding | undefined {
+    const selected = ctx.model;
+    return selected === undefined ? undefined : bindSelection(selected);
   }
 
   /**
@@ -610,14 +626,15 @@ export class UniversalUsageHost {
     ctx: ExtensionCommandContext,
     model: Model<any>,
     generation: number,
-    source?: string,
+    source: string | undefined,
+    unadopted: SelectionBinding | undefined,
   ): Promise<TargetSnapshot | undefined> {
     if (this.active !== undefined && this.isCurrentModel(model)) {
       return this.refreshActive(ctx, { reason: "command", force: true, model });
     }
     const selection = bindSelection(model);
     const resolution = await resolveTarget(ctx.modelRegistry, selection.model, { allowInsecureHttp: true });
-    if (!this.reportStillValid(generation, source, ctx)) return undefined;
+    if (!this.reportStillValid(generation, source, ctx, unadopted)) return undefined;
     if (!resolution.ok) {
       return {
         identity: resolution.identity,
@@ -636,7 +653,7 @@ export class UniversalUsageHost {
     );
     // The monitor may return a cancelled or post-shutdown placeholder snapshot;
     // a stale report discards it instead of reporting it as quota data.
-    if (!this.reportStillValid(generation, source, ctx)) return undefined;
+    if (!this.reportStillValid(generation, source, ctx, unadopted)) return undefined;
     return snapshot;
   }
 

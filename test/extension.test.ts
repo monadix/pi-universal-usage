@@ -1868,4 +1868,131 @@ describe("host routing binding", () => {
     assert.equal(calls.length, 3);
     host.shutdown(fake.ctx);
   });
+
+  it("does not request or publish a route the selection left while activation is pending", async () => {
+    const modelA = fakeModel({
+      provider: "cpa",
+      id: "chat",
+      baseUrl: "https://a.example/v1",
+      headers: { Authorization: "Bearer synthetic-a" },
+    });
+    let activationHeld = false;
+    let activationReached = false;
+    let releaseActivation: (() => void) | undefined;
+    const activationGate = new Promise<void>((resolve) => {
+      releaseActivation = resolve;
+    });
+    let commandHeld = false;
+    let commandReached = false;
+    let releaseCommand: (() => void) | undefined;
+    const commandGate = new Promise<void>((resolve) => {
+      releaseCommand = resolve;
+    });
+    const auth = (): FakeAuth => {
+      if (activationHeld) {
+        activationHeld = false;
+        activationReached = true;
+        return { apiKey: "synthetic", wait: activationGate };
+      }
+      if (commandHeld) {
+        commandHeld = false;
+        commandReached = true;
+        return { apiKey: "synthetic", wait: commandGate };
+      }
+      return { apiKey: "synthetic" };
+    };
+    const { fetchImpl, calls } = sequenceFetch([codexBody(42)]);
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [modelA],
+      auth,
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false }),
+    });
+    const selection = { current: modelA };
+    const fake = fakeContext({ modelRef: selection, registry });
+
+    // Startup holds its initial credential resolution, so no binding is adopted.
+    activationHeld = true;
+    await pi.emit("session_start", { type: "session_start" }, fake.ctx);
+    await waitFor(() => activationReached);
+
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    commandHeld = true;
+    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => commandReached);
+
+    // Pi replaces the selected object for an equal logical model without
+    // emitting model_select, so only the live getter reveals the new route.
+    selection.current = { ...modelA, baseUrl: "https://b.example/v1" };
+    releaseCommand?.();
+    await pending;
+
+    assert.equal(calls.length, 0, "no request for the route the selection left");
+    assert.equal(fake.widgets.length, 0, "no report from the abandoned route");
+    assert.equal(pi.entries.length, 0);
+
+    releaseActivation?.();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(calls.length, 0);
+    host.shutdown(fake.ctx);
+  });
+
+  it("does not publish a request whose route moved while activation is still pending", async () => {
+    const modelA = fakeModel({
+      provider: "cpa",
+      id: "chat",
+      baseUrl: "https://a.example/v1",
+      headers: { Authorization: "Bearer synthetic-a" },
+    });
+    let activationHeld = false;
+    let releaseActivation: (() => void) | undefined;
+    const activationGate = new Promise<void>((resolve) => {
+      releaseActivation = resolve;
+    });
+    let releaseGet: (() => void) | undefined;
+    const getGate = new Promise<void>((resolve) => {
+      releaseGet = resolve;
+    });
+    let getReached = false;
+    const fetchImpl = (async () => {
+      getReached = true;
+      await getGate;
+      return codexBody(42);
+    }) as typeof fetch;
+    const auth = (): FakeAuth => {
+      if (!activationHeld) return { apiKey: "synthetic" };
+      activationHeld = false;
+      return { apiKey: "synthetic", wait: activationGate };
+    };
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [modelA],
+      auth,
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false }),
+    });
+    const selection = { current: modelA };
+    const fake = fakeContext({ modelRef: selection, registry });
+
+    activationHeld = true;
+    await pi.emit("session_start", { type: "session_start" }, fake.ctx);
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => getReached);
+
+    // The command's request is in flight for the captured route while the
+    // selection silently moves to another one.
+    selection.current = { ...modelA, baseUrl: "https://b.example/v1" };
+    releaseGet?.();
+    await pending;
+
+    assert.equal(fake.widgets.length, 0, "no report from the abandoned route");
+    assert.equal(pi.entries.length, 0);
+
+    releaseActivation?.();
+    host.shutdown(fake.ctx);
+  });
 });
