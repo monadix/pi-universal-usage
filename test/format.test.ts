@@ -117,7 +117,8 @@ describe("formatting", () => {
     const limitReport = formatReport([snapshot({ metrics: limitReached.metrics })], config, NOW).join("\n");
     assert.match(limitReport, /100%/);
     assert.match(limitReport, /limit-reached/);
-    assert.match(formatCompact(snapshot({ metrics: limitReached.metrics }), NOW, config), /weekly 100% limit-reached/);
+    // No declared duration: the neutral role name, not an invented week.
+    assert.match(formatCompact(snapshot({ metrics: limitReached.metrics }), NOW, config), /secondary 100% limit-reached/);
   });
 
   it("renders a compact footer with provider, short labels, and reset", () => {
@@ -125,7 +126,7 @@ describe("formatting", () => {
       snapshot({
         identity: { ...identity, providerId: "cpa" },
         metrics: [
-          { id: "codex.secondary", kind: "subscription-window", label: "7d window", usedPercent: 42, resetAtSeconds: Math.round(NOW / 1000) + 7200, source: "codex-json" },
+          { id: "codex.secondary", kind: "subscription-window", label: "7d window", usedPercent: 42, durationSeconds: 604800, resetAtSeconds: Math.round(NOW / 1000) + 7200, source: "codex-json" },
           { id: "codex.primary", kind: "subscription-window", label: "5h window", usedPercent: 5, source: "codex-json" },
         ],
       }),
@@ -157,6 +158,7 @@ describe("formatting", () => {
             kind: "subscription-window",
             label: "7d window",
             usedPercent: 42,
+            durationSeconds: 604800,
             resetAtSeconds: Math.round(NOW / 1000) + 2 * 86400,
             source: "codex-json",
           },
@@ -170,6 +172,29 @@ describe("formatting", () => {
     assert.match(text, /reset 2d/);
   });
 
+  it("labels a Codex secondary window by its declared non-weekly duration", () => {
+    const parsed = codexJsonParser.parse({
+      now: NOW,
+      json: { rate_limit: { secondary_window: { used_percent: 40, limit_window_seconds: 86400 } } },
+    });
+    assert.ok(parsed);
+    assert.equal(parsed.metrics[0]?.label, "1d window");
+    const text = formatCompact(snapshot({ identity: { ...identity, providerId: "cpa" }, metrics: parsed.metrics }), NOW, config);
+    assert.match(text, /^cpa: 1d 40%/);
+    assert.doesNotMatch(text, /weekly/);
+  });
+
+  it("does not invent a weekly label for an unstated Codex duration", () => {
+    const parsed = codexJsonParser.parse({
+      now: NOW,
+      json: { rate_limit: { secondary_window: { used_percent: 40 } } },
+    });
+    assert.ok(parsed);
+    const text = formatCompact(snapshot({ identity: { ...identity, providerId: "cpa" }, metrics: parsed.metrics }), NOW, config);
+    assert.match(text, /^cpa: secondary 40%/);
+    assert.doesNotMatch(text, /weekly/);
+  });
+
   it("summarizes the nearest future reset rather than the first displayed one", () => {
     const text = formatCompact(
       snapshot({
@@ -180,6 +205,7 @@ describe("formatting", () => {
             kind: "subscription-window",
             label: "7d window",
             usedPercent: 42,
+            durationSeconds: 604800,
             resetAtSeconds: Math.round(NOW / 1000) + 5 * 86400,
             source: "codex-json",
           },
@@ -253,6 +279,7 @@ describe("formatting", () => {
             kind: "subscription-window",
             label: "7d window",
             usedPercent: 88,
+            durationSeconds: 604800,
             resetAtSeconds: Math.round(NOW / 1000) - 3600,
             source: "codex-json",
           },

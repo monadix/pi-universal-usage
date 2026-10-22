@@ -91,12 +91,25 @@ export function formatMetric(metric: UsageMetric, now: number): string {
   return plainText(`${metric.label} ${parts.join(", ")}`);
 }
 
+const CODEX_WEEK_SECONDS = 7 * 86400;
+
+/**
+ * Codex names its windows by role, not duration. Only a declared seven-day
+ * window is `weekly`; another declared duration is shown as that duration, and
+ * an unstated one keeps the neutral role name instead of inventing a week.
+ */
+function codexSecondaryLabel(metric: UsageMetric): string {
+  if (metric.durationSeconds === undefined) return "secondary";
+  if (metric.durationSeconds === CODEX_WEEK_SECONDS) return "weekly";
+  return formatDuration(metric.durationSeconds);
+}
+
 function shortLabel(metric: UsageMetric): string {
   switch (metric.id) {
     case "codex.primary":
       return "primary";
     case "codex.secondary":
-      return "weekly";
+      return codexSecondaryLabel(metric);
     case "anthropic.five_hour":
       return "5h";
     case "anthropic.seven_day":

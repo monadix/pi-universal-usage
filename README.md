@@ -52,7 +52,9 @@ extension entry point is `extensions/index.ts`; Pi loads the TypeScript directly
   `cpa: weekly 42% · reset 2d 3h` or `deepseek: USD $8.82`. An elapsed window is
   qualified as `reset elapsed` on its own metric, the nearest future reset is
   summarized, and a snapshot older than twice the refresh interval is marked
-  `stale`.
+  `stale`. A Codex `secondary` window is labeled `weekly` only when the payload
+  declares a seven-day duration; another declared duration is shown compactly
+  (`1d`), and an unstated one stays `secondary`.
 
 The detailed report shows state, scheme, endpoint path, freshness, one line per
 metric with scope and reset, plus any notice (for example CPA shadow quota mode)
