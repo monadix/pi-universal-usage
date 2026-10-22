@@ -1734,4 +1734,74 @@ describe("host routing binding", () => {
     assert.equal(fake.statuses.length, statusesAfterShutdown);
     assert.equal(calls.length, 0);
   });
+
+  it("stops a reselection when its authority expires before the caller resumes", async () => {
+    const model = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://a.example.com/v1" });
+    const { fetchImpl, calls } = sequenceFetch([codexBody(12)]);
+    const pi = fakePi();
+    const host = new UniversalUsageHost(pi.api, {
+      monitor: new UsageMonitor({ now: () => 1_768_000_000_000, fetchImpl, policy: { timeoutMs: 200 } }),
+      now: () => 1_768_000_000_000,
+      config: normalizeConfig({ refreshSeconds: 300, autoRefresh: false }),
+      timers: false,
+    });
+    let armed = false;
+    let shutDown = false;
+    // `isUsingOAuth` is the last registry call of an auth resolution, so two
+    // microtask hops place the shutdown after resolver adoption but before the
+    // reselection's own continuation resumes.
+    const registry = {
+      async getApiKeyAndHeaders(input: typeof model) {
+        return { ok: true as const, apiKey: "key-a", headers: input.headers, baseUrl: input.baseUrl };
+      },
+      getProviderAuthStatus: () => ({ configured: true, source: "stored" as const }),
+      isUsingOAuth: () => {
+        if (armed) {
+          armed = false;
+          queueMicrotask(() =>
+            queueMicrotask(() => {
+              shutDown = true;
+              host.shutdown(fake.ctx);
+            }),
+          );
+        }
+        return false;
+      },
+      getAvailable: () => [model],
+      getAll: () => [model],
+    } as unknown as ModelRegistry;
+    const fake = fakeContext({ model, registry, mode: "tui", idle: false });
+    // Installed Pi rejects every access to a context whose session is gone.
+    Object.defineProperty(fake.ctx, "mode", {
+      configurable: true,
+      get() {
+        if (shutDown) throw new Error("STALE CONTEXT mode");
+        return "tui";
+      },
+    });
+    host.register();
+
+    await pi.emit("session_start", { type: "session_start" }, fake.ctx);
+    await pi.emit("turn_start", { type: "turn_start", turnIndex: 0, timestamp: Date.now() }, fake.ctx);
+    const attribution = (host as unknown as { passiveAttribution?: unknown }).passiveAttribution;
+    assert.notEqual(attribution, undefined, "the turn seeded a passive attribution");
+    const statusesBeforeReselection = fake.statuses.length;
+
+    armed = true;
+    // A same-model reselection adopts its resolution, then resumes one boundary
+    // later; the shutdown in between revokes it before it may act.
+    await pi.emit("model_select", { type: "model_select", model, previousModel: model, source: "set" }, fake.ctx);
+
+    assert.equal(shutDown, true, "the shutdown landed between adoption and continuation");
+    assert.equal(
+      (host as unknown as { passiveAttribution?: unknown }).passiveAttribution,
+      undefined,
+      "no attribution is restored after shutdown",
+    );
+    assert.equal(fake.statuses.length, statusesBeforeReselection + 1, "only shutdown cleared the footer");
+    assert.equal(fake.statuses[fake.statuses.length - 1], undefined);
+    assert.equal(fake.widgets.length, 0);
+    assert.equal(pi.entries.length, 0);
+    assert.equal(calls.length, 0);
+  });
 });

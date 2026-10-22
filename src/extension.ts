@@ -307,8 +307,13 @@ export class UniversalUsageHost {
 
     // A target here already passed the adoption check: it is the newest
     // reconciliation of this activation and the live route still matches it.
-    const target = await this.reconcileActive(ctx, model, { generation, revision, selection });
-    if (target === undefined) return;
+    const lease: ResolutionLease = { generation, revision, selection };
+    const target = await this.reconcileActive(ctx, model, lease);
+    // Adoption happened one asynchronous boundary ago. A shutdown, a newer
+    // activation, or a newer reconciliation in between revokes this reselection
+    // before it may restore attribution, change the accepted view, or touch the
+    // context its work would publish through.
+    if (target === undefined || !this.adoptsResolution(lease, ctx)) return;
     if (previousKey !== target.identity.key) {
       // The route changed; do not repaint measurements from the old origin/auth.
       this.lastSnapshot = undefined;
