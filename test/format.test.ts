@@ -122,6 +122,21 @@ describe("formatting", () => {
     assert.match(formatCompact(snapshot({ metrics: limitReached.metrics }), NOW, config), /secondary 100% limit-reached/);
   });
 
+  it("shows an over-allocated Codex window at 100% with an above-100 note", () => {
+    const over = codexJsonParser.parse({
+      now: NOW,
+      json: {
+        rate_limit: { allowed: false, limit_reached: true, secondary_window: { used_percent: 140, limit_window_seconds: 604800 } },
+      },
+    });
+    assert.ok(over);
+    assert.equal(over.metrics[0]?.usedPercent, 140);
+    const report = formatReport([snapshot({ metrics: over.metrics })], config, NOW).join("\n");
+    assert.match(report, /7d window 100%, limit-reached/);
+    assert.match(report, /note: reported usage is above 100%/);
+    assert.match(formatCompact(snapshot({ metrics: over.metrics }), NOW, config), /weekly 100% limit-reached/);
+  });
+
   it("renders a compact footer with provider, short labels, and reset", () => {
     const text = formatCompact(
       snapshot({

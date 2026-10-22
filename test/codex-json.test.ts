@@ -75,6 +75,45 @@ describe("codex-json", () => {
     assert.match(result.notice ?? "", /primary window reports no usable used_percent/);
   });
 
+  it("preserves an over-allocated CPA shadow weekly window above 100%", () => {
+    // CPA computes ceil(used / allocation * 100), so a shadow-mode account that
+    // over-consumes reports more than 100 with allowed=false and
+    // limit_reached=true. That is a measurement, not a malformed value.
+    const result = parse({
+      plan_type: "unknown",
+      quota_mode: "shadow",
+      rate_limit: {
+        allowed: false,
+        limit_reached: true,
+        primary_window: null,
+        secondary_window: { used_percent: 140, limit_window_seconds: 604800, reset_after_seconds: 120 },
+      },
+    });
+    assert.ok(result);
+    assert.equal(result.metrics.length, 1);
+    assert.equal(result.metrics[0]?.id, "codex.secondary");
+    assert.equal(result.metrics[0]?.usedPercent, 140);
+    assert.equal(result.metrics[0]?.status, "limit-reached");
+    assert.equal(result.rateLimited, true);
+    assert.match(result.notice ?? "", /quota_mode=shadow/);
+  });
+
+  it("still rejects a missing, negative, or non-finite used_percent and keeps a valid sibling", () => {
+    const result = parse({
+      rate_limit: {
+        primary_window: { used_percent: -5, limit_window_seconds: 18000 },
+        secondary_window: { used_percent: 140, limit_window_seconds: 604800 },
+      },
+    });
+    assert.ok(result);
+    assert.deepEqual(result.metrics.map((metric) => metric.id), ["codex.secondary"]);
+    assert.match(result.notice ?? "", /primary window reports no usable used_percent/);
+
+    assert.equal(parse({ rate_limit: { primary_window: { used_percent: "Infinity" } } }), undefined);
+    assert.equal(parse({ rate_limit: { primary_window: { used_percent: "NaN" } } }), undefined);
+    assert.equal(parse({ rate_limit: { primary_window: { limit_window_seconds: 18000 } } }), undefined);
+  });
+
   it("returns undefined when no window carries a measurement", () => {
     assert.equal(parse({ rate_limit: { primary_window: null, secondary_window: null } }), undefined);
   });

@@ -70,8 +70,8 @@ Parsing is a registry of pure functions over unknown JSON or response headers.
 
 | Scheme id | Input | Contract |
 |---|---|---|
-| `codex-json` | Codex/WHAM body | `rate_limit.primary_window` / `secondary_window`, `used_percent` (0..100), `limit_window_seconds`, `reset_at` (Unix seconds) or `reset_after_seconds`, `allowed` / `limit_reached`, optional `credits`. A `null` or absent primary window is valid (weekly-only plans). |
-| `codex-headers` | Response headers | `x-codex-primary|secondary-used-percent`, `-window-minutes`, `-reset-at`, `-reset-after-seconds`, `x-codex-credits-*`. |
+| `codex-json` | Codex/WHAM body | `rate_limit.primary_window` / `secondary_window`, `used_percent` (a finite, non-negative percentage), `limit_window_seconds`, `reset_at` (Unix seconds) or `reset_after_seconds`, `allowed` / `limit_reached`, optional `credits`. A `null` or absent primary window is valid (weekly-only plans). A compatible proxy can report more than 100% once an allocation is over-consumed; that over-allocation is preserved, not rejected as malformed. |
+| `codex-headers` | Response headers | `x-codex-primary|secondary-used-percent` (the same finite, non-negative percentage rule), `-window-minutes`, `-reset-at`, `-reset-after-seconds`, `x-codex-credits-*`. |
 | `anthropic-json` | Anthropic usage body | `five_hour`, `seven_day`, and per-model `seven_day_<model>` windows with `utilization` (0..100) and `resets_at` (ISO-8601). Window names come from the payload keys only. |
 | `anthropic-headers` | Response headers | `anthropic-ratelimit-unified-5h|7d-utilization` (0..1 fraction, scaled once), `-reset` (Unix seconds), `-status` (`rejected`). |
 | `rate-limit-headers` | Response headers | `x-ratelimit-limit|remaining-requests`, `-tokens`, and their duration `reset` headers; bare `x-ratelimit-limit|remaining|reset` (its reset is an absolute Unix timestamp; a value that cannot be one is ignored, never reinterpreted as a duration); `RateLimit-Limit|Remaining|Reset` with `RateLimit-Policy` (reset is delta-seconds). Request and token budgets stay distinct from subscription windows. `Retry-After` is only a retry delay, never a quota percentage. Independent header dimensions may coexist. |
@@ -82,7 +82,11 @@ Parsing is a registry of pure functions over unknown JSON or response headers.
 
 Percent scaling is explicit per scheme. Malformed or partial siblings are
 skipped and reported as a notice, never turned into a full or zero value.
-Elapsed resets are shown as `reset elapsed`, not silently replenished.
+A finite non-negative percentage above 100 is over-allocation, not a malformed
+value: the measurement keeps its reported percentage and the detailed report
+notes that usage is above 100%, while the footer and compact percentages are
+drawn capped at 100%. Elapsed resets are shown as `reset elapsed`, not silently
+replenished.
 
 ## Endpoint selection
 

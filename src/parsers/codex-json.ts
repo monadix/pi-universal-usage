@@ -2,10 +2,13 @@
  * Codex / WHAM rate-limit JSON (`rate_limit.primary_window`,
  * `rate_limit.secondary_window`, optional `credits`).
  *
- * Wire contract: `used_percent` is 0..100, `limit_window_seconds` is a window
- * duration in seconds, resets arrive either as Unix seconds (`reset_at`) or as a
- * countdown (`reset_after_seconds`). Proxies may omit the primary window
- * (weekly-only plans) or send `null` for it; that is unknown, not 0%.
+ * Wire contract: `used_percent` is a finite, non-negative percentage,
+ * `limit_window_seconds` is a window duration in seconds, resets arrive either
+ * as Unix seconds (`reset_at`) or as a countdown (`reset_after_seconds`).
+ * Proxies may omit the primary window (weekly-only plans) or send `null` for it;
+ * that is unknown, not 0%. A compatible proxy that computes percent from an
+ * allocation can exceed 100 (CPA shadow mode); that over-allocation is a
+ * measurement, so it is preserved rather than clamped or rejected.
  */
 
 import { booleanValue, decimalValue, numberValue, objectValue, stringValue } from "../json.ts";

@@ -14,6 +14,16 @@ describe("codex-headers", () => {
     assert.deepEqual(result.metrics.map((metric) => metric.id), ["codex.secondary"]);
   });
 
+  it("keeps an over-allocated percent above 100", () => {
+    const result = codexHeadersParser.parse({
+      now: NOW,
+      headers: { "x-codex-secondary-used-percent": "140", "x-codex-secondary-window-minutes": "10080" },
+    });
+    assert.ok(result);
+    assert.equal(result.metrics[0]?.usedPercent, 140);
+    assert.equal(result.metrics[0]?.label, "7d window");
+  });
+
   it("drops a window duration that overflows after conversion", () => {
     const result = codexHeadersParser.parse({
       now: 1_768_000_000_000,

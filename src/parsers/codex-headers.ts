@@ -1,7 +1,8 @@
 /**
  * Codex response headers (`x-codex-primary-*`, `x-codex-secondary-*`,
  * `x-codex-credits-*`). These appear on inference responses, so they are the
- * passive source when no usage endpoint exists. Percent headers are 0..100,
+ * passive source when no usage endpoint exists. Percent headers are finite,
+ * non-negative percentages (an over-allocated value above 100 is preserved),
  * window headers are minutes, and reset headers are Unix seconds or countdowns.
  */
 
