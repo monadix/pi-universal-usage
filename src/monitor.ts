@@ -1,7 +1,9 @@
 /**
  * Refresh orchestration: one bounded GET sequence per effective target, with
  * endpoint caching, negative caching/backoff, duplicate-refresh deduplication,
- * and cancellation. Nothing here writes to a provider or mutates Pi state.
+ * and cancellation. Each target entry owns at most one run, which carries both
+ * the promise concurrent refreshes join and the controller that cancels it.
+ * Nothing here writes to a provider or mutates Pi state.
  */
 
 import { planEndpoints, type EndpointPlan, type PlannedRequest } from "./endpoints.ts";
@@ -35,13 +37,29 @@ interface OptionalDeferral {
   reason: "rate-limited" | "unavailable";
 }
 
+/**
+ * One entry-owned refresh run. The promise concurrent refreshes join and the
+ * controller that cancels the request sequence travel together, so joining,
+ * aborting, detaching and ownership checks all consult a single index.
+ */
+interface Run {
+  readonly controller: AbortController;
+  /**
+   * The sequence's result. Assigned in the same synchronous frame that installs
+   * the run; the record is installed first, so a path that answers without a
+   * network await already owns its entry.
+   */
+  promise: Promise<TargetSnapshot>;
+}
+
 interface Entry {
   snapshot?: TargetSnapshot;
   endpoint?: CachedEndpoint;
   /** Retry deadlines by optional endpoint URL; keeps a slow sibling from hiding the required result. */
   optionalRetry?: Map<string, OptionalDeferral>;
   nextAttemptAt: number;
-  inFlight?: Promise<TargetSnapshot>;
+  /** The one run that currently owns this entry; absent between runs and after a cancel. */
+  run?: Run;
 }
 
 function emptySnapshot(target: ResolvedTarget, status: TargetStatus, now: number, notice?: string): TargetSnapshot {
@@ -159,7 +177,6 @@ export class UsageMonitor {
   private readonly now: () => number;
   private readonly fetchImpl: typeof fetch;
   private readonly policyOverride: Partial<HttpPolicy>;
-  private readonly inflightControllers = new Set<AbortController>();
   private closed = false;
 
   constructor(options: MonitorOptions = {}) {
@@ -207,13 +224,19 @@ export class UsageMonitor {
       if (cached !== undefined) return Promise.resolve(cached);
       return Promise.resolve(emptySnapshot(target, "unknown", this.now(), "waiting before the next attempt"));
     }
-    if (current.inFlight !== undefined) return current.inFlight;
-    const run = this.run(target, provider, config, current, options.signal).finally(() => {
-      // A cancelled entry may already have been replaced by a newer run.
-      if (current.inFlight === run) current.inFlight = undefined;
+    if (current.run !== undefined) return current.run.promise;
+
+    // One record owns the request sequence and the controller that cancels it.
+    // Install it before any work starts, so even a path that answers without a
+    // network await is joinable and cancellable through its entry; its promise
+    // is attached immediately below.
+    const run = { controller: new AbortController() } as Run;
+    current.run = run;
+    run.promise = this.executeRun(target, provider, config, current, run, options.signal).finally(() => {
+      // A cancelled entry may already have installed a replacement run.
+      if (current.run === run) current.run = undefined;
     });
-    current.inFlight = run;
-    return run;
+    return run.promise;
   }
 
   /**
@@ -264,13 +287,19 @@ export class UsageMonitor {
   }
 
   /**
-   * Abort every in-flight request and detach them from their entries, so a
-   * replacement refresh starts new work instead of joining the cancelled run.
+   * Abort every in-flight run and detach it from its entry, so a replacement
+   * refresh starts new work instead of joining the cancelled run. Each run is
+   * reachable through the entry that owns it.
    */
   cancel(): void {
-    for (const controller of this.inflightControllers) controller.abort();
-    this.inflightControllers.clear();
-    for (const entry of this.entries.values()) entry.inFlight = undefined;
+    for (const entry of this.entries.values()) {
+      const run = entry.run;
+      if (run === undefined) continue;
+      // Detach before aborting: no listener or late continuation may see the
+      // cancelled run as the entry's owner.
+      entry.run = undefined;
+      run.controller.abort();
+    }
   }
 
   /** Idempotent shutdown: abort in-flight requests, forget cached state, refuse new work. */
@@ -281,26 +310,37 @@ export class UsageMonitor {
     this.closed = true;
   }
 
-  private async run(
+  /**
+   * A run may only write into its entry while it is still that entry's exact run
+   * and its controller has not been aborted. Cancelling detaches synchronously,
+   * so late work can neither overwrite a replacement run's snapshot, endpoint
+   * preference or retry deadline nor revive a cancelled entry.
+   */
+  private isOwned(entry: Entry, run: Run): boolean {
+    return entry.run === run && !run.controller.signal.aborted;
+  }
+
+  /**
+   * Run one request sequence for an installed run, forwarding the caller's
+   * cancellation signal onto the run's own controller.
+   */
+  private async executeRun(
     target: ResolvedTarget,
     provider: ProviderConfig | undefined,
     config: UsageConfig,
     entry: Entry,
-    signal: AbortSignal | undefined,
+    run: Run,
+    parent: AbortSignal | undefined,
   ): Promise<TargetSnapshot> {
-    const controller = new AbortController();
-    const abortFromParent = () => controller.abort();
-    if (signal !== undefined) {
-      if (signal.aborted) return cancelledSnapshot(target, this.now());
-      signal.addEventListener("abort", abortFromParent, { once: true });
-    }
-    this.inflightControllers.add(controller);
+    const abortFromParent = () => run.controller.abort();
+    const forwardParent = parent !== undefined && !parent.aborted;
+    if (forwardParent) parent.addEventListener("abort", abortFromParent, { once: true });
 
     try {
-      return await this.runPlan(target, provider, config, entry, controller.signal);
+      if (parent?.aborted === true) return cancelledSnapshot(target, this.now());
+      return await this.runPlan(target, provider, config, entry, run);
     } finally {
-      signal?.removeEventListener("abort", abortFromParent);
-      this.inflightControllers.delete(controller);
+      if (forwardParent) parent?.removeEventListener("abort", abortFromParent);
     }
   }
 
@@ -309,8 +349,9 @@ export class UsageMonitor {
     provider: ProviderConfig | undefined,
     config: UsageConfig,
     entry: Entry,
-    signal: AbortSignal,
+    run: Run,
   ): Promise<TargetSnapshot> {
+    const signal = run.controller.signal;
     if (provider?.enabled === false) {
       const snapshot = emptySnapshot(target, "unsupported", this.now(), "disabled in pi-universal-usage.json");
       entry.snapshot = snapshot;
@@ -340,7 +381,9 @@ export class UsageMonitor {
     let endpointRequest: PlannedRequest | undefined;
 
     for (const [index, request] of requests.entries()) {
-      if (signal.aborted) return cancelledSnapshot(target, this.now());
+      // A cancelled or replaced run must not start another request or write
+      // optional-sibling state.
+      if (!this.isOwned(entry, run)) return cancelledSnapshot(target, this.now());
       // An optional sibling that asked for a retry window is skipped until it
       // elapses; the required result keeps refreshing meanwhile.
       if (request.optional === true) {
@@ -361,10 +404,10 @@ export class UsageMonitor {
         this.fetchImpl,
       );
 
-      // Cancellation can land after the response resolves: a cancelled run must
-      // never write its endpoint, snapshot, or retry deadline into the entry a
-      // replacement refresh now owns.
-      if (signal.aborted) return cancelledSnapshot(target, this.now());
+      // Cancellation or replacement can land after the response resolves: a run
+      // that no longer owns this entry must never write its endpoint preference,
+      // snapshot, or retry deadline over the one its replacement now owns.
+      if (!this.isOwned(entry, run)) return cancelledSnapshot(target, this.now());
 
       if (outcome.kind === "error") {
         if (outcome.reason === "aborted") return cancelledSnapshot(target, this.now());

@@ -781,6 +781,134 @@ describe("UsageMonitor", () => {
     assert.equal(call, 2);
   });
 
+  it("keeps the replacement run owned when a cancelled run finishes later", async () => {
+    const target = await targetFor({ provider: "deepseek", baseUrl: "https://api.deepseek.com" });
+    let releaseOld: (() => void) | undefined;
+    const oldGate = new Promise<void>((resolve) => {
+      releaseOld = resolve;
+    });
+    let releaseReplacement: (() => void) | undefined;
+    const replacementGate = new Promise<void>((resolve) => {
+      releaseReplacement = resolve;
+    });
+    let call = 0;
+    const fetchImpl = (async () => {
+      call += 1;
+      if (call === 1) {
+        await oldGate;
+        return jsonResponse({ is_available: true, balance_infos: [{ currency: "USD", total_balance: "11" }] });
+      }
+      await replacementGate;
+      return jsonResponse({ is_available: true, balance_infos: [{ currency: "USD", total_balance: "22" }] });
+    }) as typeof fetch;
+    const monitor = monitorWith(fetchImpl);
+
+    const cancelledRun = monitor.refresh(target, undefined, config);
+    monitor.cancel();
+    const replacement = monitor.refresh(target, undefined, config, { force: true });
+    assert.equal(call, 2);
+
+    // The cancelled run completes after the replacement was installed. Its cleanup
+    // must leave the entry owned by the replacement, not detach it.
+    releaseOld?.();
+    const old = await cancelledRun;
+    assert.equal(old.status, "error");
+    assert.match(old.error ?? "", /cancelled/);
+
+    // A refresh arriving now joins the pending replacement instead of starting a
+    // third sequence, which is only possible while its ownership survived.
+    const joined = monitor.refresh(target, undefined, config, { force: true });
+    assert.equal(call, 2);
+    releaseReplacement?.();
+    const [replacementSnapshot, joinedSnapshot] = await Promise.all([replacement, joined]);
+    assert.equal(replacementSnapshot.status, "ok");
+    assert.equal(replacementSnapshot.metrics[0]?.remaining, 22);
+    assert.equal(joinedSnapshot, replacementSnapshot);
+    assert.equal(monitor.snapshotFor(target.identity.key)?.metrics[0]?.remaining, 22);
+    assert.equal(call, 2);
+  });
+
+  it("does not record an optional sibling's retry window from a cancelled run", async () => {
+    const target = await targetFor({ provider: "openrouter", baseUrl: "https://openrouter.ai/api/v1" });
+    let releaseCredits: (() => void) | undefined;
+    const creditsGate = new Promise<void>((resolve) => {
+      releaseCredits = resolve;
+    });
+    let creditsReached: (() => void) | undefined;
+    const creditsStarted = new Promise<void>((resolve) => {
+      creditsReached = resolve;
+    });
+    let holdCredits = true;
+    let keyCalls = 0;
+    let creditCalls = 0;
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (!url.endsWith("/api/v1/credits")) {
+        keyCalls += 1;
+        return jsonResponse({ data: { limit: 20, limit_remaining: 15 } });
+      }
+      creditCalls += 1;
+      if (holdCredits) {
+        holdCredits = false;
+        creditsReached?.();
+        await creditsGate;
+        // A cancelled run's late rate limit must not defer the sibling for its replacement.
+        return textResponse("slow down", { status: 429, headers: { "retry-after": "3600" } });
+      }
+      return jsonResponse({ data: { total_credits: 100, total_usage: 20 } });
+    }) as typeof fetch;
+    const monitor = monitorWith(fetchImpl);
+
+    const cancelledRun = monitor.refresh(target, undefined, config);
+    await creditsStarted;
+    assert.equal(keyCalls, 1);
+    monitor.cancel();
+    releaseCredits?.();
+    const old = await cancelledRun;
+    assert.equal(old.status, "error");
+    assert.match(old.error ?? "", /cancelled/);
+
+    const replacement = await monitor.refresh(target, undefined, config, { force: true });
+    assert.equal(keyCalls, 2);
+    // The replacement requests the sibling again instead of inheriting the dead run's window.
+    assert.equal(creditCalls, 2);
+    assert.deepEqual(replacement.metrics.map((metric) => metric.id).sort(), [
+      "openrouter.account-credits",
+      "openrouter.key-budget",
+    ]);
+    assert.doesNotMatch(replacement.notice ?? "", /retry window/);
+  });
+
+  it("aborts the run installed after a cancel on shutdown", async () => {
+    const target = await targetFor({ provider: "deepseek", baseUrl: "https://api.deepseek.com" });
+    let call = 0;
+    const fetchImpl = ((_input: unknown, init?: RequestInit) => {
+      call += 1;
+      return new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      });
+    }) as typeof fetch;
+    const monitor = monitorWith(fetchImpl);
+
+    const cancelledRun = monitor.refresh(target, undefined, config);
+    monitor.cancel();
+    const replacement = monitor.refresh(target, undefined, config, { force: true });
+    assert.equal(call, 2);
+
+    // Every run is reachable through the entry that owns it, so shutdown still
+    // aborts the sequence installed after the cancel.
+    monitor.dispose();
+    const [old, replacementSnapshot] = await Promise.all([cancelledRun, replacement]);
+    assert.match(old.error ?? "", /cancelled/);
+    assert.equal(replacementSnapshot.status, "error");
+    assert.match(replacementSnapshot.error ?? "", /cancelled/);
+
+    const after = await monitor.refresh(target, undefined, config, { force: true });
+    assert.equal(after.status, "unknown");
+    assert.match(after.notice ?? "", /monitor is shut down/);
+    assert.equal(call, 2);
+  });
+
   it("marks a snapshot stale after twice the refresh interval", async () => {
     const target = await targetFor({ provider: "deepseek", baseUrl: "https://api.deepseek.com" });
     const monitor = new UsageMonitor({
