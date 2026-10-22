@@ -154,20 +154,34 @@ export function authFingerprint(
 }
 
 /**
+ * The model headers Pi actually merges into the effective credential. Pi applies
+ * them one entry at a time in insertion order, deleting every earlier
+ * case-insensitive match before inserting the new one, so a map that spells one
+ * name twice resolves to its last entry - including a `null` suppression. Header
+ * casing does not reach the wire, and the surviving values are returned sorted
+ * by lowercased name so entry order outside a duplicate stays irrelevant.
+ */
+function effectiveModelHeaders(headers: Model<any>["headers"]): Array<[string, string | null]> {
+  const effective = new Map<string, string | null>();
+  for (const [name, value] of Object.entries(headers ?? {})) effective.set(name.toLowerCase(), value ?? null);
+  return [...effective.entries()].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+}
+
+/**
  * Opaque digest of the routing a selected model contributes on top of its
  * provider defaults: base URL, API, and model-level headers. Header names are
- * case-insensitive, entry order does not matter, and an explicitly suppressed
- * header (`null`) stays distinct from an absent one. Pi merges these headers
- * into the effective credential and suppresses `model_select` when provider,
- * id, and type are unchanged, so this signature is how the host notices a
- * routing change it cannot otherwise observe. The digest is never printed or
- * persisted.
+ * case-insensitive, entry order does not matter, duplicate names resolve the way
+ * Pi resolves them (last entry wins), and an explicitly suppressed header
+ * (`null`) stays distinct from an absent one. Pi merges these headers into the
+ * effective credential and suppresses `model_select` when provider, id, and type
+ * are unchanged, so this signature is how the host notices a routing change it
+ * cannot otherwise observe. The digest is never printed or persisted.
  */
 export function modelRoutingSignature(model: Model<any>): string {
-  const headers = Object.entries(model.headers ?? {})
-    .map(([name, value]) => JSON.stringify([name.toLowerCase(), value ?? null]))
-    .sort();
-  return createHash("sha256").update(JSON.stringify([model.baseUrl, model.api, headers])).digest("hex").slice(0, 16);
+  return createHash("sha256")
+    .update(JSON.stringify([model.baseUrl, model.api, effectiveModelHeaders(model.headers)]))
+    .digest("hex")
+    .slice(0, 16);
 }
 
 function identityFor(

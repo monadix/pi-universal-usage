@@ -110,6 +110,23 @@ function codexBody(usedPercent: number) {
   });
 }
 
+/**
+ * Pi merges a model's headers into the resolved credential one entry at a time in
+ * insertion order, deleting every earlier case-insensitive match before inserting
+ * the next one, so a map that spells one header name twice resolves to its last
+ * entry. This reproduces what the extension sees from `getApiKeyAndHeaders()`.
+ */
+function piEffectiveHeaders(headers: Record<string, string | null> | undefined): Record<string, string | null> {
+  const merged: Record<string, string | null> = {};
+  for (const [name, value] of Object.entries(headers ?? {})) {
+    for (const existing of Object.keys(merged)) {
+      if (existing.toLowerCase() === name.toLowerCase()) delete merged[existing];
+    }
+    merged[name] = value;
+  }
+  return merged;
+}
+
 async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void> {
   const start = Date.now();
   while (!predicate()) {
@@ -687,6 +704,62 @@ describe("pi extension wiring", () => {
     await waitFor(() => calls.length === 2);
     assert.match(calls[1]?.url ?? "", /localhost:9999/);
     host.shutdown(fake.ctx);
+  });
+
+  it("refuses a held result after a silent replacement resolves another credential", async () => {
+    const cases: Array<{ label: string; before: Record<string, string | null>; after: Record<string, string | null> }> = [
+      {
+        label: "a duplicate authorization entry reversed",
+        before: { Authorization: "Bearer A", authorization: "Bearer B" },
+        after: { authorization: "Bearer B", Authorization: "Bearer A" },
+      },
+      {
+        label: "a suppressed authorization reversed",
+        before: { authorization: null, Authorization: "Bearer A" },
+        after: { Authorization: "Bearer A", authorization: null },
+      },
+    ];
+    for (const testCase of cases) {
+      let release: (() => void) | undefined;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const calls: string[] = [];
+      const fetchImpl = (async (input: string | URL | Request) => {
+        calls.push(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+        await gate;
+        return codexBody(77);
+      }) as typeof fetch;
+      // Same provider, id, base URL, and API: Pi resolves these two model
+      // objects to different credentials but considers them the same model, so
+      // it emits no model_select and only the routing signature reveals it.
+      const route = { provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" };
+      const modelA = fakeModel({ ...route, headers: testCase.before as unknown as Record<string, string> });
+      const modelB = fakeModel({ ...route, headers: testCase.after as unknown as Record<string, string> });
+      const { pi, host, registry } = buildHost({
+        fetchImpl,
+        models: [modelA, modelB],
+        auth: (model) => ({ apiKey: "ignored", headers: piEffectiveHeaders(model.headers) }),
+        config: normalizeConfig({ refreshSeconds: 300, autoRefresh: false }),
+      });
+      const selection = { current: modelA };
+      const fake = fakeContext({ modelRef: selection, registry });
+      await pi.emit("session_start", { type: "session_start" }, fake.ctx);
+      const command = pi.commands.get(COMMAND_NAME);
+      assert.ok(command);
+      const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+      await waitFor(() => calls.length === 1);
+
+      // Pi installs the replacement before any event reaches this host.
+      selection.current = modelB;
+      release?.();
+      await pending;
+
+      assert.equal(calls.length, 1, testCase.label);
+      assert.doesNotMatch(String(fake.statuses[fake.statuses.length - 1]), /77%/, testCase.label);
+      assert.equal(fake.widgets.length, 0, testCase.label);
+      host.shutdown(fake.ctx);
+    }
   });
 
   it("adopts same-ID routing with autoRefresh disabled and discards old work and attribution", async () => {
