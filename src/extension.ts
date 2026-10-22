@@ -221,6 +221,12 @@ export class UniversalUsageHost {
     });
 
     this.pi.on("model_select", async (event, ctx) => {
+      // Pi installs the model before it emits `model_select` and awaits earlier
+      // extension handlers without serializing separate emissions, so an older
+      // selection event can arrive after a newer one was already adopted. Decide
+      // the event's authority against the live selection before it may advance a
+      // generation, abort work, or clear the accepted binding and footer.
+      if (!this.selectionEventHolds(event.model, ctx)) return;
       if (this.isCurrentModel(event.model)) {
         // Re-selecting the active logical model is still a chance to pick up
         // rotated credentials or changed same-ID routing. Adoption must happen
@@ -730,6 +736,18 @@ export class UniversalUsageHost {
     if (selected === undefined) return true;
     if (!sameLogicalModel(selected, selection.model)) return false;
     return modelRoutingSignature(selected) === selection.routing;
+  }
+
+  /**
+   * May this selection event still define the host's binding? The live selection
+   * is authoritative: an event for a model Pi has already replaced describes no
+   * reachable route, and handling it would cancel the newer selection's work and
+   * clear its accepted view before the post-resolution route check could reject
+   * the event. An equivalent selection object (same logical model, same routing)
+   * is still current and is adopted normally.
+   */
+  private selectionEventHolds(model: Model<any>, ctx: ExtensionContext): boolean {
+    return this.routeHolds(bindSelection(model), ctx);
   }
 
   /** Idempotent cleanup for reload, session replacement, and quit. */

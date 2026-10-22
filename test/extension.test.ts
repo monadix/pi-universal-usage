@@ -388,7 +388,8 @@ describe("pi extension wiring", () => {
       auth,
       config: normalizeConfig({ providers: { deepseek: { enabled: true } } }),
     });
-    const nonTui = fakeContext({ model: cpa, registry, mode: "rpc" });
+    const nonTuiSelection = { current: cpa };
+    const nonTui = fakeContext({ modelRef: nonTuiSelection, registry, mode: "rpc" });
     await pi.emit("model_select", { type: "model_select", model: cpa, previousModel: undefined, source: "set" }, nonTui.ctx);
 
     const fake = fakeContext({ model: cpa, registry });
@@ -401,6 +402,7 @@ describe("pi extension wiring", () => {
 
     // A switch advances the activation generation and cancels older work while
     // the report is still waiting for the non-active provider's credential.
+    nonTuiSelection.current = other;
     await pi.emit("model_select", { type: "model_select", model: other, previousModel: cpa, source: "set" }, nonTui.ctx);
     release?.();
     await pending;
@@ -2836,6 +2838,111 @@ describe("host routing binding", () => {
     assert.equal(calls.length, 1);
     assert.match(calls[0]?.url ?? "", /b\.example\.com/);
     assert.match(String(fake.statuses[fake.statuses.length - 1]), /33%/);
+    host.shutdown(fake.ctx);
+  });
+
+  it("keeps the newer selection when an older selection event arrives late", async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let held = false;
+    const modelX = fakeModel({ provider: "provider-x", id: "chat-x", baseUrl: "https://x.example.com/v1" });
+    const modelA = fakeModel({ provider: "provider-a", id: "chat-a", baseUrl: "https://a.example.com/v1" });
+    const modelB = fakeModel({ provider: "provider-b", id: "chat-b", baseUrl: "https://b.example.com/v1" });
+    const { fetchImpl, calls } = sequenceFetch([codexBody(33)]);
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [modelX, modelA, modelB],
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false }),
+    });
+    const selection = { current: modelX };
+    const fake = fakeContext({ modelRef: selection, registry });
+    await pi.emit("session_start", { type: "session_start" }, fake.ctx);
+
+    // An earlier extension holds A's selection event, so Pi installs B and lets
+    // B's event reach this host first.
+    const handlers = pi.handlers.get("model_select");
+    assert.ok(handlers);
+    handlers.unshift(async (event: { model: ReturnType<typeof fakeModel> }) => {
+      if (event.model !== modelA) return;
+      held = true;
+      await gate;
+    });
+    selection.current = modelA;
+    const pendingA = pi.emit("model_select", { type: "model_select", model: modelA, previousModel: modelX, source: "set" }, fake.ctx);
+    await waitFor(() => held);
+    selection.current = modelB;
+    await pi.emit("model_select", { type: "model_select", model: modelB, previousModel: modelA, source: "set" }, fake.ctx);
+    const adopted = String(fake.statuses[fake.statuses.length - 1]);
+    assert.match(adopted, /provider-b/);
+
+    release?.();
+    await pendingA;
+
+    assert.equal(
+      String(fake.statuses[fake.statuses.length - 1]),
+      adopted,
+      "the obsolete event keeps the accepted view of the live selection",
+    );
+    assert.equal(calls.length, 0);
+    const snapshot = await host.refreshActive(fake.ctx, { reason: "interval" });
+    assert.ok(snapshot, "the live selection is still refreshable");
+    assert.equal(calls.length, 1);
+    assert.match(calls[0]?.url ?? "", /b\.example\.com/);
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /33%/);
+    host.shutdown(fake.ctx);
+  });
+
+  it("keeps a newer same-ID reselection when an older event arrives late", async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let held = false;
+    const modelA = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://a.example.com/v1" });
+    const modelB = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://b.example.com/v1" });
+    const modelC = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://c.example.com/v1" });
+    const { fetchImpl } = sequenceFetch([codexBody(44)]);
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [modelA, modelB, modelC],
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false }),
+    });
+    const selection = { current: modelA };
+    const fake = fakeContext({ modelRef: selection, registry, idle: false });
+    await pi.emit("session_start", { type: "session_start" }, fake.ctx);
+    await pi.emit("turn_start", { type: "turn_start", turnIndex: 0, timestamp: Date.now() }, fake.ctx);
+
+    // The older same-ID routing (B) is held while the newer one (C) is adopted.
+    const handlers = pi.handlers.get("model_select");
+    assert.ok(handlers);
+    handlers.unshift(async (event: { model: ReturnType<typeof fakeModel> }) => {
+      if (event.model !== modelB) return;
+      held = true;
+      await gate;
+    });
+    selection.current = modelB;
+    const pendingB = pi.emit("model_select", { type: "model_select", model: modelB, previousModel: modelA, source: "set" }, fake.ctx);
+    await waitFor(() => held);
+    selection.current = modelC;
+    await pi.emit("model_select", { type: "model_select", model: modelC, previousModel: modelB, source: "set" }, fake.ctx);
+    // A new turn under the adopted C is a sound attribution boundary.
+    await pi.emit("turn_start", { type: "turn_start", turnIndex: 1, timestamp: Date.now() }, fake.ctx);
+
+    release?.();
+    await pendingB;
+
+    // The obsolete event may not cancel work or drop the attribution of the
+    // reselection that is actually live.
+    await pi.emit(
+      "after_provider_response",
+      { status: 200, headers: { "x-codex-secondary-used-percent": "90", "x-codex-secondary-window-minutes": "10080" } },
+      fake.ctx,
+    );
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /90%/);
     host.shutdown(fake.ctx);
   });
 
