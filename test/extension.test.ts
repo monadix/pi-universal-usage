@@ -1779,6 +1779,140 @@ describe("pi extension wiring", () => {
     host.shutdown(fake.ctx);
   });
 
+  it("stops a report whose source rotated away and back while a peer resolves", async () => {
+    let currentKey = "key-a";
+    let holdPeerAuth = false;
+    let peerAuthReached = false;
+    let releasePeerAuth: (() => void) | undefined;
+    const peerAuthGate = new Promise<void>((resolve) => {
+      releasePeerAuth = resolve;
+    });
+    const activeCalls: string[] = [];
+    const peerCalls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("api.deepseek.com")) {
+        peerCalls.push(url);
+        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
+      }
+      activeCalls.push(url);
+      return codexBody(activeCalls.length * 11);
+    }) as typeof fetch;
+    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
+      if (model.provider === "deepseek") {
+        if (holdPeerAuth) {
+          peerAuthReached = true;
+          return { apiKey: "key-a", source: "stored", wait: peerAuthGate };
+        }
+        return { apiKey: "key-a", source: "stored" };
+      }
+      return { apiKey: currentKey, source: "stored" };
+    };
+    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://a.example/v1" });
+    const deepseek = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [cpa, deepseek],
+      auth,
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false, providers: { deepseek: { enabled: true } } }),
+    });
+    const fake = fakeContext({ model: cpa, registry });
+    await host.activate(fake.ctx, cpa, { refresh: false });
+
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    holdPeerAuth = true;
+    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => peerAuthReached);
+    assert.equal(activeCalls.length, 1);
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /11%/);
+
+    // The credential rotates away and later returns while the report waits on
+    // its peer. Returning to the same source is not the authority it lost.
+    currentKey = "key-b";
+    await host.refreshActive(fake.ctx, { reason: "interval", force: true });
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /22%/);
+    currentKey = "key-a";
+    await host.refreshActive(fake.ctx, { reason: "interval", force: true });
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /33%/);
+
+    releasePeerAuth?.();
+    await pending;
+
+    assert.equal(peerCalls.length, 0, "a source that returns does not revive the report's authority");
+    assert.equal(fake.widgets.length, 0, "no obsolete report is published");
+    assert.equal(fake.notifications.length, 0);
+    assert.equal(pi.entries.length, 0);
+    assert.equal(activeCalls.length, 3);
+    host.shutdown(fake.ctx);
+  });
+
+  it("keeps a report waiting on a peer through an unchanged-source refresh", async () => {
+    let currentKey = "key-a";
+    let holdPeerAuth = false;
+    let peerAuthReached = false;
+    let releasePeerAuth: (() => void) | undefined;
+    const peerAuthGate = new Promise<void>((resolve) => {
+      releasePeerAuth = resolve;
+    });
+    const activeCalls: string[] = [];
+    const peerCalls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("api.deepseek.com")) {
+        peerCalls.push(url);
+        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
+      }
+      activeCalls.push(url);
+      return codexBody(activeCalls.length * 11);
+    }) as typeof fetch;
+    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
+      if (model.provider === "deepseek") {
+        if (holdPeerAuth) {
+          peerAuthReached = true;
+          return { apiKey: "key-a", source: "stored", wait: peerAuthGate };
+        }
+        return { apiKey: "key-a", source: "stored" };
+      }
+      return { apiKey: currentKey, source: "stored" };
+    };
+    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://a.example/v1" });
+    const deepseek = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [cpa, deepseek],
+      auth,
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false, providers: { deepseek: { enabled: true } } }),
+    });
+    const fake = fakeContext({ model: cpa, registry });
+    await host.activate(fake.ctx, cpa, { refresh: false });
+
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    holdPeerAuth = true;
+    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => peerAuthReached);
+
+    // An ordinary refresh of the same credential is not a source change.
+    await host.refreshActive(fake.ctx, { reason: "interval", force: true });
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /22%/);
+
+    releasePeerAuth?.();
+    await pending;
+
+    assert.equal(peerCalls.length, 1, "an unchanged source keeps the report's authority");
+    assert.equal(fake.widgets.length, 1, "the report is published");
+    const text = (fake.widgets[0]?.lines ?? []).join("\n");
+    // The report keeps its own collected snapshot, not the ordinary refresh's.
+    assert.match(text, /11%/);
+    assert.doesNotMatch(text, /22%/);
+    assert.match(text, /balance \(USD\)/);
+    assert.equal(activeCalls.length, 2);
+    host.shutdown(fake.ctx);
+  });
+
   it("discards a pending active refresh when the live selection changes route without an event", async () => {
     let release: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {
