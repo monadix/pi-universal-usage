@@ -81,6 +81,12 @@ export function formatMetric(metric: UsageMetric, now: number): string {
   } else if (metric.used !== undefined) {
     parts.push(amountText(metric.used, metric.unit));
     hasMeasurement = true;
+  } else if (metric.limit !== undefined) {
+    // A declared cap without any utilization sibling is still a real
+    // measurement; report the cap and say the usage side is unknown rather
+    // than showing nothing or inventing a percentage.
+    parts.push(`limit ${amountText(metric.limit, metric.unit)}; usage unknown`);
+    hasMeasurement = true;
   }
   if (metric.status !== undefined && (!hasMeasurement || showsStatusWithMeasurement(metric.status))) {
     parts.push(metric.status);
@@ -151,6 +157,9 @@ function shortMetric(metric: UsageMetric, now: number): string {
     hasMeasurement = true;
   } else if (metric.used !== undefined) {
     text = `${label} ${amountText(metric.used, metric.unit)}`;
+    hasMeasurement = true;
+  } else if (metric.limit !== undefined) {
+    text = `${label} limit ${amountText(metric.limit, metric.unit)}; usage unknown`;
     hasMeasurement = true;
   }
   if (metric.status !== undefined && (!hasMeasurement || showsStatusWithMeasurement(metric.status))) {

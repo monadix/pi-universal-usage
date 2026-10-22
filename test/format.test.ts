@@ -5,6 +5,7 @@ import { formatCompact, formatDuration, formatMetric, formatPercent, formatRepor
 import { anthropicJsonParser } from "../src/parsers/anthropic.ts";
 import { codexJsonParser } from "../src/parsers/codex-json.ts";
 import { deepseekBalanceParser } from "../src/parsers/deepseek.ts";
+import { rateLimitHeadersParser } from "../src/parsers/rate-limit-headers.ts";
 import type { TargetSnapshot } from "../src/types.ts";
 
 const NOW = 1_768_000_000_000;
@@ -170,6 +171,26 @@ describe("formatting", () => {
     assert.match(text, /primary 88% reset elapsed/);
     assert.match(text, /weekly 42%/);
     assert.match(text, /reset 2d/);
+  });
+
+  it("shows a limit-only measurement as an explicitly unknown-usage cap", () => {
+    const parsed = rateLimitHeadersParser.parse({
+      now: NOW,
+      headers: { "x-ratelimit-limit-requests": "500", "x-ratelimit-reset-requests": "1m" },
+    });
+    assert.ok(parsed);
+    const metric = parsed.metrics[0];
+    assert.ok(metric);
+    assert.equal(metric.usedPercent, undefined);
+
+    const line = formatMetric(metric, NOW);
+    assert.match(line, /requests limit 500; usage unknown/);
+    assert.match(line, /resets in 1m/);
+    assert.doesNotMatch(line, /%/);
+
+    const footer = formatCompact(snapshot({ identity: { ...identity, providerId: "openai" }, metrics: parsed.metrics }), NOW, config);
+    assert.match(footer, /req limit 500; usage unknown/);
+    assert.doesNotMatch(footer, /%/);
   });
 
   it("labels a Codex secondary window by its declared non-weekly duration", () => {
