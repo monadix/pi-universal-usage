@@ -2070,6 +2070,82 @@ describe("pi extension wiring", () => {
     host.shutdown(fake.ctx);
   });
 
+  it("stops a report whose header route rotated away and back while a peer resolves", async () => {
+    let holdPeerAuth = false;
+    let peerAuthReached = false;
+    let releasePeerAuth: (() => void) | undefined;
+    const peerAuthGate = new Promise<void>((resolve) => {
+      releasePeerAuth = resolve;
+    });
+    const activeCalls: string[] = [];
+    const peerCalls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("api.deepseek.com")) {
+        peerCalls.push(url);
+        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
+      }
+      activeCalls.push(url);
+      return codexBody(activeCalls.length * 11);
+    }) as typeof fetch;
+    // The credential is the same on both routes, so only the routing header tells
+    // the accepted bindings apart.
+    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
+      if (model.provider === "deepseek") {
+        if (holdPeerAuth) {
+          peerAuthReached = true;
+          return { apiKey: "key-a", source: "stored", wait: peerAuthGate };
+        }
+        return { apiKey: "key-a", source: "stored" };
+      }
+      return { apiKey: "key-a", source: "stored" };
+    };
+    const active = fakeModel({
+      provider: "cpa",
+      id: "chat",
+      baseUrl: "https://a.example/v1",
+      headers: { "ChatGPT-Account-Id": "a" },
+    });
+    const moved = modelWithHeaders(active, { "ChatGPT-Account-Id": "b" });
+    const peer = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [active, moved, peer],
+      auth,
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false, providers: { deepseek: { enabled: true } } }),
+    });
+    const selection = { current: active };
+    const fake = fakeContext({ modelRef: selection, registry });
+    await host.activate(fake.ctx, active, { refresh: false });
+
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    holdPeerAuth = true;
+    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => peerAuthReached);
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /11%/);
+
+    // The header route rotates away and later returns while the report waits on
+    // its peer; returning to the same routing is not the authority it lost.
+    selection.current = moved;
+    await host.refreshActive(fake.ctx, { reason: "interval", force: true });
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /22%/);
+    selection.current = active;
+    await host.refreshActive(fake.ctx, { reason: "interval", force: true });
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /33%/);
+
+    releasePeerAuth?.();
+    await pending;
+
+    assert.equal(peerCalls.length, 0, "a header route that returns does not revive the report");
+    assert.equal(fake.widgets.length, 0, "no obsolete report is published");
+    assert.equal(fake.notifications.length, 0);
+    assert.equal(pi.entries.length, 0);
+    assert.equal(activeCalls.length, 3);
+    host.shutdown(fake.ctx);
+  });
+
   it("discards a pending active refresh when the live selection changes route without an event", async () => {
     let release: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {
@@ -2274,6 +2350,195 @@ const HELD_BOUNDARIES = [
   { name: "peer authentication", stage: "auth", active: false },
   { name: "peer GET", stage: "get", active: false },
 ] as const;
+
+/** The two ways a credential resolution can fail: reported, or thrown. */
+const FAILURE_FORMS: Record<string, () => FakeAuth> = {
+  "returned missing credential": () => ({ ok: false, error: "removed credential" }),
+  "thrown resolver failure": () => ({ throws: "the credential store is unavailable" }),
+};
+
+/**
+ * A report that started before activation adopts a failure may only continue under
+ * an accepted failure binding it did not lose. Every silent routing change is
+ * accepted on the way out and again on the way back while the report waits on a
+ * peer, so the report must own no authority at the end whichever form the
+ * resolver fails in.
+ */
+describe("failure binding routing identity", () => {
+  for (const [route, change] of Object.entries(SILENT_ROUTING_CHANGES)) {
+    for (const [form, failure] of Object.entries(FAILURE_FORMS)) {
+      it(`stops a pre-activation report after an accepted ${route} failure round trip (${form})`, async () => {
+        let holdActivationAuth = true;
+        let activationAuthReached = false;
+        let releaseActivationAuth: (() => void) | undefined;
+        const activationAuthGate = new Promise<void>((resolve) => {
+          releaseActivationAuth = resolve;
+        });
+        let holdPeerAuth = false;
+        let peerAuthReached = false;
+        let releasePeerAuth: (() => void) | undefined;
+        const peerAuthGate = new Promise<void>((resolve) => {
+          releasePeerAuth = resolve;
+        });
+        const activeCalls: string[] = [];
+        const peerCalls: string[] = [];
+        const fetchImpl = (async (input: string | URL | Request) => {
+          const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+          if (url.includes("api.deepseek.com")) {
+            peerCalls.push(url);
+            return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
+          }
+          activeCalls.push(url);
+          return codexBody(11);
+        }) as typeof fetch;
+        const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
+          if (model.provider === "deepseek") {
+            if (holdPeerAuth) {
+              peerAuthReached = true;
+              return { apiKey: "key-a", source: "stored", wait: peerAuthGate };
+            }
+            return { apiKey: "key-a", source: "stored" };
+          }
+          // Only the activation's own resolution is held; every later CPA
+          // reconciliation completes before the report resumes.
+          const held = holdActivationAuth;
+          holdActivationAuth = false;
+          if (held) activationAuthReached = true;
+          return { ...failure(), ...(held ? { wait: activationAuthGate } : {}) };
+        };
+        const active = fakeModel({
+          provider: "cpa",
+          id: "chat",
+          baseUrl: "https://a.example/v1",
+          headers: { Authorization: "Bearer synthetic-a", "ChatGPT-Account-Id": "a" },
+        });
+        const moved = change(active);
+        const peer = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
+        const { pi, host, registry } = buildHost({
+          fetchImpl,
+          models: [active, moved, peer],
+          auth,
+          timers: false,
+          config: normalizeConfig({ autoRefresh: false, providers: { deepseek: { enabled: true } } }),
+        });
+        const selection = { current: active };
+        const fake = fakeContext({ modelRef: selection, registry });
+        const activation = host.activate(fake.ctx, active, { refresh: false });
+        await waitFor(() => activationAuthReached);
+
+        const command = pi.commands.get(COMMAND_NAME);
+        assert.ok(command);
+        holdPeerAuth = true;
+        const pending = command.handler("deepseek", fake.ctx as unknown as ExtensionCommandContext);
+        await waitFor(() => peerAuthReached);
+
+        // Activation adopts the failure for A, then the changed route's failure
+        // and A's failure again are adopted while the report waits on its peer.
+        releaseActivationAuth?.();
+        await activation;
+        selection.current = moved;
+        await host.refreshActive(fake.ctx, { reason: "interval" });
+        assert.match(String(fake.statuses[fake.statuses.length - 1]), /no-credential/);
+        selection.current = active;
+        await host.refreshActive(fake.ctx, { reason: "interval" });
+        assert.match(String(fake.statuses[fake.statuses.length - 1]), /no-credential/);
+
+        releasePeerAuth?.();
+        await pending;
+
+        assert.equal(peerCalls.length, 0, "no peer is fetched for a revoked report");
+        assert.equal(activeCalls.length, 0, "no active request is issued");
+        assert.equal(fake.widgets.length, 0, "no obsolete report is published");
+        assert.equal(fake.notifications.length, 0);
+        assert.equal(pi.entries.length, 0);
+        host.shutdown(fake.ctx);
+      });
+    }
+  }
+
+  it("keeps a pre-activation report through an equivalent-header failure re-adoption", async () => {
+    let holdActivationAuth = true;
+    let activationAuthReached = false;
+    let releaseActivationAuth: (() => void) | undefined;
+    const activationAuthGate = new Promise<void>((resolve) => {
+      releaseActivationAuth = resolve;
+    });
+    let holdPeerAuth = false;
+    let peerAuthReached = false;
+    let releasePeerAuth: (() => void) | undefined;
+    const peerAuthGate = new Promise<void>((resolve) => {
+      releasePeerAuth = resolve;
+    });
+    const peerCalls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("api.deepseek.com")) {
+        peerCalls.push(url);
+        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
+      }
+      return codexBody(11);
+    }) as typeof fetch;
+    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
+      if (model.provider === "deepseek") {
+        if (holdPeerAuth) {
+          peerAuthReached = true;
+          return { apiKey: "key-a", source: "stored", wait: peerAuthGate };
+        }
+        return { apiKey: "key-a", source: "stored" };
+      }
+      const held = holdActivationAuth;
+      holdActivationAuth = false;
+      if (held) activationAuthReached = true;
+      return { ok: false, error: "removed credential", ...(held ? { wait: activationAuthGate } : {}) };
+    };
+    const active = fakeModel({
+      provider: "cpa",
+      id: "chat",
+      baseUrl: "https://a.example/v1",
+      headers: { Authorization: "Bearer synthetic-a", "ChatGPT-Account-Id": "a" },
+    });
+    // The same routing with recased, reordered headers is not another route.
+    const equivalent = modelWithHeaders(active, { "chatgpt-account-id": "a", authorization: "Bearer synthetic-a" });
+    const peer = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [active, equivalent, peer],
+      auth,
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false, providers: { deepseek: { enabled: true } } }),
+    });
+    const selection = { current: active };
+    const fake = fakeContext({ modelRef: selection, registry });
+    const activation = host.activate(fake.ctx, active, { refresh: false });
+    await waitFor(() => activationAuthReached);
+
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    holdPeerAuth = true;
+    const pending = command.handler("deepseek", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => peerAuthReached);
+
+    // The equivalent route adopts its failure while the report waits, which is
+    // a re-adoption of the same accepted binding, not a replacement.
+    releaseActivationAuth?.();
+    await activation;
+    selection.current = equivalent;
+    await host.refreshActive(fake.ctx, { reason: "interval" });
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /no-credential/);
+
+    releasePeerAuth?.();
+    await pending;
+
+    assert.equal(peerCalls.length, 1, "an equivalent route keeps the report's authority");
+    assert.equal(fake.widgets.length, 1, "the report is published");
+    const text = (fake.widgets[0]?.lines ?? []).join("\n");
+    assert.match(text, /deepseek\/chat/);
+    assert.match(text, /balance \(USD\)/);
+    assert.match(text, /cpa\/chat/);
+    assert.match(text, /state: no-credential/);
+    host.shutdown(fake.ctx);
+  });
+});
 
 describe("host routing binding", () => {
   for (const boundary of HELD_BOUNDARIES) {

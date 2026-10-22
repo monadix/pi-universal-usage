@@ -57,11 +57,6 @@ interface ActiveTarget {
   selection: SelectionBinding;
   /** Absent after a failed reconciliation; the selection is kept so a later retry can resolve it. */
   target?: ResolvedTarget;
-  /**
-   * Route identity of the sanitized failure this target-less binding adopted.
-   * Distinct failures share the `-` source sentinel but not this identity.
-   */
-  failureKey?: string;
 }
 
 /** Authority to adopt one asynchronous resolver result. */
@@ -264,7 +259,7 @@ export class UniversalUsageHost {
 
     if (!resolution.ok) {
       // Keep the selection so a later /usage or selection can retry resolution.
-      this.bindActive({ model, selection, failureKey: resolution.identity.key });
+      this.bindActive({ model, selection });
       this.lastSnapshot = {
         identity: resolution.identity,
         status: resolution.status,
@@ -422,7 +417,7 @@ export class UniversalUsageHost {
       // aborted and the old target can no longer satisfy a work lease.
       this.abortRefresh();
       this.monitor.cancel();
-      this.bindActive({ model, selection: lease.selection, failureKey: resolution.identity.key });
+      this.bindActive({ model, selection: lease.selection });
       this.passiveAttribution = undefined;
       const snapshot: TargetSnapshot = {
         identity: resolution.identity,
@@ -502,14 +497,17 @@ export class UniversalUsageHost {
   }
 
   /**
-   * The identity of an accepted binding: the resolved source, or the route
-   * identity of the sanitized failure a target-less binding adopted. Target-less
-   * bindings share the `-` source sentinel, so the failure identity is what tells
-   * one accepted failure route from another.
+   * The identity of an accepted binding: the accepted source, or `-` while the
+   * binding carries no target, together with the captured selection routing.
+   * Target-less bindings share the `-` source sentinel and a resolver failure
+   * fingerprints an empty header map, so only the captured routing - base URL,
+   * API, and canonical model headers including explicit `null` suppression -
+   * can tell two accepted failure routes apart.
    */
   private activeBindingToken(active: ActiveTarget | undefined): string {
     if (active === undefined) return "-";
-    return active.target?.identity.key ?? active.failureKey ?? "-";
+    const { model, routing } = active.selection;
+    return [active.target?.identity.key ?? "-", model.provider, model.id, routing].join("|");
   }
 
   /**
