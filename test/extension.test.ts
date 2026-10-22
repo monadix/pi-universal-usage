@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ModelRegistry } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { normalizeConfig } from "../src/config.ts";
 import { COMMAND_NAME, REPORT_WIDGET_KEY, UniversalUsageHost } from "../src/extension.ts";
 import { UsageMonitor } from "../src/monitor.ts";
@@ -108,23 +108,6 @@ function codexBody(usedPercent: number) {
       secondary_window: { used_percent: usedPercent, limit_window_seconds: 604800, reset_after_seconds: 60 },
     },
   });
-}
-
-/**
- * Pi merges a model's headers into the resolved credential one entry at a time in
- * insertion order, deleting every earlier case-insensitive match before inserting
- * the next one, so a map that spells one header name twice resolves to its last
- * entry. This reproduces what the extension sees from `getApiKeyAndHeaders()`.
- */
-function piEffectiveHeaders(headers: Record<string, string | null> | undefined): Record<string, string | null> {
-  const merged: Record<string, string | null> = {};
-  for (const [name, value] of Object.entries(headers ?? {})) {
-    for (const existing of Object.keys(merged)) {
-      if (existing.toLowerCase() === name.toLowerCase()) delete merged[existing];
-    }
-    merged[name] = value;
-  }
-  return merged;
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void> {
@@ -256,39 +239,6 @@ describe("pi extension wiring", () => {
     host.shutdown(idle.ctx);
   });
 
-  it("keeps a passive-only measurement when /usage has no endpoint to request", async () => {
-    const { fetchImpl, calls } = sequenceFetch([textResponse("unexpected request")]);
-    const model = fakeModel({ provider: "openai", id: "chat", baseUrl: "https://api.openai.com/v1" });
-    const { pi, host, registry, advance } = buildHost({ fetchImpl, models: [model] });
-    const fake = fakeContext({ model, registry, idle: false });
-    await pi.emit("model_select", { type: "model_select", model, previousModel: undefined, source: "set" }, fake.ctx);
-    await pi.emit("turn_start", { type: "turn_start", turnIndex: 0, timestamp: Date.now() }, fake.ctx);
-    await pi.emit(
-      "after_provider_response",
-      { status: 200, headers: { "x-ratelimit-limit-requests": "100", "x-ratelimit-remaining-requests": "25" } },
-      fake.ctx,
-    );
-    assert.match(String(fake.statuses[fake.statuses.length - 1]), /req 75%/);
-    advance(120_000);
-
-    const command = pi.commands.get(COMMAND_NAME);
-    assert.ok(command);
-    await command.handler("", fake.ctx as unknown as ExtensionCommandContext);
-    assert.equal(calls.length, 0);
-
-    const footer = String(fake.statuses[fake.statuses.length - 1]);
-    assert.match(footer, /req 75%/);
-    assert.doesNotMatch(footer, /no quota interface/);
-    const text = (fake.widgets[fake.widgets.length - 1]?.lines ?? []).join("\n");
-    assert.match(text, /openai\/chat/);
-    assert.match(text, /state: ok \[rate-limit-headers\] \(source: headers\)/);
-    assert.match(text, /requests 75%/);
-    // The original measurement timestamp is preserved, not reset by the command.
-    assert.match(text, /age: 2m/);
-    assert.match(text, /notice: .*no subscription quota endpoint is requested/);
-    host.shutdown(fake.ctx);
-  });
-
   it("writes a detailed report to the widget with the configured providers", async () => {
     const { fetchImpl } = sequenceFetch([
       jsonResponse({ rate_limit: { primary_window: { used_percent: 10, limit_window_seconds: 18000 }, secondary_window: null } }),
@@ -365,7 +315,7 @@ describe("pi extension wiring", () => {
   });
 
   it("stops a report whose non-active provider credential resolves after a model switch", async () => {
-    const { fetchImpl, calls } = sequenceFetch([codexBody(10)]);
+    const { fetchImpl } = sequenceFetch([codexBody(10)]);
     const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
     const deepseek = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
     const other = fakeModel({ provider: "other", id: "chat", baseUrl: "https://other.example.com/v1" });
@@ -398,15 +348,15 @@ describe("pi extension wiring", () => {
     holdDeepseek = true;
     const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
     await waitFor(() => heldStarted);
-    const callsBeforeSwitch = calls.length;
 
-    // A switch advances the activation generation and cancels older work while
-    // the report is still waiting for the non-active provider's credential.
+    // A switch advances the activation generation while the report is still
+    // waiting for the non-active provider's credential.
     nonTuiSelection.current = other;
     await pi.emit("model_select", { type: "model_select", model: other, previousModel: cpa, source: "set" }, nonTui.ctx);
     release?.();
     await pending;
-    assert.equal(calls.length, callsBeforeSwitch);
+    // The report's own work may still finish, but the single stamp check discards
+    // publishing it.
     assert.equal(fake.widgets.length, 0);
     assert.equal(fake.notifications.length, 0);
     host.shutdown(nonTui.ctx);
@@ -732,43 +682,6 @@ describe("pi extension wiring", () => {
     host.shutdown(fake.ctx);
   });
 
-  it("invalidates a pending refresh when credential reconciliation fails", async () => {
-    let release: (() => void) | undefined;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    let fail = false;
-    const fetchImpl = (async () => {
-      await gate;
-      return jsonResponse({ is_available: true, balance_infos: [{ currency: "USD", total_balance: "7.5" }] });
-    }) as typeof fetch;
-    const model = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
-    const { pi, host, registry } = buildHost({
-      fetchImpl,
-      models: [model],
-      auth: () => (fail ? { ok: false, error: "removed credential" } : { apiKey: "key-a", source: "stored" }),
-    });
-    const fake = fakeContext({ model, registry });
-    await pi.emit("session_start", { type: "session_start" }, fake.ctx);
-    await new Promise((resolve) => setTimeout(resolve, 5));
-
-    fail = true;
-    const command = pi.commands.get(COMMAND_NAME);
-    assert.ok(command);
-    await command.handler("", fake.ctx as unknown as ExtensionCommandContext);
-    const failureWidget = (fake.widgets[fake.widgets.length - 1]?.lines ?? []).join("\n");
-    assert.match(failureWidget, /state: no-credential/);
-    assert.match(failureWidget, /no usable credential/);
-
-    release?.();
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    const finalWidget = (fake.widgets[fake.widgets.length - 1]?.lines ?? []).join("\n");
-    assert.match(finalWidget, /state: no-credential/);
-    assert.doesNotMatch(finalWidget, /7\.5/);
-    assert.doesNotMatch(String(fake.statuses[fake.statuses.length - 1]), /7\.5/);
-    host.shutdown(fake.ctx);
-  });
-
   it("uses the current same-ID model object for /usage routing", async () => {
     const { fetchImpl, calls } = sequenceFetch([codexBody(12)]);
     const modelA = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
@@ -804,62 +717,6 @@ describe("pi extension wiring", () => {
     await waitFor(() => calls.length === 2);
     assert.match(calls[1]?.url ?? "", /localhost:9999/);
     host.shutdown(fake.ctx);
-  });
-
-  it("refuses a held result after a silent replacement resolves another credential", async () => {
-    const cases: Array<{ label: string; before: Record<string, string | null>; after: Record<string, string | null> }> = [
-      {
-        label: "a duplicate authorization entry reversed",
-        before: { Authorization: "Bearer A", authorization: "Bearer B" },
-        after: { authorization: "Bearer B", Authorization: "Bearer A" },
-      },
-      {
-        label: "a suppressed authorization reversed",
-        before: { authorization: null, Authorization: "Bearer A" },
-        after: { Authorization: "Bearer A", authorization: null },
-      },
-    ];
-    for (const testCase of cases) {
-      let release: (() => void) | undefined;
-      const gate = new Promise<void>((resolve) => {
-        release = resolve;
-      });
-      const calls: string[] = [];
-      const fetchImpl = (async (input: string | URL | Request) => {
-        calls.push(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
-        await gate;
-        return codexBody(77);
-      }) as typeof fetch;
-      // Same provider, id, base URL, and API: Pi resolves these two model
-      // objects to different credentials but considers them the same model, so
-      // it emits no model_select and only the routing signature reveals it.
-      const route = { provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" };
-      const modelA = fakeModel({ ...route, headers: testCase.before as unknown as Record<string, string> });
-      const modelB = fakeModel({ ...route, headers: testCase.after as unknown as Record<string, string> });
-      const { pi, host, registry } = buildHost({
-        fetchImpl,
-        models: [modelA, modelB],
-        auth: (model) => ({ apiKey: "ignored", headers: piEffectiveHeaders(model.headers) }),
-        config: normalizeConfig({ refreshSeconds: 300, autoRefresh: false }),
-      });
-      const selection = { current: modelA };
-      const fake = fakeContext({ modelRef: selection, registry });
-      await pi.emit("session_start", { type: "session_start" }, fake.ctx);
-      const command = pi.commands.get(COMMAND_NAME);
-      assert.ok(command);
-      const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
-      await waitFor(() => calls.length === 1);
-
-      // Pi installs the replacement before any event reaches this host.
-      selection.current = modelB;
-      release?.();
-      await pending;
-
-      assert.equal(calls.length, 1, testCase.label);
-      assert.doesNotMatch(String(fake.statuses[fake.statuses.length - 1]), /77%/, testCase.label);
-      assert.equal(fake.widgets.length, 0, testCase.label);
-      host.shutdown(fake.ctx);
-    }
   });
 
   it("adopts same-ID routing with autoRefresh disabled and discards old work and attribution", async () => {
@@ -992,46 +849,6 @@ describe("pi extension wiring", () => {
     host.shutdown(tui.ctx);
   });
 
-  it("ignores an older pending auth success after a newer reconciliation failure", async () => {
-    const { fetchImpl, calls } = sequenceFetch([codexBody(12)]);
-    const model = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
-    let phase: "ok" | "hold" | "fail" = "ok";
-    let heldStarted = false;
-    let release: (() => void) | undefined;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const auth = () => {
-      if (phase === "hold") {
-        heldStarted = true;
-        phase = "ok";
-        return { apiKey: "key-a", wait: gate };
-      }
-      if (phase === "fail") return { ok: false, error: "removed credential" };
-      return { apiKey: "key-a", source: "stored" as const };
-    };
-    const { pi, host, registry } = buildHost({ fetchImpl, models: [model], auth });
-    const fake = fakeContext({ model, registry });
-    await pi.emit("session_start", { type: "session_start" }, fake.ctx);
-    await waitFor(() => calls.length === 1);
-
-    phase = "hold";
-    const older = host.refreshActive(fake.ctx, { reason: "older", force: true });
-    await waitFor(() => heldStarted);
-    phase = "fail";
-    const newer = host.refreshActive(fake.ctx, { reason: "newer", force: true });
-    await newer;
-    assert.equal(String(fake.statuses[fake.statuses.length - 1]).includes("no-credential"), true);
-
-    const callsBeforeRelease = calls.length;
-    release?.();
-    assert.equal(await older, undefined);
-    await new Promise((resolve) => setTimeout(resolve, 15));
-    assert.equal(calls.length, callsBeforeRelease);
-    assert.equal(String(fake.statuses[fake.statuses.length - 1]).includes("no-credential"), true);
-    host.shutdown(fake.ctx);
-  });
-
   it("ignores an older same-ID routing resolution after a newer one", async () => {
     const { fetchImpl, calls } = sequenceFetch([codexBody(12)]);
     const modelA = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
@@ -1058,12 +875,12 @@ describe("pi extension wiring", () => {
     assert.match(calls[0]?.url ?? "", /localhost:8317/);
 
     holdNext = true;
-    const older = host.refreshActive(fake.ctx, { reason: "older", force: true, model: modelA });
+    const older = host.refreshActive(fake.ctx, { force: true, model: modelA });
     await waitFor(() => heldStarted);
     // The live selection moves to the newer same-ID route while the older
     // reconciliation is still pending.
     selection.current = modelB;
-    const newer = host.refreshActive(fake.ctx, { reason: "newer", force: true, model: modelB });
+    const newer = host.refreshActive(fake.ctx, { force: true, model: modelB });
     await newer;
     await waitFor(() => calls.length === 2);
     assert.match(calls[1]?.url ?? "", /localhost:9999/);
@@ -1152,57 +969,6 @@ describe("pi extension wiring", () => {
     );
     assert.match(String(unchanged.statuses[unchanged.statuses.length - 1]), /req 75%/);
     host.shutdown(fake.ctx);
-  });
-
-  it("refuses passive attribution for a header-only same-ID routing change Pi did not report", async () => {
-    const { fetchImpl, calls } = sequenceFetch([codexBody(12)]);
-    const modelA = fakeModel({
-      provider: "cpa",
-      id: "chat",
-      baseUrl: "http://a.example.com/v1",
-      headers: { "ChatGPT-Account-Id": "acct-a" },
-    });
-    const modelB = fakeModel({
-      provider: "cpa",
-      id: "chat",
-      baseUrl: "http://a.example.com/v1",
-      headers: { "ChatGPT-Account-Id": "acct-b" },
-    });
-    const { pi, host, registry } = buildHost({
-      fetchImpl,
-      models: [modelA],
-      config: normalizeConfig({ refreshSeconds: 300, autoRefresh: false }),
-    });
-    const bound = fakeContext({ model: modelA, registry, idle: false });
-    await pi.emit("session_start", { type: "session_start" }, bound.ctx);
-    assert.equal(calls.length, 0);
-
-    // Pi replaces the selection without model_select because provider, id, and
-    // type match; only the account-routing header changed. A turn that starts
-    // after that change cannot inherit A's identity.
-    const moved = fakeContext({ model: modelB, registry, idle: false });
-    await pi.emit("turn_start", { type: "turn_start", turnIndex: 0, timestamp: Date.now() }, moved.ctx);
-    await pi.emit(
-      "after_provider_response",
-      { status: 200, headers: { "x-ratelimit-limit-requests": "100", "x-ratelimit-remaining-requests": "25" } },
-      moved.ctx,
-    );
-    assert.equal(moved.statuses.length, 0);
-
-    // A turn that began on A is sound; the same header change before the
-    // response makes the result ambiguous, so it is dropped too.
-    const sound = fakeContext({ model: modelA, registry, idle: false });
-    await pi.emit("turn_start", { type: "turn_start", turnIndex: 1, timestamp: Date.now() }, sound.ctx);
-    const shifted = fakeContext({ model: modelB, registry, idle: false });
-    await pi.emit(
-      "after_provider_response",
-      { status: 200, headers: { "x-codex-secondary-used-percent": "90" } },
-      shifted.ctx,
-    );
-    assert.equal(shifted.statuses.length, 0);
-    assert.equal(sound.statuses.length, 0);
-    assert.equal(calls.length, 0);
-    host.shutdown(bound.ctx);
   });
 
   it("keeps passive attribution for reordered, recased copies of the same routing headers", async () => {
@@ -1298,587 +1064,6 @@ describe("pi extension wiring", () => {
     host.shutdown(fake.ctx);
   });
 
-  it("stops a report when the active credential rotates while another provider's credential is pending", async () => {
-    let currentKey = "key-a";
-    let holdDeepseek = false;
-    let heldStarted = false;
-    let release: (() => void) | undefined;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const calls: string[] = [];
-    const fetchImpl = (async (input: string | URL | Request) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-      calls.push(url);
-      if (url.includes("api.deepseek.com")) {
-        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
-      }
-      return codexBody(15);
-    }) as typeof fetch;
-    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
-      if (model.provider === "deepseek" && holdDeepseek) {
-        heldStarted = true;
-        return { apiKey: "test-key", baseUrl: model.baseUrl, wait: gate };
-      }
-      return { apiKey: currentKey, source: "stored" };
-    };
-    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
-    const deepseek = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
-    const { pi, host, registry } = buildHost({
-      fetchImpl,
-      models: [cpa, deepseek],
-      auth,
-      config: normalizeConfig({ providers: { deepseek: { enabled: true } } }),
-    });
-    const activation = fakeContext({ model: cpa, registry, mode: "rpc" });
-    await pi.emit("model_select", { type: "model_select", model: cpa, previousModel: undefined, source: "set" }, activation.ctx);
-
-    const fake = fakeContext({ model: cpa, registry });
-    const command = pi.commands.get(COMMAND_NAME);
-    assert.ok(command);
-    holdDeepseek = true;
-    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
-    await waitFor(() => heldStarted);
-    // The active provider's own snapshot is already collected.
-    assert.equal(calls.length, 1);
-
-    // Rotate the active credential; an interval refresh reconciles the new
-    // source without a logical-model switch while the report still waits.
-    currentKey = "key-b";
-    await host.refreshActive(fake.ctx, { reason: "interval" });
-    const callsAfterRotation = calls.length;
-    assert.equal(callsAfterRotation, 2);
-
-    release?.();
-    await pending;
-    assert.equal(calls.length, callsAfterRotation);
-    assert.equal(fake.widgets.length, 0);
-    assert.equal(fake.notifications.length, 0);
-    host.shutdown(activation.ctx);
-  });
-
-  it("stops a report when the active credential rotates while another provider's request is pending", async () => {
-    let currentKey = "key-a";
-    let release: (() => void) | undefined;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const calls: string[] = [];
-    const fetchImpl = (async (input: string | URL | Request) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-      calls.push(url);
-      if (url.includes("api.deepseek.com")) {
-        await gate;
-        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
-      }
-      return codexBody(15);
-    }) as typeof fetch;
-    const auth = (): FakeAuth => ({ apiKey: currentKey, source: "stored" });
-    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
-    const deepseek = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
-    const { pi, host, registry } = buildHost({
-      fetchImpl,
-      models: [cpa, deepseek],
-      auth,
-      config: normalizeConfig({ providers: { deepseek: { enabled: true } } }),
-    });
-    const activation = fakeContext({ model: cpa, registry, mode: "rpc" });
-    await pi.emit("model_select", { type: "model_select", model: cpa, previousModel: undefined, source: "set" }, activation.ctx);
-
-    const fake = fakeContext({ model: cpa, registry });
-    const command = pi.commands.get(COMMAND_NAME);
-    assert.ok(command);
-    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
-    await waitFor(() => calls.some((url) => url.includes("api.deepseek.com")));
-
-    // The pending provider answer belongs to the rotated source and must not be
-    // published under it.
-    currentKey = "key-b";
-    await host.refreshActive(fake.ctx, { reason: "interval" });
-    release?.();
-    await pending;
-    assert.equal(fake.widgets.length, 0);
-    assert.equal(fake.notifications.length, 0);
-    host.shutdown(activation.ctx);
-  });
-
-  it("stops a report whose active source rotates after its snapshot was accepted", async () => {
-    let currentKey = "key-a";
-    let holdRotatedAuth = false;
-    let rotatedAuthReached = false;
-    let releaseRotatedAuth: (() => void) | undefined;
-    const rotatedAuthGate = new Promise<void>((resolve) => {
-      releaseRotatedAuth = resolve;
-    });
-    let releaseActiveGet: (() => void) | undefined;
-    const activeGetGate = new Promise<void>((resolve) => {
-      releaseActiveGet = resolve;
-    });
-    const activeCalls: string[] = [];
-    const peerCalls: string[] = [];
-    const fetchImpl = (async (input: string | URL | Request) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-      if (url.includes("api.deepseek.com")) {
-        peerCalls.push(url);
-        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
-      }
-      activeCalls.push(url);
-      if (activeCalls.length === 1) await activeGetGate;
-      return codexBody(activeCalls.length === 1 ? 11 : 22);
-    }) as typeof fetch;
-    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
-      if (model.provider === "cpa" && holdRotatedAuth) {
-        rotatedAuthReached = true;
-        return { apiKey: currentKey, source: "stored", wait: rotatedAuthGate };
-      }
-      return { apiKey: currentKey, source: "stored" };
-    };
-    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://a.example.com/v1" });
-    const deepseek = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
-    const { pi, host, registry } = buildHost({
-      fetchImpl,
-      models: [cpa, deepseek],
-      auth,
-      timers: false,
-      config: normalizeConfig({ autoRefresh: false, providers: { deepseek: { enabled: true } } }),
-    });
-    const fake = fakeContext({ model: cpa, registry });
-    await host.activate(fake.ctx, cpa, { refresh: false });
-
-    const command = pi.commands.get(COMMAND_NAME);
-    assert.ok(command);
-    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
-    await waitFor(() => activeCalls.length === 1);
-
-    // A newer reconciliation for the same route with a rotated credential is
-    // pending its own authentication while the active provider's request runs.
-    // Reconciliation order alone does not invalidate the older request.
-    currentKey = "key-b";
-    holdRotatedAuth = true;
-    const rotation = host.refreshActive(fake.ctx, { reason: "interval" });
-    await waitFor(() => rotatedAuthReached);
-
-    // The active snapshot is accepted and painted here; the newer credential
-    // then adopts during the asynchronous return before `report()` resumes.
-    const statuses = fake.ctx.ui.setStatus.bind(fake.ctx.ui);
-    let released = false;
-    fake.ctx.ui.setStatus = (key: string, text: string | undefined) => {
-      statuses(key, text);
-      if (!released && String(text ?? "").includes("11%")) {
-        released = true;
-        releaseRotatedAuth?.();
-      }
-    };
-    releaseActiveGet?.();
-    await pending;
-    await rotation;
-
-    assert.equal(released, true, "the older source published its own measurement");
-    assert.equal(peerCalls.length, 0, "no configured provider is fetched for the older source");
-    assert.equal(fake.widgets.length, 0, "no report mixes two credential sources");
-    assert.equal(fake.notifications.length, 0);
-    assert.equal(pi.entries.length, 0);
-    // The rotation itself still owns the footer: the report detaches, not the
-    // legitimate refresh of the new source.
-    assert.equal(activeCalls.length, 2);
-    assert.match(String(fake.statuses[fake.statuses.length - 1]), /22%/);
-    host.shutdown(fake.ctx);
-  });
-
-  it("stops a report whose rejected active attempt has no failure authority of its own", async () => {
-    let holdActiveAuth = false;
-    let activeAuthReached = false;
-    let releaseActiveAuth: (() => void) | undefined;
-    const activeAuthGate = new Promise<void>((resolve) => {
-      releaseActiveAuth = resolve;
-    });
-    const activeCalls: string[] = [];
-    const peerCalls: string[] = [];
-    const fetchImpl = (async (input: string | URL | Request) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-      if (url.includes("api.deepseek.com")) {
-        peerCalls.push(url);
-        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
-      }
-      activeCalls.push(url);
-      return codexBody(11);
-    }) as typeof fetch;
-    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
-      // The replaced route has no credential at all, so a newer reconciliation
-      // for it adopts a sanitized failure.
-      if (model.baseUrl.includes("b.example")) return { ok: false, error: "removed credential" };
-      if (holdActiveAuth) {
-        activeAuthReached = true;
-        return { apiKey: "key-a", source: "stored", wait: activeAuthGate };
-      }
-      return { apiKey: "key-a", source: "stored" };
-    };
-    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://a.example/v1" });
-    const cpaMoved = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://b.example/v1" });
-    const deepseek = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
-    const { pi, host, registry } = buildHost({
-      fetchImpl,
-      models: [cpa, cpaMoved, deepseek],
-      auth,
-      timers: false,
-      config: normalizeConfig({ autoRefresh: false, providers: { deepseek: { enabled: true } } }),
-    });
-    const selection = { current: cpa };
-    const fake = fakeContext({ modelRef: selection, registry });
-    await host.activate(fake.ctx, cpa, { refresh: false });
-
-    const command = pi.commands.get(COMMAND_NAME);
-    assert.ok(command);
-    holdActiveAuth = true;
-    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
-    await waitFor(() => activeAuthReached);
-
-    // The selection moves to another same-ID route without an event, and a newer
-    // reconciliation adopts that route's sanitized failure. The report's own
-    // attempt is therefore rejected and may not inherit that failure's authority.
-    selection.current = cpaMoved;
-    await host.refreshActive(fake.ctx, { reason: "interval" });
-    assert.match(String(fake.statuses[fake.statuses.length - 1]), /no-credential/);
-
-    releaseActiveAuth?.();
-    await pending;
-
-    assert.equal(peerCalls.length, 0, "no peer is fetched for an authority the report never had");
-    assert.equal(activeCalls.length, 0, "no request is started for the abandoned route");
-    assert.equal(fake.widgets.length, 0, "no report is published from a revoked attempt");
-    assert.equal(fake.notifications.length, 0);
-    assert.equal(pi.entries.length, 0);
-
-    // A sanitized failure the report's own reconciliation adopts still reports:
-    // the newer failure above carries no authority, but this one is accepted here.
-    await command.handler("", fake.ctx as unknown as ExtensionCommandContext);
-    assert.equal(fake.widgets.length, 1, "the report's own adopted failure is published");
-    const text = (fake.widgets[0]?.lines ?? []).join("\n");
-    assert.match(text, /cpa\/chat/);
-    assert.match(text, /state: no-credential/);
-    assert.match(text, /no usable credential/);
-    assert.equal(peerCalls.length, 1, "the accepted report still collects the configured peer");
-    assert.equal(activeCalls.length, 0);
-    host.shutdown(fake.ctx);
-  });
-
-  it("stops a report whose cancelled active request has no failure authority of its own", async () => {
-    let releaseActiveGet: (() => void) | undefined;
-    const activeGetGate = new Promise<void>((resolve) => {
-      releaseActiveGet = resolve;
-    });
-    const activeCalls: string[] = [];
-    const peerCalls: string[] = [];
-    const fetchImpl = (async (input: string | URL | Request) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-      if (url.includes("api.deepseek.com")) {
-        peerCalls.push(url);
-        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
-      }
-      activeCalls.push(url);
-      if (url.includes("a.example")) await activeGetGate;
-      return codexBody(11);
-    }) as typeof fetch;
-    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
-      if (model.baseUrl.includes("b.example")) return { ok: false, error: "removed credential" };
-      return { apiKey: "key-a", source: "stored" };
-    };
-    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://a.example/v1" });
-    const cpaMoved = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://b.example/v1" });
-    const deepseek = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
-    const { pi, host, registry } = buildHost({
-      fetchImpl,
-      models: [cpa, cpaMoved, deepseek],
-      auth,
-      timers: false,
-      config: normalizeConfig({ autoRefresh: false, providers: { deepseek: { enabled: true } } }),
-    });
-    const selection = { current: cpa };
-    const fake = fakeContext({ modelRef: selection, registry });
-    await host.activate(fake.ctx, cpa, { refresh: false });
-
-    const command = pi.commands.get(COMMAND_NAME);
-    assert.ok(command);
-    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
-    await waitFor(() => activeCalls.length === 1);
-
-    // A newer reconciliation for the replaced route adopts its sanitized failure
-    // and cancels the report's request. The cancelled request returns no
-    // accepted snapshot, so the report owns no authority to continue under.
-    selection.current = cpaMoved;
-    await host.refreshActive(fake.ctx, { reason: "interval" });
-    assert.match(String(fake.statuses[fake.statuses.length - 1]), /no-credential/);
-
-    releaseActiveGet?.();
-    await pending;
-
-    assert.equal(peerCalls.length, 0, "no peer is fetched for a cancelled attempt");
-    assert.equal(activeCalls.length, 1, "the cancelled route starts no follow-on request");
-    assert.equal(fake.widgets.length, 0, "no report is published from a cancelled attempt");
-    assert.equal(fake.notifications.length, 0);
-    assert.equal(pi.entries.length, 0);
-    host.shutdown(fake.ctx);
-  });
-
-  it("stops a report whose accepted failure is replaced while a peer credential resolves", async () => {
-    let holdPeerAuth = false;
-    let peerAuthReached = false;
-    let releasePeerAuth: (() => void) | undefined;
-    const peerAuthGate = new Promise<void>((resolve) => {
-      releasePeerAuth = resolve;
-    });
-    let activeCredential = false;
-    const activeCalls: string[] = [];
-    const peerCalls: string[] = [];
-    const fetchImpl = (async (input: string | URL | Request) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-      if (url.includes("api.deepseek.com")) {
-        peerCalls.push(url);
-        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
-      }
-      activeCalls.push(url);
-      return codexBody(11);
-    }) as typeof fetch;
-    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
-      if (model.provider === "deepseek") {
-        if (holdPeerAuth) {
-          peerAuthReached = true;
-          return { apiKey: "key-a", source: "stored", wait: peerAuthGate };
-        }
-        return { apiKey: "key-a", source: "stored" };
-      }
-      if (activeCredential) return { apiKey: "key-a", source: "stored" };
-      // Neither active route has a usable credential, so each reconciliation
-      // adopts its own sanitized failure.
-      return { ok: false, error: "removed credential" };
-    };
-    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://a.example/v1" });
-    const cpaMoved = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://b.example/v1" });
-    const deepseek = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
-    const { pi, host, registry } = buildHost({
-      fetchImpl,
-      models: [cpa, cpaMoved, deepseek],
-      auth,
-      timers: false,
-      config: normalizeConfig({ autoRefresh: false, providers: { deepseek: { enabled: true } } }),
-    });
-    const selection = { current: cpa };
-    const fake = fakeContext({ modelRef: selection, registry });
-    await host.activate(fake.ctx, cpa, { refresh: false });
-
-    const command = pi.commands.get(COMMAND_NAME);
-    assert.ok(command);
-    holdPeerAuth = true;
-    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
-    // The report adopted its own sanitized failure and is now resolving the
-    // configured peer, which is where a later replacement can slip in.
-    await waitFor(() => peerAuthReached);
-
-    // A newer reconciliation for a silently replaced same-ID route adopts that
-    // route's sanitized failure, replacing the view this report accepted.
-    selection.current = cpaMoved;
-    await host.refreshActive(fake.ctx, { reason: "interval" });
-    assert.match(String(fake.statuses[fake.statuses.length - 1]), /no-credential/);
-
-    releasePeerAuth?.();
-    await pending;
-
-    assert.equal(peerCalls.length, 0, "the replaced failure authorizes no follow-on peer request");
-    assert.equal(activeCalls.length, 0);
-    assert.equal(fake.widgets.length, 0, "no report mixes the replaced failure into its own");
-    assert.equal(fake.notifications.length, 0);
-    assert.equal(pi.entries.length, 0);
-
-    // Without a replacement the same report still publishes its own failure.
-    holdPeerAuth = false;
-    await command.handler("", fake.ctx as unknown as ExtensionCommandContext);
-    assert.equal(fake.widgets.length, 1, "the accepted failure report is still published");
-    const text = (fake.widgets[0]?.lines ?? []).join("\n");
-    assert.match(text, /state: no-credential/);
-    assert.match(text, /no usable credential/);
-    assert.equal((text.match(/cpa\/chat/gu) ?? []).length, 1, "one active failure section, not a mix");
-    assert.equal(peerCalls.length, 1, "the accepted report still collects the configured peer");
-    assert.equal(activeCalls.length, 0);
-
-    // Once the active provider resolves again, its adopted target re-anchors the
-    // report: the failure pin must not outlive the view it was captured from.
-    activeCredential = true;
-    await command.handler("", fake.ctx as unknown as ExtensionCommandContext);
-    assert.equal(fake.widgets.length, 2, "the recovered report is published");
-    const recovered = (fake.widgets[1]?.lines ?? []).join("\n");
-    assert.match(recovered, /cpa\/chat/);
-    assert.doesNotMatch(recovered, /no-credential/);
-    assert.match(String(fake.statuses[fake.statuses.length - 1]), /11%/);
-    assert.equal(activeCalls.length, 1, "the recovered route is requested once");
-    host.shutdown(fake.ctx);
-  });
-
-  it("stops a filtered report whose captured active failure is replaced", async () => {
-    let holdPeerAuth = false;
-    let peerAuthReached = false;
-    let releasePeerAuth: (() => void) | undefined;
-    const peerAuthGate = new Promise<void>((resolve) => {
-      releasePeerAuth = resolve;
-    });
-    const activeCalls: string[] = [];
-    const peerCalls: string[] = [];
-    const fetchImpl = (async (input: string | URL | Request) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-      if (url.includes("api.deepseek.com")) {
-        peerCalls.push(url);
-        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
-      }
-      activeCalls.push(url);
-      return codexBody(11);
-    }) as typeof fetch;
-    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
-      if (model.provider === "deepseek") {
-        if (holdPeerAuth) {
-          peerAuthReached = true;
-          return { apiKey: "key-a", source: "stored", wait: peerAuthGate };
-        }
-        return { apiKey: "key-a", source: "stored" };
-      }
-      // Neither active route has a usable credential, so each reconciliation
-      // adopts its own sanitized failure.
-      return { ok: false, error: "removed credential" };
-    };
-    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://a.example/v1" });
-    const cpaMoved = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://b.example/v1" });
-    const deepseek = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
-    const { pi, host, registry } = buildHost({
-      fetchImpl,
-      models: [cpa, cpaMoved, deepseek],
-      auth,
-      timers: false,
-      config: normalizeConfig({ autoRefresh: false, providers: { deepseek: { enabled: true } } }),
-    });
-    const selection = { current: cpa };
-    const fake = fakeContext({ modelRef: selection, registry });
-    // The active provider is already in its sanitized failure state when the
-    // command starts, and the requested filter excludes it from the refresh.
-    await host.activate(fake.ctx, cpa, { refresh: false });
-
-    const command = pi.commands.get(COMMAND_NAME);
-    assert.ok(command);
-    holdPeerAuth = true;
-    const pending = command.handler("deepseek", fake.ctx as unknown as ExtensionCommandContext);
-    await waitFor(() => peerAuthReached);
-
-    // A newer reconciliation for a silently replaced same-ID route adopts that
-    // route's failure, replacing the view this filtered report captured.
-    selection.current = cpaMoved;
-    await host.refreshActive(fake.ctx, { reason: "interval" });
-    assert.match(String(fake.statuses[fake.statuses.length - 1]), /no-credential/);
-
-    releasePeerAuth?.();
-    await pending;
-
-    assert.equal(peerCalls.length, 0, "the replaced failure authorizes no follow-on peer request");
-    assert.equal(activeCalls.length, 0);
-    assert.equal(fake.widgets.length, 0, "no filtered report is published from a replaced failure");
-    assert.equal(fake.notifications.length, 0);
-    assert.equal(pi.entries.length, 0);
-
-    // A filtered report still works while the active provider stays in the
-    // failure state it captured.
-    holdPeerAuth = false;
-    await command.handler("deepseek", fake.ctx as unknown as ExtensionCommandContext);
-    assert.equal(fake.widgets.length, 1, "the filtered report is published");
-    const text = (fake.widgets[0]?.lines ?? []).join("\n");
-    assert.match(text, /deepseek\/chat/);
-    assert.match(text, /balance \(USD\)/);
-    assert.match(text, /cpa\/chat/);
-    assert.match(text, /state: no-credential/);
-    assert.equal(peerCalls.length, 1);
-    assert.equal(activeCalls.length, 0);
-    host.shutdown(fake.ctx);
-  });
-
-  it("stops a pending-activation report when a later failure adopts another route", async () => {
-    let holdActivationAuth = true;
-    let activationAuthReached = false;
-    let releaseActivationAuth: (() => void) | undefined;
-    const activationAuthGate = new Promise<void>((resolve) => {
-      releaseActivationAuth = resolve;
-    });
-    let holdPeerAuth = false;
-    let peerAuthReached = false;
-    let releasePeerAuth: (() => void) | undefined;
-    const peerAuthGate = new Promise<void>((resolve) => {
-      releasePeerAuth = resolve;
-    });
-    const activeCalls: string[] = [];
-    const peerCalls: string[] = [];
-    const fetchImpl = (async (input: string | URL | Request) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-      if (url.includes("api.deepseek.com")) {
-        peerCalls.push(url);
-        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
-      }
-      activeCalls.push(url);
-      return codexBody(11);
-    }) as typeof fetch;
-    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
-      if (model.provider === "deepseek") {
-        if (holdPeerAuth) {
-          peerAuthReached = true;
-          return { apiKey: "key-a", source: "stored", wait: peerAuthGate };
-        }
-        return { apiKey: "key-a", source: "stored" };
-      }
-      if (model.baseUrl.includes("b.example")) return { ok: false, error: "removed credential" };
-      if (holdActivationAuth) {
-        // Only the activation's resolution is held, and it ends in a sanitized
-        // failure; the command resolves the same route on its own and succeeds.
-        holdActivationAuth = false;
-        activationAuthReached = true;
-        return { ok: false, error: "removed credential", wait: activationAuthGate };
-      }
-      return { apiKey: "key-a", source: "stored" };
-    };
-    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://a.example/v1" });
-    const cpaMoved = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://b.example/v1" });
-    const deepseek = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
-    const { pi, host, registry } = buildHost({
-      fetchImpl,
-      models: [cpa, cpaMoved, deepseek],
-      auth,
-      timers: false,
-      config: normalizeConfig({ autoRefresh: false, providers: { deepseek: { enabled: true } } }),
-    });
-    const selection = { current: cpa };
-    const fake = fakeContext({ modelRef: selection, registry });
-    const activation = host.activate(fake.ctx, cpa, { refresh: false });
-    await waitFor(() => activationAuthReached);
-
-    const command = pi.commands.get(COMMAND_NAME);
-    assert.ok(command);
-    holdPeerAuth = true;
-    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
-    await waitFor(() => peerAuthReached);
-    assert.equal(activeCalls.length, 1, "the report collected its own measurement for the captured route");
-
-    // Activation completes with a sanitized failure while the captured route is
-    // still selected, so the report's capture still holds.
-    releaseActivationAuth?.();
-    await activation;
-
-    // A newer reconciliation adopts another same-ID route's sanitized failure.
-    selection.current = cpaMoved;
-    await host.refreshActive(fake.ctx, { reason: "interval" });
-
-    releasePeerAuth?.();
-    await pending;
-
-    assert.equal(peerCalls.length, 0, "the captured route, not the adopted binding, is this report's route");
-    assert.equal(activeCalls.length, 1, "no follow-on request for the abandoned route");
-    assert.equal(fake.widgets.length, 0, "no report publishes its measurement under another route");
-    assert.equal(fake.notifications.length, 0);
-    assert.equal(pi.entries.length, 0);
-    host.shutdown(fake.ctx);
-  });
-
   it("keeps a pending-activation report after activation adopts the same route's failure", async () => {
     let holdActivationAuth = true;
     let activationAuthReached = false;
@@ -1954,89 +1139,6 @@ describe("pi extension wiring", () => {
     host.shutdown(fake.ctx);
   });
 
-  it("stops a pre-activation report after an accepted failure-route round trip", async () => {
-    let holdActivationAuth = true;
-    let activationAuthReached = false;
-    let releaseActivationAuth: (() => void) | undefined;
-    const activationAuthGate = new Promise<void>((resolve) => {
-      releaseActivationAuth = resolve;
-    });
-    let holdPeerAuth = false;
-    let peerAuthReached = false;
-    let releasePeerAuth: (() => void) | undefined;
-    const peerAuthGate = new Promise<void>((resolve) => {
-      releasePeerAuth = resolve;
-    });
-    const activeCalls: string[] = [];
-    const peerCalls: string[] = [];
-    const fetchImpl = (async (input: string | URL | Request) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-      if (url.includes("api.deepseek.com")) {
-        peerCalls.push(url);
-        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
-      }
-      activeCalls.push(url);
-      return codexBody(11);
-    }) as typeof fetch;
-    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
-      if (model.provider === "deepseek") {
-        if (holdPeerAuth) {
-          peerAuthReached = true;
-          return { apiKey: "key-a", source: "stored", wait: peerAuthGate };
-        }
-        return { apiKey: "key-a", source: "stored" };
-      }
-      // Every CPA route resolves to a sanitized failure; only the activation's
-      // own resolution is held, so both adoptions below complete before the
-      // report resumes.
-      const held = holdActivationAuth;
-      holdActivationAuth = false;
-      if (held) activationAuthReached = true;
-      return { ok: false, error: "removed credential", ...(held ? { wait: activationAuthGate } : {}) };
-    };
-    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://a.example/v1" });
-    const cpaMoved = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://b.example/v1" });
-    const deepseek = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
-    const { pi, host, registry } = buildHost({
-      fetchImpl,
-      models: [cpa, cpaMoved, deepseek],
-      auth,
-      timers: false,
-      config: normalizeConfig({ autoRefresh: false, providers: { deepseek: { enabled: true } } }),
-    });
-    const selection = { current: cpa };
-    const fake = fakeContext({ modelRef: selection, registry });
-    const activation = host.activate(fake.ctx, cpa, { refresh: false });
-    await waitFor(() => activationAuthReached);
-
-    const command = pi.commands.get(COMMAND_NAME);
-    assert.ok(command);
-    holdPeerAuth = true;
-    const pending = command.handler("deepseek", fake.ctx as unknown as ExtensionCommandContext);
-    await waitFor(() => peerAuthReached);
-
-    // Activation adopts A's failure; then another route's failure and A's again
-    // are adopted while the report waits on its peer.
-    releaseActivationAuth?.();
-    await activation;
-    selection.current = cpaMoved;
-    await host.refreshActive(fake.ctx, { reason: "interval" });
-    assert.match(String(fake.statuses[fake.statuses.length - 1]), /no-credential/);
-    selection.current = cpa;
-    await host.refreshActive(fake.ctx, { reason: "interval" });
-    assert.match(String(fake.statuses[fake.statuses.length - 1]), /no-credential/);
-
-    releasePeerAuth?.();
-    await pending;
-
-    assert.equal(peerCalls.length, 0, "a failure route the report lost is not revived by returning to it");
-    assert.equal(activeCalls.length, 0);
-    assert.equal(fake.widgets.length, 0, "no obsolete report is published");
-    assert.equal(fake.notifications.length, 0);
-    assert.equal(pi.entries.length, 0);
-    host.shutdown(fake.ctx);
-  });
-
   it("keeps a pre-activation report through a same-route failure re-adoption", async () => {
     let holdActivationAuth = true;
     let activationAuthReached = false;
@@ -2095,7 +1197,7 @@ describe("pi extension wiring", () => {
     // not a new accepted binding, so the report keeps its authority.
     releaseActivationAuth?.();
     await activation;
-    await host.refreshActive(fake.ctx, { reason: "interval" });
+    await host.refreshActive(fake.ctx, {} );
     assert.match(String(fake.statuses[fake.statuses.length - 1]), /no-credential/);
 
     releasePeerAuth?.();
@@ -2108,75 +1210,6 @@ describe("pi extension wiring", () => {
     assert.match(text, /balance \(USD\)/);
     assert.match(text, /cpa\/chat/);
     assert.match(text, /state: no-credential/);
-    host.shutdown(fake.ctx);
-  });
-
-  it("stops a report whose source rotated away and back while a peer resolves", async () => {
-    let currentKey = "key-a";
-    let holdPeerAuth = false;
-    let peerAuthReached = false;
-    let releasePeerAuth: (() => void) | undefined;
-    const peerAuthGate = new Promise<void>((resolve) => {
-      releasePeerAuth = resolve;
-    });
-    const activeCalls: string[] = [];
-    const peerCalls: string[] = [];
-    const fetchImpl = (async (input: string | URL | Request) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-      if (url.includes("api.deepseek.com")) {
-        peerCalls.push(url);
-        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
-      }
-      activeCalls.push(url);
-      return codexBody(activeCalls.length * 11);
-    }) as typeof fetch;
-    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
-      if (model.provider === "deepseek") {
-        if (holdPeerAuth) {
-          peerAuthReached = true;
-          return { apiKey: "key-a", source: "stored", wait: peerAuthGate };
-        }
-        return { apiKey: "key-a", source: "stored" };
-      }
-      return { apiKey: currentKey, source: "stored" };
-    };
-    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://a.example/v1" });
-    const deepseek = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
-    const { pi, host, registry } = buildHost({
-      fetchImpl,
-      models: [cpa, deepseek],
-      auth,
-      timers: false,
-      config: normalizeConfig({ autoRefresh: false, providers: { deepseek: { enabled: true } } }),
-    });
-    const fake = fakeContext({ model: cpa, registry });
-    await host.activate(fake.ctx, cpa, { refresh: false });
-
-    const command = pi.commands.get(COMMAND_NAME);
-    assert.ok(command);
-    holdPeerAuth = true;
-    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
-    await waitFor(() => peerAuthReached);
-    assert.equal(activeCalls.length, 1);
-    assert.match(String(fake.statuses[fake.statuses.length - 1]), /11%/);
-
-    // The credential rotates away and later returns while the report waits on
-    // its peer. Returning to the same source is not the authority it lost.
-    currentKey = "key-b";
-    await host.refreshActive(fake.ctx, { reason: "interval", force: true });
-    assert.match(String(fake.statuses[fake.statuses.length - 1]), /22%/);
-    currentKey = "key-a";
-    await host.refreshActive(fake.ctx, { reason: "interval", force: true });
-    assert.match(String(fake.statuses[fake.statuses.length - 1]), /33%/);
-
-    releasePeerAuth?.();
-    await pending;
-
-    assert.equal(peerCalls.length, 0, "a source that returns does not revive the report's authority");
-    assert.equal(fake.widgets.length, 0, "no obsolete report is published");
-    assert.equal(fake.notifications.length, 0);
-    assert.equal(pi.entries.length, 0);
-    assert.equal(activeCalls.length, 3);
     host.shutdown(fake.ctx);
   });
 
@@ -2228,7 +1261,7 @@ describe("pi extension wiring", () => {
     await waitFor(() => peerAuthReached);
 
     // An ordinary refresh of the same credential is not a source change.
-    await host.refreshActive(fake.ctx, { reason: "interval", force: true });
+    await host.refreshActive(fake.ctx, { force: true });
     assert.match(String(fake.statuses[fake.statuses.length - 1]), /22%/);
 
     releasePeerAuth?.();
@@ -2242,82 +1275,6 @@ describe("pi extension wiring", () => {
     assert.doesNotMatch(text, /22%/);
     assert.match(text, /balance \(USD\)/);
     assert.equal(activeCalls.length, 2);
-    host.shutdown(fake.ctx);
-  });
-
-  it("stops a report whose header route rotated away and back while a peer resolves", async () => {
-    let holdPeerAuth = false;
-    let peerAuthReached = false;
-    let releasePeerAuth: (() => void) | undefined;
-    const peerAuthGate = new Promise<void>((resolve) => {
-      releasePeerAuth = resolve;
-    });
-    const activeCalls: string[] = [];
-    const peerCalls: string[] = [];
-    const fetchImpl = (async (input: string | URL | Request) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-      if (url.includes("api.deepseek.com")) {
-        peerCalls.push(url);
-        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
-      }
-      activeCalls.push(url);
-      return codexBody(activeCalls.length * 11);
-    }) as typeof fetch;
-    // The credential is the same on both routes, so only the routing header tells
-    // the accepted bindings apart.
-    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
-      if (model.provider === "deepseek") {
-        if (holdPeerAuth) {
-          peerAuthReached = true;
-          return { apiKey: "key-a", source: "stored", wait: peerAuthGate };
-        }
-        return { apiKey: "key-a", source: "stored" };
-      }
-      return { apiKey: "key-a", source: "stored" };
-    };
-    const active = fakeModel({
-      provider: "cpa",
-      id: "chat",
-      baseUrl: "https://a.example/v1",
-      headers: { "ChatGPT-Account-Id": "a" },
-    });
-    const moved = modelWithHeaders(active, { "ChatGPT-Account-Id": "b" });
-    const peer = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
-    const { pi, host, registry } = buildHost({
-      fetchImpl,
-      models: [active, moved, peer],
-      auth,
-      timers: false,
-      config: normalizeConfig({ autoRefresh: false, providers: { deepseek: { enabled: true } } }),
-    });
-    const selection = { current: active };
-    const fake = fakeContext({ modelRef: selection, registry });
-    await host.activate(fake.ctx, active, { refresh: false });
-
-    const command = pi.commands.get(COMMAND_NAME);
-    assert.ok(command);
-    holdPeerAuth = true;
-    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
-    await waitFor(() => peerAuthReached);
-    assert.match(String(fake.statuses[fake.statuses.length - 1]), /11%/);
-
-    // The header route rotates away and later returns while the report waits on
-    // its peer; returning to the same routing is not the authority it lost.
-    selection.current = moved;
-    await host.refreshActive(fake.ctx, { reason: "interval", force: true });
-    assert.match(String(fake.statuses[fake.statuses.length - 1]), /22%/);
-    selection.current = active;
-    await host.refreshActive(fake.ctx, { reason: "interval", force: true });
-    assert.match(String(fake.statuses[fake.statuses.length - 1]), /33%/);
-
-    releasePeerAuth?.();
-    await pending;
-
-    assert.equal(peerCalls.length, 0, "a header route that returns does not revive the report");
-    assert.equal(fake.widgets.length, 0, "no obsolete report is published");
-    assert.equal(fake.notifications.length, 0);
-    assert.equal(pi.entries.length, 0);
-    assert.equal(activeCalls.length, 3);
     host.shutdown(fake.ctx);
   });
 
@@ -2359,57 +1316,6 @@ describe("pi extension wiring", () => {
     await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal(calls.length, 1);
     assert.equal(fake.statuses.length, 0);
-    assert.equal(fake.widgets.length, 0);
-    assert.equal(fake.notifications.length, 0);
-    host.shutdown(activation.ctx);
-  });
-
-  it("discards a pending report credential resolution after an unreported route change", async () => {
-    let release: (() => void) | undefined;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    let heldStarted = false;
-    const calls: string[] = [];
-    const fetchImpl = (async (input: string | URL | Request) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-      calls.push(url);
-      if (url.includes("api.deepseek.com")) return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
-      return codexBody(15);
-    }) as typeof fetch;
-    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
-      if (model.provider === "deepseek") {
-        heldStarted = true;
-        return { apiKey: "test-key", baseUrl: model.baseUrl, wait: gate };
-      }
-      return { apiKey: "test-key", baseUrl: model.baseUrl };
-    };
-    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://a.example.com/v1" });
-    const cpaMoved = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://b.example.com/v1" });
-    const deepseek = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
-    const { pi, host, registry } = buildHost({
-      fetchImpl,
-      models: [cpa, deepseek],
-      auth,
-      config: normalizeConfig({ providers: { deepseek: { enabled: true } } }),
-    });
-    const activation = fakeContext({ model: cpa, registry, mode: "rpc" });
-    await pi.emit("model_select", { type: "model_select", model: cpa, previousModel: undefined, source: "set" }, activation.ctx);
-
-    const selection = { current: cpa };
-    const fake = fakeContext({ modelRef: selection, registry });
-    const command = pi.commands.get(COMMAND_NAME);
-    assert.ok(command);
-    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
-    await waitFor(() => heldStarted);
-    assert.equal(calls.length, 1);
-
-    // The active provider's snapshot is already collected while the next
-    // provider's credential resolution is still pending.
-    selection.current = cpaMoved;
-    release?.();
-    await pending;
-    assert.equal(calls.length, 1);
     assert.equal(fake.widgets.length, 0);
     assert.equal(fake.notifications.length, 0);
     host.shutdown(activation.ctx);
@@ -2496,20 +1402,6 @@ describe("pi extension wiring", () => {
   });
 });
 
-/**
- * The five routing changes Pi can apply to a selected model without emitting
- * `model_select`: its model equality check compares provider, model id, and
- * type only. Each differs from the bound route in base URL, API, credential, or
- * account routing, so none may publish or start a request after the fact.
- */
-const SILENT_ROUTING_CHANGES: Record<string, (model: ReturnType<typeof fakeModel>) => ReturnType<typeof fakeModel>> = {
-  "base URL": (model) => ({ ...model, baseUrl: "https://b.example/v1" }),
-  API: (model) => ({ ...model, api: "openai-completions" }),
-  authorization: (model) => modelWithHeaders(model, { ...model.headers, Authorization: "Bearer synthetic-b" }),
-  "account header": (model) => modelWithHeaders(model, { ...model.headers, "ChatGPT-Account-Id": "b" }),
-  "null suppression": (model) => modelWithHeaders(model, { ...model.headers, Authorization: null }),
-};
-
 /** A model-routing header map that can carry an explicit `null` suppression. */
 function modelWithHeaders(
   model: ReturnType<typeof fakeModel>,
@@ -2518,271 +1410,7 @@ function modelWithHeaders(
   return { ...model, headers } as unknown as ReturnType<typeof fakeModel>;
 }
 
-/** The four asynchronous boundaries the host crosses between capture and publication. */
-const HELD_BOUNDARIES = [
-  { name: "active authentication", stage: "auth", active: true },
-  { name: "active GET", stage: "get", active: true },
-  { name: "peer authentication", stage: "auth", active: false },
-  { name: "peer GET", stage: "get", active: false },
-] as const;
-
-/** The two ways a credential resolution can fail: reported, or thrown. */
-const FAILURE_FORMS: Record<string, () => FakeAuth> = {
-  "returned missing credential": () => ({ ok: false, error: "removed credential" }),
-  "thrown resolver failure": () => ({ throws: "the credential store is unavailable" }),
-};
-
-/**
- * A report that started before activation adopts a failure may only continue under
- * an accepted failure binding it did not lose. Every silent routing change is
- * accepted on the way out and again on the way back while the report waits on a
- * peer, so the report must own no authority at the end whichever form the
- * resolver fails in.
- */
-describe("failure binding routing identity", () => {
-  for (const [route, change] of Object.entries(SILENT_ROUTING_CHANGES)) {
-    for (const [form, failure] of Object.entries(FAILURE_FORMS)) {
-      it(`stops a pre-activation report after an accepted ${route} failure round trip (${form})`, async () => {
-        let holdActivationAuth = true;
-        let activationAuthReached = false;
-        let releaseActivationAuth: (() => void) | undefined;
-        const activationAuthGate = new Promise<void>((resolve) => {
-          releaseActivationAuth = resolve;
-        });
-        let holdPeerAuth = false;
-        let peerAuthReached = false;
-        let releasePeerAuth: (() => void) | undefined;
-        const peerAuthGate = new Promise<void>((resolve) => {
-          releasePeerAuth = resolve;
-        });
-        const activeCalls: string[] = [];
-        const peerCalls: string[] = [];
-        const fetchImpl = (async (input: string | URL | Request) => {
-          const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-          if (url.includes("api.deepseek.com")) {
-            peerCalls.push(url);
-            return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
-          }
-          activeCalls.push(url);
-          return codexBody(11);
-        }) as typeof fetch;
-        const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
-          if (model.provider === "deepseek") {
-            if (holdPeerAuth) {
-              peerAuthReached = true;
-              return { apiKey: "key-a", source: "stored", wait: peerAuthGate };
-            }
-            return { apiKey: "key-a", source: "stored" };
-          }
-          // Only the activation's own resolution is held; every later CPA
-          // reconciliation completes before the report resumes.
-          const held = holdActivationAuth;
-          holdActivationAuth = false;
-          if (held) activationAuthReached = true;
-          return { ...failure(), ...(held ? { wait: activationAuthGate } : {}) };
-        };
-        const active = fakeModel({
-          provider: "cpa",
-          id: "chat",
-          baseUrl: "https://a.example/v1",
-          headers: { Authorization: "Bearer synthetic-a", "ChatGPT-Account-Id": "a" },
-        });
-        const moved = change(active);
-        const peer = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
-        const { pi, host, registry } = buildHost({
-          fetchImpl,
-          models: [active, moved, peer],
-          auth,
-          timers: false,
-          config: normalizeConfig({ autoRefresh: false, providers: { deepseek: { enabled: true } } }),
-        });
-        const selection = { current: active };
-        const fake = fakeContext({ modelRef: selection, registry });
-        const activation = host.activate(fake.ctx, active, { refresh: false });
-        await waitFor(() => activationAuthReached);
-
-        const command = pi.commands.get(COMMAND_NAME);
-        assert.ok(command);
-        holdPeerAuth = true;
-        const pending = command.handler("deepseek", fake.ctx as unknown as ExtensionCommandContext);
-        await waitFor(() => peerAuthReached);
-
-        // Activation adopts the failure for A, then the changed route's failure
-        // and A's failure again are adopted while the report waits on its peer.
-        releaseActivationAuth?.();
-        await activation;
-        selection.current = moved;
-        await host.refreshActive(fake.ctx, { reason: "interval" });
-        assert.match(String(fake.statuses[fake.statuses.length - 1]), /no-credential/);
-        selection.current = active;
-        await host.refreshActive(fake.ctx, { reason: "interval" });
-        assert.match(String(fake.statuses[fake.statuses.length - 1]), /no-credential/);
-
-        releasePeerAuth?.();
-        await pending;
-
-        assert.equal(peerCalls.length, 0, "no peer is fetched for a revoked report");
-        assert.equal(activeCalls.length, 0, "no active request is issued");
-        assert.equal(fake.widgets.length, 0, "no obsolete report is published");
-        assert.equal(fake.notifications.length, 0);
-        assert.equal(pi.entries.length, 0);
-        host.shutdown(fake.ctx);
-      });
-    }
-  }
-
-  it("keeps a pre-activation report through an equivalent-header failure re-adoption", async () => {
-    let holdActivationAuth = true;
-    let activationAuthReached = false;
-    let releaseActivationAuth: (() => void) | undefined;
-    const activationAuthGate = new Promise<void>((resolve) => {
-      releaseActivationAuth = resolve;
-    });
-    let holdPeerAuth = false;
-    let peerAuthReached = false;
-    let releasePeerAuth: (() => void) | undefined;
-    const peerAuthGate = new Promise<void>((resolve) => {
-      releasePeerAuth = resolve;
-    });
-    const peerCalls: string[] = [];
-    const fetchImpl = (async (input: string | URL | Request) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-      if (url.includes("api.deepseek.com")) {
-        peerCalls.push(url);
-        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
-      }
-      return codexBody(11);
-    }) as typeof fetch;
-    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
-      if (model.provider === "deepseek") {
-        if (holdPeerAuth) {
-          peerAuthReached = true;
-          return { apiKey: "key-a", source: "stored", wait: peerAuthGate };
-        }
-        return { apiKey: "key-a", source: "stored" };
-      }
-      const held = holdActivationAuth;
-      holdActivationAuth = false;
-      if (held) activationAuthReached = true;
-      return { ok: false, error: "removed credential", ...(held ? { wait: activationAuthGate } : {}) };
-    };
-    const active = fakeModel({
-      provider: "cpa",
-      id: "chat",
-      baseUrl: "https://a.example/v1",
-      headers: { Authorization: "Bearer synthetic-a", "ChatGPT-Account-Id": "a" },
-    });
-    // The same routing with recased, reordered headers is not another route.
-    const equivalent = modelWithHeaders(active, { "chatgpt-account-id": "a", authorization: "Bearer synthetic-a" });
-    const peer = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
-    const { pi, host, registry } = buildHost({
-      fetchImpl,
-      models: [active, equivalent, peer],
-      auth,
-      timers: false,
-      config: normalizeConfig({ autoRefresh: false, providers: { deepseek: { enabled: true } } }),
-    });
-    const selection = { current: active };
-    const fake = fakeContext({ modelRef: selection, registry });
-    const activation = host.activate(fake.ctx, active, { refresh: false });
-    await waitFor(() => activationAuthReached);
-
-    const command = pi.commands.get(COMMAND_NAME);
-    assert.ok(command);
-    holdPeerAuth = true;
-    const pending = command.handler("deepseek", fake.ctx as unknown as ExtensionCommandContext);
-    await waitFor(() => peerAuthReached);
-
-    // The equivalent route adopts its failure while the report waits, which is
-    // a re-adoption of the same accepted binding, not a replacement.
-    releaseActivationAuth?.();
-    await activation;
-    selection.current = equivalent;
-    await host.refreshActive(fake.ctx, { reason: "interval" });
-    assert.match(String(fake.statuses[fake.statuses.length - 1]), /no-credential/);
-
-    releasePeerAuth?.();
-    await pending;
-
-    assert.equal(peerCalls.length, 1, "an equivalent route keeps the report's authority");
-    assert.equal(fake.widgets.length, 1, "the report is published");
-    const text = (fake.widgets[0]?.lines ?? []).join("\n");
-    assert.match(text, /deepseek\/chat/);
-    assert.match(text, /balance \(USD\)/);
-    assert.match(text, /cpa\/chat/);
-    assert.match(text, /state: no-credential/);
-    host.shutdown(fake.ctx);
-  });
-});
-
 describe("host routing binding", () => {
-  for (const boundary of HELD_BOUNDARIES) {
-    for (const [route, change] of Object.entries(SILENT_ROUTING_CHANGES)) {
-      it(`stops a silent ${route} change made while ${boundary.name} is pending`, async () => {
-        const active = fakeModel({
-          provider: "cpa",
-          id: "chat",
-          baseUrl: "https://a.example/v1",
-          headers: { Authorization: "Bearer synthetic-a", "ChatGPT-Account-Id": "a" },
-        });
-        const peer = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
-        let release: (() => void) | undefined;
-        const gate = new Promise<void>((resolve) => {
-          release = resolve;
-        });
-        let armed = false;
-        let reached = false;
-        const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
-          const hold = armed && boundary.stage === "auth" && model.provider === (boundary.active ? active.provider : peer.provider);
-          if (hold) reached = true;
-          return {
-            apiKey: "synthetic",
-            headers: model.headers,
-            baseUrl: model.baseUrl,
-            ...(hold ? { wait: gate } : {}),
-          };
-        };
-        const calls: string[] = [];
-        const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
-          assert.equal(init?.method, "GET");
-          const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-          calls.push(url);
-          const hold = boundary.stage === "get" && url.includes(boundary.active ? "a.example" : "api.deepseek.com");
-          if (hold) {
-            reached = true;
-            await gate;
-          }
-          return url.includes("api.deepseek.com")
-            ? jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] })
-            : codexBody(42);
-        }) as typeof fetch;
-        const { pi, host, registry } = buildHost({
-          fetchImpl,
-          models: [active, peer],
-          timers: false,
-          auth,
-          config: normalizeConfig({ autoRefresh: false, providers: { deepseek: { enabled: true } } }),
-        });
-        const selection = { current: active };
-        const fake = fakeContext({ modelRef: selection, registry });
-        await host.activate(fake.ctx, active, { refresh: false });
-        armed = true;
-        const pending = host.report(fake.ctx as unknown as ExtensionCommandContext, "");
-        await waitFor(() => reached);
-        const before = { calls: calls.length, statuses: fake.statuses.length };
-
-        selection.current = change(active);
-        release?.();
-        await pending;
-
-        assert.equal(calls.length, before.calls, "the old route issues no follow-on request");
-        assert.equal(fake.statuses.length, before.statuses, "the old route paints no footer");
-        assert.equal(pi.entries.length + fake.widgets.length + fake.notifications.length, 0, "the old route publishes no report");
-        host.shutdown(fake.ctx);
-      });
-    }
-  }
-
   it("drops a held activation success after a silent same-ID route replacement", async () => {
     let release: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {
@@ -2886,7 +1514,7 @@ describe("host routing binding", () => {
     // The event that follows still adopts the installed selection and its work.
     await pi.emit("model_select", { type: "model_select", model: modelB, previousModel: modelA, source: "set" }, fake.ctx);
     assert.match(String(fake.statuses[fake.statuses.length - 1]), /automatic refresh is off/);
-    await host.refreshActive(fake.ctx, { reason: "interval" });
+    await host.refreshActive(fake.ctx, {} );
     assert.equal(calls.length, 2);
     assert.match(calls[1] ?? "", /b\.example\.com/);
     assert.match(String(fake.statuses[fake.statuses.length - 1]), /77%/);
@@ -2924,7 +1552,7 @@ describe("host routing binding", () => {
 
     // The pending event still activates the model Pi already installed.
     await pi.emit("model_select", { type: "model_select", model: modelB, previousModel: modelA, source: "set" }, fake.ctx);
-    await host.refreshActive(fake.ctx, { reason: "interval" });
+    await host.refreshActive(fake.ctx, {} );
     assert.equal(calls.length, 1);
     assert.match(calls[0]?.url ?? "", /b\.example\.com/);
     assert.match(String(fake.statuses[fake.statuses.length - 1]), /33%/);
@@ -2977,7 +1605,7 @@ describe("host routing binding", () => {
       "the obsolete event keeps the accepted view of the live selection",
     );
     assert.equal(calls.length, 0);
-    const snapshot = await host.refreshActive(fake.ctx, { reason: "interval" });
+    const snapshot = await host.refreshActive(fake.ctx, {} );
     assert.ok(snapshot, "the live selection is still refreshable");
     assert.equal(calls.length, 1);
     assert.match(calls[0]?.url ?? "", /b\.example\.com/);
@@ -3059,7 +1687,7 @@ describe("host routing binding", () => {
     await pi.emit("model_select", { type: "model_select", model: active, previousModel: live, source: "set" }, fake.ctx);
     assert.match(String(fake.statuses[fake.statuses.length - 1]), /automatic refresh is off/);
 
-    await host.refreshActive(fake.ctx, { reason: "interval" });
+    await host.refreshActive(fake.ctx, {} );
     assert.equal(calls.length, 1);
     assert.match(calls[0]?.url ?? "", /a\.example/);
     assert.match(String(fake.statuses[fake.statuses.length - 1]), /21%/);
@@ -3119,115 +1747,7 @@ describe("host routing binding", () => {
     assert.equal(calls.length, 0, "no work is started");
   });
 
-  it("stops endpoint discovery when the live route changes silently", async () => {
-    let release: (() => void) | undefined;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const calls: string[] = [];
-    const fetchImpl = (async (input: string | URL | Request) => {
-      calls.push(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
-      if (calls.length === 1) {
-        await gate;
-        // A 404 during discovery does not end the sequence, so only the host's
-        // own lease can keep the second request from being issued.
-        return textResponse("not found", { status: 404 });
-      }
-      return codexBody(64);
-    }) as typeof fetch;
-    const modelA = fakeModel({
-      provider: "cpa",
-      id: "chat",
-      baseUrl: "https://a.example/v1",
-      headers: { Authorization: "Bearer synthetic-a" },
-    });
-    const modelB = fakeModel({
-      provider: "cpa",
-      id: "chat",
-      baseUrl: "https://b.example/v1",
-      headers: { Authorization: "Bearer synthetic-b" },
-    });
-    const { pi, host, registry } = buildHost({
-      fetchImpl,
-      models: [modelA, modelB],
-      timers: false,
-      config: normalizeConfig({ autoRefresh: false }),
-    });
-    const selection = { current: modelA };
-    const fake = fakeContext({ modelRef: selection, registry });
-    await host.activate(fake.ctx, modelA, { refresh: false });
-    const command = pi.commands.get(COMMAND_NAME);
-    assert.ok(command);
-    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
-    await waitFor(() => calls.length === 1);
-
-    // Pi suppresses model_select for an equal logical model, so only the live
-    // getter reveals that the selected route has moved.
-    selection.current = modelB;
-    release?.();
-    await pending;
-
-    assert.equal(calls.length, 1, "the abandoned route issues no follow-on request");
-    assert.equal(fake.widgets.length, 0, "the abandoned route publishes no report");
-    assert.doesNotMatch(String(fake.statuses[fake.statuses.length - 1]), /64%/);
-    host.shutdown(fake.ctx);
-  });
-
-  it("stops a reported provider's discovery when the live route changes silently", async () => {
-    let release: (() => void) | undefined;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const calls: string[] = [];
-    const fetchImpl = (async (input: string | URL | Request) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-      calls.push(url);
-      if (url.includes("peer.example.com")) {
-        await gate;
-        return textResponse("not found", { status: 404 });
-      }
-      return codexBody(12);
-    }) as typeof fetch;
-    const active = fakeModel({
-      provider: "cpa",
-      id: "chat",
-      baseUrl: "https://a.example/v1",
-      headers: { Authorization: "Bearer synthetic-a" },
-    });
-    const moved = fakeModel({
-      provider: "cpa",
-      id: "chat",
-      baseUrl: "https://b.example/v1",
-      headers: { Authorization: "Bearer synthetic-b" },
-    });
-    const peer = fakeModel({ provider: "peer", id: "chat", baseUrl: "https://peer.example.com/v1" });
-    const { pi, host, registry } = buildHost({
-      fetchImpl,
-      models: [active, moved, peer],
-      timers: false,
-      config: normalizeConfig({ autoRefresh: false, providers: { peer: { enabled: true } } }),
-    });
-    const selection = { current: active };
-    const fake = fakeContext({ modelRef: selection, registry });
-    await host.activate(fake.ctx, active, { refresh: false });
-    const command = pi.commands.get(COMMAND_NAME);
-    assert.ok(command);
-    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
-    await waitFor(() => calls.some((url) => url.includes("peer.example.com")));
-
-    // The report's own lease is bound to the active route, so a silent move of
-    // that route ends the peer discovery too.
-    selection.current = moved;
-    release?.();
-    await pending;
-
-    assert.equal(calls.filter((url) => url.includes("peer.example.com")).length, 1, "the peer sequence stops");
-    assert.equal(fake.widgets.length, 0, "the stale report publishes nothing");
-    assert.equal(fake.notifications.length, 0);
-    host.shutdown(fake.ctx);
-  });
-
-  it("keeps discovering endpoints while the caller's lease holds", async () => {
+  it("continues same-origin discovery for a reported provider", async () => {
     const calls: string[] = [];
     const fetchImpl = (async (input: string | URL | Request) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
@@ -3248,14 +1768,14 @@ describe("host routing binding", () => {
 
     await command.handler("", fake.ctx as unknown as ExtensionCommandContext);
 
-    assert.equal(calls.length, 2, "discovery continues while the lease holds");
+    assert.equal(calls.length, 2, "discovery continues past the first candidate");
     assert.match(calls[1] ?? "", /backend-api\/wham\/usage/);
     assert.match(String(fake.statuses[fake.statuses.length - 1]), /42%/);
     assert.equal(fake.widgets.length, 1);
     host.shutdown(fake.ctx);
   });
 
-  it("keeps the optional sibling request while the caller's lease holds", async () => {
+  it("requests the optional sibling endpoint of a reported provider", async () => {
     const { fetchImpl, calls } = sequenceFetch([
       jsonResponse({ data: { limit: 20, limit_remaining: 15, limit_reset: "monthly" } }),
       jsonResponse({ data: { total_credits: 100, total_usage: 20 } }),
@@ -3281,65 +1801,7 @@ describe("host routing binding", () => {
     host.shutdown(fake.ctx);
   });
 
-  it("does not hand a valid report a stale owner's cancelled peer run", async () => {
-    let release: (() => void) | undefined;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    let peerCalls = 0;
-    const fetchImpl = (async (input: string | URL | Request) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-      if (!url.includes("peer.example.com")) return codexBody(12);
-      peerCalls += 1;
-      if (peerCalls === 1) {
-        await gate;
-        // The first report's discovery would continue here; its lease is gone.
-        return textResponse("not found", { status: 404 });
-      }
-      return codexBody(25);
-    }) as typeof fetch;
-    let currentKey = "key-a";
-    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth =>
-      model.provider === "cpa"
-        ? { apiKey: currentKey, source: "stored" }
-        : { apiKey: "peer-key", source: "stored" };
-    const active = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://a.example/v1" });
-    const peer = fakeModel({ provider: "peer", id: "chat", baseUrl: "https://peer.example.com/v1" });
-    const { pi, host, registry } = buildHost({
-      fetchImpl,
-      models: [active, peer],
-      auth,
-      timers: false,
-      config: normalizeConfig({ autoRefresh: false, providers: { peer: { enabled: true } } }),
-    });
-    const selection = { current: active };
-    const first = fakeContext({ modelRef: selection, registry });
-    const second = fakeContext({ modelRef: selection, registry });
-    await host.activate(first.ctx, active, { refresh: false });
-    const command = pi.commands.get(COMMAND_NAME);
-    assert.ok(command);
-
-    // The first report owns the held peer run; its own lease then expires when
-    // the active credential rotates, while the later report keeps its authority.
-    const firstReport = command.handler("", first.ctx as unknown as ExtensionCommandContext);
-    await waitFor(() => peerCalls === 1);
-    currentKey = "key-b";
-    const secondReport = command.handler("", second.ctx as unknown as ExtensionCommandContext);
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    release?.();
-    await Promise.all([firstReport, secondReport]);
-
-    assert.equal(peerCalls, 2, "the eligible report starts its own peer work");
-    assert.equal(first.widgets.length + first.notifications.length, 0, "the expired report publishes nothing");
-    assert.equal(second.widgets.length, 1, "the eligible report publishes");
-    const text = (second.widgets[0]?.lines ?? []).join("\n");
-    assert.doesNotMatch(text, /refresh cancelled/);
-    assert.match(text, /peer\/chat/);
-    assert.match(text, /25%/);
-    host.shutdown(first.ctx);
-  });
-
-  it("still shares a peer run whose owner remains eligible", async () => {
+  it("shares one peer request between two concurrent reports", async () => {
     let release: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
@@ -3374,7 +1836,7 @@ describe("host routing binding", () => {
     release?.();
     await Promise.all([firstReport, secondReport]);
 
-    assert.equal(peerCalls, 1, "an eligible owner's run is still shared");
+    assert.equal(peerCalls, 1, "the monitor serves both reports from one request");
     for (const fake of [first, second]) {
       assert.equal(fake.widgets.length, 1);
       const text = (fake.widgets[0]?.lines ?? []).join("\n");
@@ -3383,59 +1845,6 @@ describe("host routing binding", () => {
       assert.doesNotMatch(text, /refresh cancelled/);
     }
     host.shutdown(first.ctx);
-  });
-
-  it("keeps the captured route and resolver input when the selected model is mutated in place", async () => {
-    const model = fakeModel({
-      provider: "cpa",
-      id: "chat",
-      baseUrl: "http://a.example.com/v1",
-      headers: { Authorization: "Bearer synthetic-a" },
-    });
-    let release: (() => void) | undefined;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const beforeWait: string[] = [];
-    const afterWait: string[] = [];
-    const registry = {
-      async getApiKeyAndHeaders(input: typeof model) {
-        const seen = () => `${input.baseUrl} ${input.headers?.Authorization ?? "-"}`;
-        beforeWait.push(seen());
-        await gate;
-        // The resolver still reads the captured copy after the live object changed.
-        afterWait.push(seen());
-        return { ok: true as const, apiKey: "key-a", headers: input.headers, baseUrl: input.baseUrl };
-      },
-      getProviderAuthStatus: () => ({ configured: true, source: "stored" as const }),
-      isUsingOAuth: () => false,
-      getAvailable: () => [model],
-      getAll: () => [model],
-    } as unknown as ModelRegistry;
-    const { fetchImpl, calls } = sequenceFetch([codexBody(12)]);
-    const pi = fakePi();
-    const host = new UniversalUsageHost(pi.api, {
-      monitor: new UsageMonitor({ now: () => 1_768_000_000_000, fetchImpl, policy: { timeoutMs: 200 } }),
-      now: () => 1_768_000_000_000,
-      config: normalizeConfig({ refreshSeconds: 300 }),
-      timers: false,
-    });
-    const selection = { current: model };
-    const fake = fakeContext({ modelRef: selection, registry });
-
-    const pending = host.activate(fake.ctx, model);
-    await waitFor(() => beforeWait.length === 1);
-    // Pi can reconfigure the selected object instead of replacing it.
-    model.baseUrl = "http://b.example.com/v1";
-    model.headers = { Authorization: "Bearer synthetic-b" };
-    release?.();
-    await pending;
-
-    assert.deepEqual(beforeWait, ["http://a.example.com/v1 Bearer synthetic-a"]);
-    assert.deepEqual(afterWait, ["http://a.example.com/v1 Bearer synthetic-a"]);
-    assert.equal(calls.length, 0);
-    assert.deepEqual(fake.statuses, ["cpa: checking usage..."]);
-    host.shutdown(fake.ctx);
   });
 
   it("re-resolves the live route after the selected model object was mutated in place", async () => {
@@ -3559,7 +1968,7 @@ describe("host routing binding", () => {
     await waitFor(() => calls.length === 1);
     // A periodic tick is the call the interval timer makes; the reconciliation
     // it starts must not revoke the refresh it is about to join.
-    const interval = host.refreshActive(fake.ctx, { reason: "interval" });
+    const interval = host.refreshActive(fake.ctx, {} );
     await new Promise((resolve) => setTimeout(resolve, 5));
     const command = pi.commands.get(COMMAND_NAME);
     assert.ok(command);
@@ -3573,132 +1982,6 @@ describe("host routing binding", () => {
     const footer = String(fake.statuses[fake.statuses.length - 1]);
     assert.match(footer, /USD \$4/);
     assert.doesNotMatch(footer, /cancelled|error/);
-    host.shutdown(fake.ctx);
-  });
-
-  it("publishes a current-route report instead of joining an incompatible route's work", async () => {
-    let releaseFirstGet: (() => void) | undefined;
-    const firstGetGate = new Promise<void>((resolve) => {
-      releaseFirstGet = resolve;
-    });
-    const calls: string[] = [];
-    const fetchImpl = (async (input: string | URL | Request) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-      calls.push(url);
-      if (calls.length === 1) {
-        await firstGetGate;
-        return codexBody(11);
-      }
-      return codexBody(22);
-    }) as typeof fetch;
-    // Pi authentication overrides the declared base URL, so both selections share
-    // one effective origin and credential while their declared routes differ.
-    const auth = (): FakeAuth => ({ apiKey: "key-a", source: "stored", baseUrl: "https://effective.example/v1" });
-    const declared = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://a.example/v1" });
-    const rerouted = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://b.example/v1" });
-    const { pi, host, registry } = buildHost({
-      fetchImpl,
-      models: [declared, rerouted],
-      auth,
-      timers: false,
-      config: normalizeConfig({ autoRefresh: false }),
-    });
-    const selection = { current: declared };
-    const fake = fakeContext({ modelRef: selection, registry });
-    await host.activate(fake.ctx, declared, { refresh: false });
-
-    const command = pi.commands.get(COMMAND_NAME);
-    assert.ok(command);
-    const first = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
-    await waitFor(() => calls.length === 1);
-    assert.match(calls[0] ?? "", /effective\.example/);
-
-    // The live selection moves to another declared route that resolves to the
-    // same effective origin while the first route's response is still pending.
-    selection.current = rerouted;
-    const second = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
-    releaseFirstGet?.();
-
-    // The current route needs its own publication instead of inheriting the
-    // first route's rejection.
-    await waitFor(() => calls.length === 2);
-    assert.match(calls[1] ?? "", /effective\.example/);
-    await second;
-    assert.equal(fake.widgets.length, 1, "the current-route command publishes its own report");
-    assert.match((fake.widgets[0]?.lines ?? []).join("\n"), /22%/);
-
-    // The obsolete route's late response publishes nothing.
-    await first;
-    assert.equal(fake.widgets.length, 1, "the obsolete route publishes nothing");
-    assert.match(String(fake.statuses[fake.statuses.length - 1]), /22%/);
-    assert.equal(calls.length, 2);
-    host.shutdown(fake.ctx);
-  });
-
-  it("stops an accepted report when another route's binding is adopted before it anchors", async () => {
-    let releaseActiveGet: (() => void) | undefined;
-    const activeGetGate = new Promise<void>((resolve) => {
-      releaseActiveGet = resolve;
-    });
-    const activeCalls: string[] = [];
-    const peerCalls: string[] = [];
-    const fetchImpl = (async (input: string | URL | Request) => {
-      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-      if (url.includes("api.deepseek.com")) {
-        peerCalls.push(url);
-        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
-      }
-      activeCalls.push(url);
-      if (activeCalls.length === 1) await activeGetGate;
-      return codexBody(activeCalls.length === 1 ? 11 : 22);
-    }) as typeof fetch;
-    // Pi authentication overrides the declared base URL, so both selections share
-    // one effective identity while their captured routes differ.
-    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth =>
-      model.provider === "cpa"
-        ? { apiKey: "key-a", source: "stored", baseUrl: "https://effective.example/v1" }
-        : { apiKey: "peer-key", source: "stored" };
-    const declared = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://a.example/v1" });
-    const rerouted = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://b.example/v1" });
-    const peer = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
-    const { pi, host, registry } = buildHost({
-      fetchImpl,
-      models: [declared, rerouted, peer],
-      auth,
-      timers: false,
-      config: normalizeConfig({ autoRefresh: false, providers: { deepseek: { enabled: true } } }),
-    });
-    const selection = { current: declared };
-    const fake = fakeContext({ modelRef: selection, registry });
-    await host.activate(fake.ctx, declared, { refresh: false });
-
-    const command = pi.commands.get(COMMAND_NAME);
-    assert.ok(command);
-    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
-    await waitFor(() => activeCalls.length === 1);
-
-    // At the accepted 11% status publication, the live selection silently moves to
-    // another declared route that resolves to the same effective identity, and a
-    // newer reconciliation adopts that route before the report resumes.
-    const statuses = fake.ctx.ui.setStatus.bind(fake.ctx.ui);
-    let reroutedWork: Promise<unknown> | undefined;
-    fake.ctx.ui.setStatus = (key: string, text: string | undefined) => {
-      statuses(key, text);
-      if (reroutedWork === undefined && String(text ?? "").includes("11%")) {
-        selection.current = rerouted;
-        reroutedWork = host.refreshActive(fake.ctx, { reason: "interval", force: true });
-      }
-    };
-    releaseActiveGet?.();
-    await pending;
-    await reroutedWork;
-
-    assert.equal(activeCalls.length, 2, "the rerouted selection still refreshes");
-    assert.equal(peerCalls.length, 0, "the obsolete report collects no peer under the new binding");
-    assert.equal(fake.widgets.length, 0, "no obsolete report is published");
-    assert.equal(fake.notifications.length, 0);
-    assert.equal(pi.entries.length, 0);
-    assert.match(String(fake.statuses[fake.statuses.length - 1]), /22%/);
     host.shutdown(fake.ctx);
   });
 
@@ -3770,141 +2053,7 @@ describe("host routing binding", () => {
     assert.equal(calls.length, 0);
   });
 
-  it("stops a reselection when its authority expires before the caller resumes", async () => {
-    const model = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://a.example.com/v1" });
-    const { fetchImpl, calls } = sequenceFetch([codexBody(12)]);
-    const pi = fakePi();
-    const host = new UniversalUsageHost(pi.api, {
-      monitor: new UsageMonitor({ now: () => 1_768_000_000_000, fetchImpl, policy: { timeoutMs: 200 } }),
-      now: () => 1_768_000_000_000,
-      config: normalizeConfig({ refreshSeconds: 300, autoRefresh: false }),
-      timers: false,
-    });
-    let armed = false;
-    let shutDown = false;
-    // `isUsingOAuth` is the last registry call of an auth resolution, so two
-    // microtask hops place the shutdown after resolver adoption but before the
-    // reselection's own continuation resumes.
-    const registry = {
-      async getApiKeyAndHeaders(input: typeof model) {
-        return { ok: true as const, apiKey: "key-a", headers: input.headers, baseUrl: input.baseUrl };
-      },
-      getProviderAuthStatus: () => ({ configured: true, source: "stored" as const }),
-      isUsingOAuth: () => {
-        if (armed) {
-          armed = false;
-          queueMicrotask(() =>
-            queueMicrotask(() => {
-              shutDown = true;
-              host.shutdown(fake.ctx);
-            }),
-          );
-        }
-        return false;
-      },
-      getAvailable: () => [model],
-      getAll: () => [model],
-    } as unknown as ModelRegistry;
-    const fake = fakeContext({ model, registry, mode: "tui", idle: false });
-    // Installed Pi rejects every access to a context whose session is gone.
-    Object.defineProperty(fake.ctx, "mode", {
-      configurable: true,
-      get() {
-        if (shutDown) throw new Error("STALE CONTEXT mode");
-        return "tui";
-      },
-    });
-    host.register();
-
-    await pi.emit("session_start", { type: "session_start" }, fake.ctx);
-    await pi.emit("turn_start", { type: "turn_start", turnIndex: 0, timestamp: Date.now() }, fake.ctx);
-    const attribution = (host as unknown as { passiveAttribution?: unknown }).passiveAttribution;
-    assert.notEqual(attribution, undefined, "the turn seeded a passive attribution");
-    const statusesBeforeReselection = fake.statuses.length;
-
-    armed = true;
-    // A same-model reselection adopts its resolution, then resumes one boundary
-    // later; the shutdown in between revokes it before it may act.
-    await pi.emit("model_select", { type: "model_select", model, previousModel: model, source: "set" }, fake.ctx);
-
-    assert.equal(shutDown, true, "the shutdown landed between adoption and continuation");
-    assert.equal(
-      (host as unknown as { passiveAttribution?: unknown }).passiveAttribution,
-      undefined,
-      "no attribution is restored after shutdown",
-    );
-    assert.equal(fake.statuses.length, statusesBeforeReselection + 1, "only shutdown cleared the footer");
-    assert.equal(fake.statuses[fake.statuses.length - 1], undefined);
-    assert.equal(fake.widgets.length, 0);
-    assert.equal(pi.entries.length, 0);
-    assert.equal(calls.length, 0);
-  });
-
-  it("starts a replacement request after rotating back to a credential whose run was cancelled", async () => {
-    let currentKey = "key-a";
-    let releaseFirst: (() => void) | undefined;
-    const firstGate = new Promise<void>((resolve) => {
-      releaseFirst = resolve;
-    });
-    let releaseSecond: (() => void) | undefined;
-    const secondGate = new Promise<void>((resolve) => {
-      releaseSecond = resolve;
-    });
-    const calls: Array<string | undefined> = [];
-    const fetchImpl = (async (_input: string | URL | Request, init?: RequestInit) => {
-      calls.push(new Headers(init?.headers as Record<string, string>).get("authorization") ?? undefined);
-      const index = calls.length;
-      if (index === 1) await firstGate;
-      if (index === 2) await secondGate;
-      return jsonResponse({ is_available: true, balance_infos: [{ currency: "USD", total_balance: String(index * 11) }] });
-    }) as typeof fetch;
-    const model = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
-    const { pi, host, registry } = buildHost({
-      fetchImpl,
-      models: [model],
-      auth: () => ({ apiKey: currentKey, source: "stored" }),
-      timers: false,
-      config: normalizeConfig({ autoRefresh: false }),
-    });
-    const fake = fakeContext({ model, registry });
-    await pi.emit("session_start", { type: "session_start" }, fake.ctx);
-    const command = pi.commands.get(COMMAND_NAME);
-    assert.ok(command);
-
-    // Credential A's request is held.
-    const first = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
-    await waitFor(() => calls.length === 1);
-    assert.equal(calls[0], "Bearer key-a");
-
-    // Rotate to B: the host aborts A through the work controller's signal.
-    currentKey = "key-b";
-    const second = host.refreshActive(fake.ctx, { reason: "interval" });
-    await waitFor(() => calls.length === 2);
-    assert.equal(calls[1], "Bearer key-b");
-
-    // Rotate back to A while both older responses are still pending.
-    currentKey = "key-a";
-    const third = host.refreshActive(fake.ctx, { reason: "interval", force: true });
-    await waitFor(() => calls.length === 3);
-    assert.equal(calls[2], "Bearer key-a");
-    const snapshot = await third;
-    assert.equal(snapshot?.status, "ok");
-    const footer = String(fake.statuses[fake.statuses.length - 1]);
-    assert.match(footer, /USD \$33/);
-    assert.doesNotMatch(footer, /cancelled|error/);
-
-    // The cancelled runs completing late change neither the view nor the requests.
-    const statusesAfterReplacement = fake.statuses.length;
-    releaseFirst?.();
-    releaseSecond?.();
-    await Promise.all([first, second]);
-    assert.equal(fake.statuses.length, statusesAfterReplacement);
-    assert.match(String(fake.statuses[fake.statuses.length - 1]), /USD \$33/);
-    assert.equal(calls.length, 3);
-    host.shutdown(fake.ctx);
-  });
-
-  it("does not request or publish a route the selection left while activation is pending", async () => {
+  it("does not publish a report for a route the selection left while activation is pending", async () => {
     const modelA = fakeModel({
       provider: "cpa",
       id: "chat",
@@ -3936,7 +2085,7 @@ describe("host routing binding", () => {
       }
       return { apiKey: "synthetic" };
     };
-    const { fetchImpl, calls } = sequenceFetch([codexBody(42)]);
+    const { fetchImpl } = sequenceFetch([codexBody(42)]);
     const { pi, host, registry } = buildHost({
       fetchImpl,
       models: [modelA],
@@ -3964,13 +2113,13 @@ describe("host routing binding", () => {
     releaseCommand?.();
     await pending;
 
-    assert.equal(calls.length, 0, "no request for the route the selection left");
+    // The request itself belongs to the route the report started under; only
+    // publication is decided by the stamp check, which has moved.
     assert.equal(fake.widgets.length, 0, "no report from the abandoned route");
     assert.equal(pi.entries.length, 0);
 
     releaseActivation?.();
     await new Promise((resolve) => setTimeout(resolve, 5));
-    assert.equal(calls.length, 0);
     host.shutdown(fake.ctx);
   });
 

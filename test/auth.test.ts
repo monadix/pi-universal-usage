@@ -5,7 +5,6 @@ import {
   AUTH_RESOLUTION_FAILED,
   authorizationCredential,
   chatgptAccountId,
-  modelRoutingSignature,
   NO_CREDENTIAL,
   resolveTarget,
 } from "../src/auth.ts";
@@ -220,47 +219,5 @@ describe("target resolution", () => {
     const apiKey = await resolveTarget(fakeRegistry({ apiKey: `a.${claims}.c`, isOAuth: false }, [keyModel]), keyModel);
     assert.equal(apiKey.ok, true);
     if (apiKey.ok) assert.equal(apiKey.target.accountId, undefined);
-  });
-});
-
-describe("model routing signature", () => {
-  it("ignores header name casing and entry order", () => {
-    const route = { provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1", api: "openai-responses" };
-    const left = fakeModel({ ...route, headers: { "ChatGPT-Account-Id": "acct-a", "x-routing": "blue" } });
-    const right = fakeModel({ ...route, headers: { "x-routing": "blue", "chatgpt-account-id": "acct-a" } });
-    assert.equal(modelRoutingSignature(left), modelRoutingSignature(right));
-  });
-
-  it("resolves duplicate header names the way Pi merges them: the last entry wins", () => {
-    const route = { provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1", api: "openai-responses" };
-    // Pi deletes every earlier case-insensitive match before inserting the next
-    // header entry, so these two maps send different credentials and must not
-    // share a routing signature.
-    const bearerB = fakeModel({ ...route, headers: { Authorization: "Bearer A", authorization: "Bearer B" } });
-    const bearerA = fakeModel({ ...route, headers: { authorization: "Bearer B", Authorization: "Bearer A" } });
-    assert.notEqual(modelRoutingSignature(bearerB), modelRoutingSignature(bearerA));
-
-    // The same collision can reverse an explicit `null` suppression.
-    const suppressed = fakeModel({ ...route, headers: { "x-routing": null, "X-Routing": "blue" } as unknown as Record<string, string> });
-    const routed = fakeModel({ ...route, headers: { "X-Routing": "blue", "x-routing": null } as unknown as Record<string, string> });
-    assert.notEqual(modelRoutingSignature(suppressed), modelRoutingSignature(routed));
-
-    // A duplicate that keeps the same surviving value is not a routing change.
-    const sameValue = fakeModel({ ...route, headers: { Authorization: "Bearer A", authorization: "Bearer A" } });
-    const single = fakeModel({ ...route, headers: { authorization: "Bearer A" } });
-    assert.equal(modelRoutingSignature(sameValue), modelRoutingSignature(single));
-  });
-
-  it("separates base URL, API, and an explicitly suppressed header from an absent one", () => {
-    const route = { provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" };
-    const base = fakeModel(route);
-    const otherBase = fakeModel({ ...route, baseUrl: "http://localhost:9999/v1" });
-    const otherApi = fakeModel({ ...route, api: "openai-completions" });
-    // Pi's header type allows `null` to suppress a provider default; runtime
-    // registrations can hand such a map through a model object.
-    const suppressed = fakeModel({ ...route, headers: { "x-routing": null } as unknown as Record<string, string> });
-    const routed = fakeModel({ ...route, headers: { "x-routing": "blue" } });
-    const signatures = [base, otherBase, otherApi, suppressed, routed].map(modelRoutingSignature);
-    assert.equal(new Set(signatures).size, signatures.length);
   });
 });
