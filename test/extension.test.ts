@@ -1575,6 +1575,108 @@ describe("host routing binding", () => {
     host.shutdown(fake.ctx);
   });
 
+  it("re-resolves the live route after the selected model object was mutated in place", async () => {
+    const model = fakeModel({
+      provider: "cpa",
+      id: "chat",
+      baseUrl: "http://a.example.com/v1",
+      headers: { Authorization: "Bearer synthetic-a" },
+    });
+    const resolved: string[] = [];
+    const auth = (input: ReturnType<typeof fakeModel>): FakeAuth => {
+      // getProviderAuthStatus receives a provider id, not a model.
+      if (typeof input === "object") resolved.push(`${input.baseUrl} ${input.headers?.Authorization ?? "-"}`);
+      return { apiKey: "synthetic", headers: input.headers, baseUrl: input.baseUrl };
+    };
+    const { fetchImpl, calls } = sequenceFetch([codexBody(42)]);
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [model],
+      auth,
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false }),
+    });
+    const fake = fakeContext({ model, registry });
+    await pi.emit("session_start", { type: "session_start" }, fake.ctx);
+    assert.equal(calls.length, 0);
+
+    // Pi can reconfigure the adopted object instead of replacing it.
+    model.baseUrl = "http://b.example.com/v1";
+    model.headers = { Authorization: "Bearer synthetic-b" };
+
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    await command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => calls.length === 1);
+
+    // The new reconciliation describes the route the user is on now, so the
+    // command re-anchors instead of rejecting the mutated selection forever.
+    assert.match(calls[0]?.url ?? "", /b\.example\.com/);
+    assert.equal(calls[0]?.headers.authorization, "Bearer synthetic-b");
+    assert.equal(resolved[resolved.length - 1], "http://b.example.com/v1 Bearer synthetic-b");
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /42%/);
+
+    // A later command keeps working against the same mutated object.
+    await command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => calls.length === 2);
+    assert.match(calls[1]?.url ?? "", /b\.example\.com/);
+    assert.equal(fake.widgets.length, 2, "each command published its own report");
+    host.shutdown(fake.ctx);
+  });
+
+  it("rejects work whose route changed while pending and re-anchors on the next command", async () => {
+    const model = fakeModel({
+      provider: "cpa",
+      id: "chat",
+      baseUrl: "http://a.example.com/v1",
+      headers: { Authorization: "Bearer synthetic-a" },
+    });
+    let held = false;
+    let reached = false;
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const auth = (input: ReturnType<typeof fakeModel>): FakeAuth => {
+      const base: FakeAuth = { apiKey: "synthetic", headers: input.headers, baseUrl: input.baseUrl };
+      if (!held) return base;
+      held = false;
+      reached = true;
+      return { ...base, wait: gate };
+    };
+    const { fetchImpl, calls } = sequenceFetch([codexBody(42)]);
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [model],
+      auth,
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false }),
+    });
+    const fake = fakeContext({ model, registry });
+    await pi.emit("session_start", { type: "session_start" }, fake.ctx);
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+
+    held = true;
+    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => reached);
+    // The route moves while the resolver for the captured route is still pending.
+    model.baseUrl = "http://b.example.com/v1";
+    release?.();
+    await pending;
+
+    assert.equal(calls.length, 0, "no request for the route the selection left");
+    assert.equal(fake.widgets.length, 0, "no report from the stale route");
+
+    // The next command starts from the live route and recovers.
+    await command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => calls.length === 1);
+    assert.match(calls[0]?.url ?? "", /b\.example\.com/);
+    const text = (fake.widgets[fake.widgets.length - 1]?.lines ?? []).join("\n");
+    assert.match(text, /42%/);
+    host.shutdown(fake.ctx);
+  });
+
   it("joins startup, interval, and /usage refreshes of one target into a single HTTP sequence", async () => {
     let release: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {

@@ -237,9 +237,11 @@ export class UniversalUsageHost {
     const revision = ++this.reconcileRevision;
     const model =
       options.model ?? (options.resolved !== undefined ? active.model : this.currentSelectedModel(ctx, active.model));
-    // Reuse the binding captured for the adopted model: re-capturing after an
-    // in-place mutation would adopt a route that was never resolved.
-    const selection = model === active.model ? active.selection : bindSelection(model);
+    // Begin every new reconciliation from the live routing: the selected object
+    // may have been mutated in place since it was adopted, and the resolver must
+    // describe the route the user is on now. A resolution handed in by the caller
+    // is already bound to the capture it was produced from.
+    const selection = options.resolved !== undefined ? active.selection : bindSelection(model);
     if (model !== active.model) {
       this.active = { model, selection };
       this.passiveAttribution = undefined;
