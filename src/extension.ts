@@ -325,6 +325,7 @@ export class UniversalUsageHost {
 
   /** `/usage [provider ...]`: detailed report for the active and configured providers. */
   async report(ctx: ExtensionCommandContext, args: string): Promise<void> {
+    const generation = this.generation;
     const requested = args
       .split(/\s+/u)
       .map((part) => part.trim())
@@ -334,21 +335,32 @@ export class UniversalUsageHost {
     // The active target is always included; other providers only when the user
     // opted into them before the session (explicit config entries) or asked.
     for (const model of this.reportModels(ctx, requested)) {
-      const snapshot = await this.snapshotForModel(ctx, model);
+      const snapshot = await this.snapshotForModel(ctx, model, generation);
+      // A model switch or shutdown cancels the report silently: it must not
+      // fetch the next provider or publish measurements from an older session.
+      if (this.reportCancelled(generation)) return;
       if (snapshot !== undefined) snapshots.push(snapshot);
     }
+    if (this.reportCancelled(generation)) return;
     const active = this.lastSnapshot;
     if (active !== undefined && !snapshots.some((snapshot) => snapshot.identity.key === active.identity.key)) {
       snapshots.unshift(active);
     }
 
     const lines = formatReport(snapshots, this.config, this.now());
+    // Pi rejects a stale context after a reload; stop before touching it.
+    if (this.reportCancelled(generation)) return;
     if (ctx.hasUI) {
       ctx.ui.setWidget(REPORT_WIDGET_KEY, lines);
       ctx.ui.notify("pi-universal-usage: report updated", "info");
     } else {
       this.pi.appendEntry("universal-usage-report", { lines });
     }
+  }
+
+  /** A report may only continue and publish within the activation generation it started in. */
+  private reportCancelled(generation: number): boolean {
+    return this.disposed || generation !== this.generation;
   }
 
   /** Idempotent cleanup for reload, session replacement, and quit. */
@@ -396,11 +408,16 @@ export class UniversalUsageHost {
     return models;
   }
 
-  private async snapshotForModel(ctx: ExtensionCommandContext, model: Model<any>): Promise<TargetSnapshot | undefined> {
+  private async snapshotForModel(
+    ctx: ExtensionCommandContext,
+    model: Model<any>,
+    generation: number,
+  ): Promise<TargetSnapshot | undefined> {
     if (this.active !== undefined && this.isCurrentModel(model)) {
       return this.refreshActive(ctx, { reason: "command", force: true, model });
     }
     const resolution = await resolveTarget(ctx.modelRegistry, model, { allowInsecureHttp: true });
+    if (this.reportCancelled(generation)) return undefined;
     if (!resolution.ok) {
       return {
         identity: resolution.identity,
@@ -411,12 +428,16 @@ export class UniversalUsageHost {
         source: "cache",
       };
     }
-    return this.monitor.refresh(
+    const snapshot = await this.monitor.refresh(
       resolution.target,
       this.config.providers.get(resolution.target.identity.providerId),
       this.config,
       { force: true },
     );
+    // The monitor may return a cancelled or post-shutdown placeholder snapshot;
+    // a stale report discards it instead of reporting it as quota data.
+    if (this.reportCancelled(generation)) return undefined;
+    return snapshot;
   }
 
   private paint(ctx: ExtensionContext): void {

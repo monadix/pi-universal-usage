@@ -284,6 +284,92 @@ describe("pi extension wiring", () => {
     host.shutdown(fake.ctx);
   });
 
+  it("stops a report whose non-active provider credential resolves after a model switch", async () => {
+    const { fetchImpl, calls } = sequenceFetch([codexBody(10)]);
+    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
+    const deepseek = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
+    const other = fakeModel({ provider: "other", id: "chat", baseUrl: "https://other.example.com/v1" });
+    let holdDeepseek = false;
+    let heldStarted = false;
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
+      if (model.provider === "deepseek" && holdDeepseek) {
+        heldStarted = true;
+        return { apiKey: "test-key", baseUrl: model.baseUrl, wait: gate };
+      }
+      return statusOf(model);
+    };
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [cpa, deepseek, other],
+      auth,
+      config: normalizeConfig({ providers: { deepseek: { enabled: true } } }),
+    });
+    const nonTui = fakeContext({ model: cpa, registry, mode: "rpc" });
+    await pi.emit("model_select", { type: "model_select", model: cpa, previousModel: undefined, source: "set" }, nonTui.ctx);
+
+    const fake = fakeContext({ model: cpa, registry });
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    holdDeepseek = true;
+    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => heldStarted);
+    const callsBeforeSwitch = calls.length;
+
+    // A switch advances the activation generation and cancels older work while
+    // the report is still waiting for the non-active provider's credential.
+    await pi.emit("model_select", { type: "model_select", model: other, previousModel: cpa, source: "set" }, nonTui.ctx);
+    release?.();
+    await pending;
+    assert.equal(calls.length, callsBeforeSwitch);
+    assert.equal(fake.widgets.length, 0);
+    assert.equal(fake.notifications.length, 0);
+    host.shutdown(nonTui.ctx);
+  });
+
+  it("stops a report at shutdown instead of publishing a cancelled snapshot", async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const calls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      calls.push(url);
+      if (url.includes("api.deepseek.com")) {
+        await gate;
+        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
+      }
+      return codexBody(10);
+    }) as typeof fetch;
+    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
+    const deepseek = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [cpa, deepseek],
+      config: normalizeConfig({ providers: { deepseek: { enabled: true } } }),
+    });
+    const nonTui = fakeContext({ model: cpa, registry, mode: "rpc" });
+    await pi.emit("model_select", { type: "model_select", model: cpa, previousModel: undefined, source: "set" }, nonTui.ctx);
+
+    const fake = fakeContext({ model: cpa, registry });
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => calls.some((url) => url.includes("api.deepseek.com")));
+
+    // Shutdown aborts the pending GET; the cancelled snapshot must not be
+    // published through a context Pi has already invalidated.
+    host.shutdown(fake.ctx);
+    release?.();
+    await pending;
+    assert.equal(fake.widgets.length, 0);
+    assert.equal(fake.notifications.length, 0);
+  });
+
   it("repaints stale footer qualifications from cache without another request", async () => {
     const { fetchImpl, calls } = sequenceFetch([codexBody(42)]);
     const model = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
