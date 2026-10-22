@@ -1445,6 +1445,86 @@ describe("pi extension wiring", () => {
     host.shutdown(fake.ctx);
   });
 
+  it("stops a report whose accepted failure is replaced while a peer credential resolves", async () => {
+    let holdPeerAuth = false;
+    let peerAuthReached = false;
+    let releasePeerAuth: (() => void) | undefined;
+    const peerAuthGate = new Promise<void>((resolve) => {
+      releasePeerAuth = resolve;
+    });
+    const activeCalls: string[] = [];
+    const peerCalls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("api.deepseek.com")) {
+        peerCalls.push(url);
+        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
+      }
+      activeCalls.push(url);
+      return codexBody(11);
+    }) as typeof fetch;
+    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
+      if (model.provider === "deepseek") {
+        if (holdPeerAuth) {
+          peerAuthReached = true;
+          return { apiKey: "key-a", source: "stored", wait: peerAuthGate };
+        }
+        return { apiKey: "key-a", source: "stored" };
+      }
+      // Neither active route has a usable credential, so each reconciliation
+      // adopts its own sanitized failure.
+      return { ok: false, error: "removed credential" };
+    };
+    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://a.example/v1" });
+    const cpaMoved = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://b.example/v1" });
+    const deepseek = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [cpa, cpaMoved, deepseek],
+      auth,
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false, providers: { deepseek: { enabled: true } } }),
+    });
+    const selection = { current: cpa };
+    const fake = fakeContext({ modelRef: selection, registry });
+    await host.activate(fake.ctx, cpa, { refresh: false });
+
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    holdPeerAuth = true;
+    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    // The report adopted its own sanitized failure and is now resolving the
+    // configured peer, which is where a later replacement can slip in.
+    await waitFor(() => peerAuthReached);
+
+    // A newer reconciliation for a silently replaced same-ID route adopts that
+    // route's sanitized failure, replacing the view this report accepted.
+    selection.current = cpaMoved;
+    await host.refreshActive(fake.ctx, { reason: "interval" });
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /no-credential/);
+
+    releasePeerAuth?.();
+    await pending;
+
+    assert.equal(peerCalls.length, 0, "the replaced failure authorizes no follow-on peer request");
+    assert.equal(activeCalls.length, 0);
+    assert.equal(fake.widgets.length, 0, "no report mixes the replaced failure into its own");
+    assert.equal(fake.notifications.length, 0);
+    assert.equal(pi.entries.length, 0);
+
+    // Without a replacement the same report still publishes its own failure.
+    holdPeerAuth = false;
+    await command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    assert.equal(fake.widgets.length, 1, "the accepted failure report is still published");
+    const text = (fake.widgets[0]?.lines ?? []).join("\n");
+    assert.match(text, /state: no-credential/);
+    assert.match(text, /no usable credential/);
+    assert.equal((text.match(/cpa\/chat/gu) ?? []).length, 1, "one active failure section, not a mix");
+    assert.equal(peerCalls.length, 1, "the accepted report still collects the configured peer");
+    assert.equal(activeCalls.length, 0);
+    host.shutdown(fake.ctx);
+  });
+
   it("discards a pending active refresh when the live selection changes route without an event", async () => {
     let release: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {

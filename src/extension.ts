@@ -490,6 +490,9 @@ export class UniversalUsageHost {
     // changed same-ID route) cancels the report instead of publishing older
     // measurements.
     let source = this.activeSourceToken();
+    // The sanitized failure this report's own attempt adopted, if any. It remains
+    // this report's authority for its whole lifetime, not only at the anchor.
+    let acceptedFailure: TargetSnapshot | undefined;
     // The active target is always included; other providers only when the user
     // opted into them before the session (explicit config entries) or asked.
     for (const target of this.reportTargets(ctx, requested)) {
@@ -507,17 +510,18 @@ export class UniversalUsageHost {
         const anchor = this.activeReportAnchor(outcome);
         if (anchor === undefined) return;
         source = anchor;
+        if (outcome.kind === "failure") acceptedFailure = outcome.snapshot;
         snapshot = outcome.snapshot;
       } else {
-        snapshot = await this.snapshotForModel(ctx, target.model, generation, source, unadopted);
+        snapshot = await this.snapshotForModel(ctx, target.model, generation, source, unadopted, acceptedFailure);
       }
-      // A model switch, shutdown, or effective source change cancels the report
-      // silently: it must not fetch the next provider or publish measurements
-      // from an older source.
-      if (!this.reportStillValid(generation, source, ctx, unadopted)) return;
+      // A model switch, shutdown, effective source change, or a replaced failure
+      // cancels the report silently: it must not fetch the next provider or
+      // publish measurements from an authority it no longer holds.
+      if (!this.reportStillValid(generation, source, ctx, unadopted, acceptedFailure)) return;
       if (snapshot !== undefined) snapshots.push(snapshot);
     }
-    if (!this.reportStillValid(generation, source, ctx, unadopted)) return;
+    if (!this.reportStillValid(generation, source, ctx, unadopted, acceptedFailure)) return;
     const active = this.lastSnapshot;
     const activeTargetKey = this.active?.target?.identity.key;
     // With no reconciled target the last snapshot is the accepted failure state
@@ -530,7 +534,7 @@ export class UniversalUsageHost {
 
     const lines = formatReport(snapshots, this.config, this.now());
     // Pi rejects a stale context after a reload; stop before touching it.
-    if (!this.reportStillValid(generation, source, ctx, unadopted)) return;
+    if (!this.reportStillValid(generation, source, ctx, unadopted, acceptedFailure)) return;
     if (ctx.hasUI) {
       ctx.ui.setWidget(REPORT_WIDGET_KEY, lines);
       ctx.ui.notify("pi-universal-usage: report updated", "info");
@@ -569,17 +573,23 @@ export class UniversalUsageHost {
 
   /**
    * Report work is bound to the activation generation and effective source it
-   * started with. The route it may publish under is the current binding, because
-   * the active provider's own reconciliation re-anchors both; while no binding
-   * has been adopted yet, the route the command captured before its first await
-   * is the one its work must still match.
+   * started with, and -- when its own active attempt adopted a sanitized failure
+   * -- to that exact accepted view. Every target-less failure shares the `-`
+   * source, so only the pinned view distinguishes them: newer work that replaces
+   * it stops the report instead of lending its authority. The route the report
+   * may publish under is the current binding, because the active provider's own
+   * reconciliation re-anchors both; while no binding has been adopted yet, the
+   * route the command captured before its first await is the one its work must
+   * still match.
    */
   private reportStillValid(
     generation: number,
     source: string | undefined,
     ctx: ExtensionContext,
     unadopted: SelectionBinding | undefined,
+    acceptedFailure: TargetSnapshot | undefined,
   ): boolean {
+    if (acceptedFailure !== undefined && this.lastSnapshot !== acceptedFailure) return false;
     return this.holdsWork({ generation, selection: this.active?.selection ?? unadopted, source }, ctx);
   }
 
@@ -712,10 +722,11 @@ export class UniversalUsageHost {
     generation: number,
     source: string | undefined,
     unadopted: SelectionBinding | undefined,
+    acceptedFailure: TargetSnapshot | undefined,
   ): Promise<TargetSnapshot | undefined> {
     const selection = bindSelection(model);
     const resolution = await resolveTarget(ctx.modelRegistry, selection.model, { allowInsecureHttp: true });
-    if (!this.reportStillValid(generation, source, ctx, unadopted)) return undefined;
+    if (!this.reportStillValid(generation, source, ctx, unadopted, acceptedFailure)) return undefined;
     if (!resolution.ok) {
       return {
         identity: resolution.identity,
@@ -734,7 +745,7 @@ export class UniversalUsageHost {
     );
     // The monitor may return a cancelled or post-shutdown placeholder snapshot;
     // a stale report discards it instead of reporting it as quota data.
-    if (!this.reportStillValid(generation, source, ctx, unadopted)) return undefined;
+    if (!this.reportStillValid(generation, source, ctx, unadopted, acceptedFailure)) return undefined;
     return snapshot;
   }
 
