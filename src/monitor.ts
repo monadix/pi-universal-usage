@@ -213,7 +213,7 @@ export class UsageMonitor {
     target: ResolvedTarget,
     provider: ProviderConfig | undefined,
     config: UsageConfig,
-    options: { force?: boolean; signal?: AbortSignal } = {},
+    options: { force?: boolean; signal?: AbortSignal; mayContinue?: () => boolean } = {},
   ): Promise<TargetSnapshot> {
     if (this.closed) return Promise.resolve(emptySnapshot(target, "unknown", this.now(), "monitor is shut down"));
     const key = target.identity.key;
@@ -251,7 +251,7 @@ export class UsageMonitor {
     // is attached immediately below.
     const run = { controller: new AbortController() } as Run;
     current.run = run;
-    run.promise = this.executeRun(target, provider, config, current, run, options.signal).finally(() => {
+    run.promise = this.executeRun(target, provider, config, current, run, options.signal, options.mayContinue).finally(() => {
       // A cancelled entry may already have installed a replacement run.
       if (current.run === run) current.run = undefined;
     });
@@ -348,7 +348,9 @@ export class UsageMonitor {
   /**
    * Run one request sequence for an installed run, forwarding the caller's
    * cancellation onto the run's own controller. Cancellation detaches first, so
-   * a replacement never joins work its parent aborted.
+   * a replacement never joins work its parent aborted. A caller-supplied
+   * continuation check is consulted before every request: it is the caller's own
+   * authority, not this entry's ownership.
    */
   private async executeRun(
     target: ResolvedTarget,
@@ -357,6 +359,7 @@ export class UsageMonitor {
     entry: Entry,
     run: Run,
     parent: AbortSignal | undefined,
+    mayContinue: (() => boolean) | undefined,
   ): Promise<TargetSnapshot> {
     const abortFromParent = () => this.detach(entry, run);
     const forwardParent = parent !== undefined && !parent.aborted;
@@ -368,7 +371,7 @@ export class UsageMonitor {
         this.detach(entry, run);
         return cancelledSnapshot(target, this.now());
       }
-      return await this.runPlan(target, provider, config, entry, run);
+      return await this.runPlan(target, provider, config, entry, run, mayContinue);
     } finally {
       if (forwardParent) parent?.removeEventListener("abort", abortFromParent);
     }
@@ -380,6 +383,7 @@ export class UsageMonitor {
     config: UsageConfig,
     entry: Entry,
     run: Run,
+    mayContinue: (() => boolean) | undefined,
   ): Promise<TargetSnapshot> {
     const signal = run.controller.signal;
     if (provider?.enabled === false) {
@@ -414,6 +418,11 @@ export class UsageMonitor {
       // A cancelled or replaced run must not start another request or write
       // optional-sibling state.
       if (!this.isOwned(entry, run)) return cancelledSnapshot(target, this.now());
+      // The caller may also lose its own authority while this sequence runs - a
+      // silent same-ID routing change emits no event and aborts no run - so it
+      // rechecks that authority before each request instead of only after the
+      // whole sequence returns.
+      if (mayContinue !== undefined && !mayContinue()) return cancelledSnapshot(target, this.now());
       // An optional sibling that asked for a retry window is skipped until it
       // elapses; the required result keeps refreshing meanwhile.
       if (request.optional === true) {

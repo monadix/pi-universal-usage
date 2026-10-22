@@ -369,7 +369,15 @@ export class UniversalUsageHost {
         target,
         this.config.providers.get(target.identity.providerId),
         this.config,
-        { force: options.force === true, signal: controller.signal },
+        {
+          force: options.force === true,
+          signal: controller.signal,
+          // The host owns publication, but a silent same-ID routing change emits
+          // no event and aborts no run: recheck this work's own lease before the
+          // monitor starts another request, so an abandoned route cannot keep
+          // discovering endpoints.
+          mayContinue: () => this.holdsWork(work, ctx),
+        },
       );
       // A cancelled run, a replaced activation, a rotated source, or a live
       // selection that moved without an event may not publish.
@@ -856,7 +864,12 @@ export class UniversalUsageHost {
       resolution.target,
       this.config.providers.get(resolution.target.identity.providerId),
       this.config,
-      { force: true },
+      {
+        force: true,
+        // The report can lose its authority between two discovery requests for
+        // the same reason: no event announces a silent same-ID route change.
+        mayContinue: () => this.reportStillValid(lease, ctx),
+      },
     );
     // The monitor may return a cancelled or post-shutdown placeholder snapshot;
     // a stale report discards it instead of reporting it as quota data.

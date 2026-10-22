@@ -3029,6 +3029,168 @@ describe("host routing binding", () => {
     assert.equal(calls.length, 0, "no work is started");
   });
 
+  it("stops endpoint discovery when the live route changes silently", async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const calls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      calls.push(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+      if (calls.length === 1) {
+        await gate;
+        // A 404 during discovery does not end the sequence, so only the host's
+        // own lease can keep the second request from being issued.
+        return textResponse("not found", { status: 404 });
+      }
+      return codexBody(64);
+    }) as typeof fetch;
+    const modelA = fakeModel({
+      provider: "cpa",
+      id: "chat",
+      baseUrl: "https://a.example/v1",
+      headers: { Authorization: "Bearer synthetic-a" },
+    });
+    const modelB = fakeModel({
+      provider: "cpa",
+      id: "chat",
+      baseUrl: "https://b.example/v1",
+      headers: { Authorization: "Bearer synthetic-b" },
+    });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [modelA, modelB],
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false }),
+    });
+    const selection = { current: modelA };
+    const fake = fakeContext({ modelRef: selection, registry });
+    await host.activate(fake.ctx, modelA, { refresh: false });
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => calls.length === 1);
+
+    // Pi suppresses model_select for an equal logical model, so only the live
+    // getter reveals that the selected route has moved.
+    selection.current = modelB;
+    release?.();
+    await pending;
+
+    assert.equal(calls.length, 1, "the abandoned route issues no follow-on request");
+    assert.equal(fake.widgets.length, 0, "the abandoned route publishes no report");
+    assert.doesNotMatch(String(fake.statuses[fake.statuses.length - 1]), /64%/);
+    host.shutdown(fake.ctx);
+  });
+
+  it("stops a reported provider's discovery when the live route changes silently", async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const calls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      calls.push(url);
+      if (url.includes("peer.example.com")) {
+        await gate;
+        return textResponse("not found", { status: 404 });
+      }
+      return codexBody(12);
+    }) as typeof fetch;
+    const active = fakeModel({
+      provider: "cpa",
+      id: "chat",
+      baseUrl: "https://a.example/v1",
+      headers: { Authorization: "Bearer synthetic-a" },
+    });
+    const moved = fakeModel({
+      provider: "cpa",
+      id: "chat",
+      baseUrl: "https://b.example/v1",
+      headers: { Authorization: "Bearer synthetic-b" },
+    });
+    const peer = fakeModel({ provider: "peer", id: "chat", baseUrl: "https://peer.example.com/v1" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [active, moved, peer],
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false, providers: { peer: { enabled: true } } }),
+    });
+    const selection = { current: active };
+    const fake = fakeContext({ modelRef: selection, registry });
+    await host.activate(fake.ctx, active, { refresh: false });
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => calls.some((url) => url.includes("peer.example.com")));
+
+    // The report's own lease is bound to the active route, so a silent move of
+    // that route ends the peer discovery too.
+    selection.current = moved;
+    release?.();
+    await pending;
+
+    assert.equal(calls.filter((url) => url.includes("peer.example.com")).length, 1, "the peer sequence stops");
+    assert.equal(fake.widgets.length, 0, "the stale report publishes nothing");
+    assert.equal(fake.notifications.length, 0);
+    host.shutdown(fake.ctx);
+  });
+
+  it("keeps discovering endpoints while the caller's lease holds", async () => {
+    const calls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      calls.push(url);
+      return calls.length === 1 ? textResponse("not found", { status: 404 }) : codexBody(42);
+    }) as typeof fetch;
+    const model = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://a.example/v1" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [model],
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false }),
+    });
+    const fake = fakeContext({ modelRef: { current: model }, registry });
+    await host.activate(fake.ctx, model, { refresh: false });
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+
+    await command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+
+    assert.equal(calls.length, 2, "discovery continues while the lease holds");
+    assert.match(calls[1] ?? "", /backend-api\/wham\/usage/);
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /42%/);
+    assert.equal(fake.widgets.length, 1);
+    host.shutdown(fake.ctx);
+  });
+
+  it("keeps the optional sibling request while the caller's lease holds", async () => {
+    const { fetchImpl, calls } = sequenceFetch([
+      jsonResponse({ data: { limit: 20, limit_remaining: 15, limit_reset: "monthly" } }),
+      jsonResponse({ data: { total_credits: 100, total_usage: 20 } }),
+    ]);
+    const model = fakeModel({ provider: "openrouter", id: "chat", baseUrl: "https://openrouter.ai/api/v1" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [model],
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false }),
+    });
+    const fake = fakeContext({ modelRef: { current: model }, registry });
+    await host.activate(fake.ctx, model, { refresh: false });
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+
+    await command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+
+    assert.equal(calls.length, 2, "the optional sibling is still requested");
+    assert.match(calls[1]?.url ?? "", /\/api\/v1\/credits$/);
+    const text = (fake.widgets[fake.widgets.length - 1]?.lines ?? []).join("\n");
+    assert.match(text, /state: ok/);
+    host.shutdown(fake.ctx);
+  });
+
   it("keeps the captured route and resolver input when the selected model is mutated in place", async () => {
     const model = fakeModel({
       provider: "cpa",
