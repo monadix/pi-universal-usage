@@ -271,7 +271,7 @@ describe("UsageMonitor", () => {
     assert.match(fileConfig.problems.join(" "), /deepseek\.path must be an absolute path/);
   });
 
-  it("parses passive headers without caching them", async () => {
+  it("records the last passive measurement without caching it", async () => {
     const target = await targetFor({ provider: "openai", baseUrl: "https://gateway.example.com/v1" });
     const monitor = monitorWith(sequenceFetch([textResponse("")]).fetchImpl);
     const snapshot = monitor.passiveSnapshot(
@@ -284,9 +284,66 @@ describe("UsageMonitor", () => {
     assert.equal(snapshot.source, "headers");
     assert.equal(snapshot.scheme, "codex-headers");
     assert.equal(snapshot.metrics[0]?.usedPercent, 55);
-    // Display-only: the measurement never enters the cache a later refresh or
-    // report would read back.
+    // The cache entry a refresh or report reads back stays empty; the value is
+    // kept only as this identity's last passive measurement.
     assert.equal(monitor.snapshotFor(target.identity.key), undefined);
+  });
+
+  it("reports the last passive measurement when a forced refresh has no endpoint", async () => {
+    const target = await targetFor({ provider: "openai", baseUrl: "https://api.openai.com/v1" });
+    let now = NOW;
+    const { fetchImpl, calls } = sequenceFetch([textResponse("unused")]);
+    const monitor = new UsageMonitor({ now: () => now, fetchImpl, policy: { timeoutMs: 200 } });
+    const passive = monitor.passiveSnapshot(
+      target,
+      { "x-ratelimit-limit-requests": "100", "x-ratelimit-remaining-requests": "25" },
+      200,
+      config,
+    );
+    assert.equal(passive?.metrics[0]?.usedPercent, 75);
+
+    // `/usage` forces a refresh; with no requestable endpoint the measurement
+    // comes back unchanged, including its original timestamp and provenance.
+    now += 120_000;
+    const forced = await monitor.refresh(target, undefined, config, { force: true });
+    assert.equal(forced.source, "headers");
+    assert.equal(forced.status, "ok");
+    assert.equal(forced.fetchedAt, NOW);
+    assert.deepEqual(forced.metrics, passive?.metrics);
+    assert.equal(forced.notice, undefined);
+    assert.equal(calls.length, 0);
+  });
+
+  it("does not report another model's passive measurement without an endpoint", async () => {
+    const modelA = fakeModel({ provider: "openai", id: "chat-a", baseUrl: "https://api.openai.com/v1" });
+    const modelB = fakeModel({ provider: "openai", id: "chat-b", baseUrl: "https://api.openai.com/v1" });
+    const registry = fakeRegistry({ apiKey: "test-key" }, [modelA, modelB]);
+    const resolvedA = await resolveTarget(registry, modelA, { allowInsecureHttp: true });
+    const resolvedB = await resolveTarget(registry, modelB, { allowInsecureHttp: true });
+    assert.equal(resolvedA.ok && resolvedB.ok, true);
+    if (!resolvedA.ok || !resolvedB.ok) return;
+    // One account-level entry, but a passive measurement belongs to one model.
+    assert.equal(resolvedA.target.identity.key, resolvedB.target.identity.key);
+
+    const { fetchImpl, calls } = sequenceFetch([textResponse("unused")]);
+    const monitor = monitorWith(fetchImpl);
+    const passiveA = monitor.passiveSnapshot(
+      resolvedA.target,
+      { "x-ratelimit-limit-requests": "100", "x-ratelimit-remaining-requests": "25" },
+      200,
+      config,
+    );
+    assert.equal(passiveA?.metrics[0]?.usedPercent, 75);
+
+    const forcedA = await monitor.refresh(resolvedA.target, undefined, config, { force: true });
+    assert.equal(forcedA.source, "headers");
+    assert.equal(forcedA.fetchedAt, passiveA?.fetchedAt);
+
+    const forcedB = await monitor.refresh(resolvedB.target, undefined, config, { force: true });
+    assert.deepEqual(forcedB.metrics, []);
+    assert.notEqual(forcedB.source, "headers");
+    assert.match(forcedB.notice ?? "", /no subscription quota endpoint is requested/);
+    assert.equal(calls.length, 0);
   });
 
   it("shares an endpoint result with a joining model of the same account", async () => {
@@ -344,6 +401,13 @@ describe("UsageMonitor", () => {
     // Subsequent ordinary refreshes keep serving the disabled state.
     const next = await monitor.refresh(target, provider, disabledConfig);
     assert.equal(next, disabled);
+
+    // Nothing was recorded, so even a forced refresh reports the disabled state
+    // instead of a stale passive measurement.
+    const forced = await monitor.refresh(target, provider, disabledConfig, { force: true });
+    assert.equal(forced.status, "unsupported");
+    assert.match(forced.notice ?? "", /disabled/);
+    assert.deepEqual(forced.metrics, []);
     assert.equal(calls.length, 0);
   });
 

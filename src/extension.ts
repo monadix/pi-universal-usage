@@ -289,11 +289,11 @@ export class UniversalUsageHost {
 
   /**
    * Passive update from an inference response: parse the headers and paint the
-   * footer directly. The value is transient - it is not cached, `/usage` never
-   * sees it, and the next scheduled or manual refresh replaces it. Attribution
-   * holds only while Pi is busy with the target that started the current turn:
-   * a response event carries no model identity, so a switch inside the turn
-   * makes it ambiguous.
+   * footer directly. The monitor keeps the parsed value as the last measurement
+   * of this model, so `/usage` can report it when no endpoint is requestable; the
+   * next measurement or endpoint read replaces it. Attribution holds only while
+   * Pi is busy with the target that started the current turn: a response event
+   * carries no model identity, so a switch inside the turn makes it ambiguous.
    */
   afterProviderResponse(status: number, headers: Record<string, string>, ctx: ExtensionContext): void {
     const active = this.active;

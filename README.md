@@ -278,10 +278,12 @@ run.
 
 ## Known limitations
 
-- Passive response headers are display-only. They are not stored, so `/usage`
-  never reports them, they do not survive a forced refresh that finds no
-  requestable endpoint, and a provider with a fresh endpoint snapshot may have
-  its footer briefly replaced by a coarser header value until the next refresh.
+- Passive response headers are kept in memory as the last measurement of the
+  model whose inference produced them, so `/usage` reports that value for the
+  same model when no endpoint is requestable. The next passive measurement or a
+  fresh endpoint read replaces it, and it is never reported for another model. A
+  provider with a fresh endpoint snapshot may still have its footer briefly
+  replaced by a coarser header value until the next refresh.
 - A same-model selection change that only alters a model-level routing header is
   not detected: the stamp covers provider, model id, API, and base URL. The
   previous route's footer value stays until the next selection event or refresh.

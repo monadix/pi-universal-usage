@@ -239,6 +239,39 @@ describe("pi extension wiring", () => {
     host.shutdown(idle.ctx);
   });
 
+  it("reports a passive-only measurement from /usage when no endpoint is requestable", async () => {
+    const { fetchImpl, calls } = sequenceFetch([textResponse("unexpected request")]);
+    const model = fakeModel({ provider: "openai", id: "chat", baseUrl: "https://api.openai.com/v1" });
+    const { pi, host, registry, advance } = buildHost({ fetchImpl, models: [model] });
+    const fake = fakeContext({ model, registry, idle: false });
+    await pi.emit("model_select", { type: "model_select", model, previousModel: undefined, source: "set" }, fake.ctx);
+    await pi.emit("turn_start", { type: "turn_start", turnIndex: 0, timestamp: Date.now() }, fake.ctx);
+    await pi.emit(
+      "after_provider_response",
+      { status: 200, headers: { "x-ratelimit-limit-requests": "100", "x-ratelimit-remaining-requests": "25" } },
+      fake.ctx,
+    );
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /req 75%/);
+    advance(120_000);
+
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    await command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    assert.equal(calls.length, 0);
+
+    // The forced report keeps the header-derived value instead of erasing it.
+    const footer = String(fake.statuses[fake.statuses.length - 1]);
+    assert.match(footer, /req 75%/);
+    assert.doesNotMatch(footer, /no quota interface/);
+    const text = (fake.widgets[fake.widgets.length - 1]?.lines ?? []).join("\n");
+    assert.match(text, /openai\/chat/);
+    assert.match(text, /state: ok \[rate-limit-headers\] \(source: headers\)/);
+    assert.match(text, /requests 75%/);
+    // The original measurement timestamp is preserved, not reset by the command.
+    assert.match(text, /age: 2m/);
+    host.shutdown(fake.ctx);
+  });
+
   it("writes a detailed report to the widget with the configured providers", async () => {
     const { fetchImpl } = sequenceFetch([
       jsonResponse({ rate_limit: { primary_window: { used_percent: 10, limit_window_seconds: 18000 }, secondary_window: null } }),

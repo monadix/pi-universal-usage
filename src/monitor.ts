@@ -3,8 +3,10 @@
  * endpoint caching, negative caching/backoff, duplicate-refresh deduplication,
  * and cancellation. Each target entry owns at most one run, which carries both
  * the promise concurrent refreshes join and the controller that cancels it.
- * Passive header parsing is display-only and never touches the cache. Nothing
- * here writes to a provider or mutates Pi state.
+ * Passive header parsing never writes the cache: the last measurement is kept
+ * per entry, tagged with the model that produced it, so a target with nothing
+ * to request can still report it. Nothing here writes to a provider or mutates
+ * Pi state.
  */
 
 import { planEndpoints, type EndpointPlan, type PlannedRequest } from "./endpoints.ts";
@@ -54,6 +56,13 @@ interface Run {
 
 interface Entry {
   snapshot?: TargetSnapshot;
+  /**
+   * The last passive header measurement of this account-level entry, with the
+   * model whose inference produced it: last write wins, and only that model may
+   * read it back. It never occupies `snapshot`, so a refresh still writes what
+   * it actually fetched.
+   */
+  lastPassive?: { modelId: string; snapshot: TargetSnapshot };
   endpoint?: CachedEndpoint;
   /** Retry deadlines by optional endpoint URL; keeps a slow sibling from hiding the required result. */
   optionalRetry?: Map<string, OptionalDeferral>;
@@ -244,10 +253,11 @@ export class UsageMonitor {
 
   /**
    * Parse passive response headers from an inference response for the active
-   * target. The result is display-only: it is never written into the cache, so a
-   * later refresh can never serve it back and `/usage` never sees it. The caller
-   * owns attribution; an explicitly disabled provider produces nothing, so a live
-   * response cannot revive a disabled footer.
+   * target and keep the result as this identity's last passive measurement. It is
+   * never written into `snapshot`, so a refresh still writes only what it fetched;
+   * a target with no requestable endpoint reports this value for the same model.
+   * The caller owns attribution; an explicitly disabled provider produces nothing,
+   * so a live response cannot revive a disabled footer.
    */
   passiveSnapshot(
     target: ResolvedTarget,
@@ -266,7 +276,7 @@ export class UsageMonitor {
     }
     const rejected = results.some((result) => result.rateLimited === true) || status === 429;
     const notice = mergeNotice(...results.map((result) => result.notice));
-    return {
+    const snapshot: TargetSnapshot = {
       identity: target.identity,
       status: rejected ? "rate-limited" : "ok",
       scheme: results[0]?.scheme,
@@ -276,6 +286,10 @@ export class UsageMonitor {
       fetchedAt: now,
       source: "headers",
     };
+    const entry = this.entries.get(target.identity.key) ?? { nextAttemptAt: 0 };
+    this.entries.set(target.identity.key, entry);
+    entry.lastPassive = { modelId: target.identity.modelId, snapshot };
+    return snapshot;
   }
 
   /**
@@ -364,6 +378,14 @@ export class UsageMonitor {
 
     const plan = planEndpoints(target, provider, config);
     if (plan.kind === "none") {
+      // Nothing can be requested, so a forced `/usage` refresh reports this
+      // model's last passive measurement with its original timestamp instead of
+      // erasing it. Another model's measurement is never reused.
+      const passive = entry.lastPassive;
+      if (passive !== undefined && passive.modelId === target.identity.modelId) {
+        entry.nextAttemptAt = this.now() + AUTH_FAILURE_BACKOFF_MS;
+        return passive.snapshot;
+      }
       const snapshot = emptySnapshot(target, plan.status, this.now(), plan.notice);
       entry.snapshot = snapshot;
       entry.nextAttemptAt = this.now() + AUTH_FAILURE_BACKOFF_MS;
