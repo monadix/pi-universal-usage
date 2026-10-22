@@ -49,6 +49,31 @@ describe("codex-headers", () => {
     assert.equal(secondary?.resetAtSeconds, Math.round(NOW / 1000 + 900));
   });
 
+  it("labels a declared window by its exact duration", () => {
+    const halfHour = codexHeadersParser.parse({
+      now: NOW,
+      headers: { "x-codex-primary-used-percent": "25", "x-codex-primary-window-minutes": "30" },
+    });
+    assert.ok(halfHour);
+    assert.equal(halfHour.metrics[0]?.durationSeconds, 1800);
+    assert.equal(halfHour.metrics[0]?.label, "30m window");
+
+    const quarterHour = codexHeadersParser.parse({
+      now: NOW,
+      headers: { "x-codex-primary-used-percent": "25", "x-codex-primary-window-minutes": "15" },
+    });
+    assert.ok(quarterHour);
+    assert.equal(quarterHour.metrics[0]?.label, "15m window");
+
+    const ninetyMinutes = codexHeadersParser.parse({
+      now: NOW,
+      headers: { "x-codex-secondary-used-percent": "60", "x-codex-secondary-window-minutes": "90" },
+    });
+    assert.ok(ninetyMinutes);
+    assert.equal(ninetyMinutes.metrics[0]?.durationSeconds, 5400);
+    assert.equal(ninetyMinutes.metrics[0]?.label, "90m window");
+  });
+
   it("keeps a credits balance as a separate budget dimension", () => {
     const result = codexHeadersParser.parse({
       now: NOW,

@@ -11,8 +11,12 @@ import type { ParseInput, ParseResult, UsageMetric, UsageParser } from "../types
 
 function windowLabel(id: "primary" | "secondary", durationSeconds: number | undefined): string {
   if (durationSeconds === undefined) return id === "primary" ? "primary window" : "secondary window";
+  // Label the declared window exactly; rounding 90 minutes to `2h` would
+  // misstate the quota the headers describe.
   if (durationSeconds % 86400 === 0) return `${durationSeconds / 86400}d window`;
-  return `${Math.round(durationSeconds / 3600)}h window`;
+  if (durationSeconds % 3600 === 0) return `${durationSeconds / 3600}h window`;
+  if (durationSeconds % 60 === 0) return `${durationSeconds / 60}m window`;
+  return `${durationSeconds}s window`;
 }
 
 function windowMetric(
