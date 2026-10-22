@@ -1452,6 +1452,7 @@ describe("pi extension wiring", () => {
     const peerAuthGate = new Promise<void>((resolve) => {
       releasePeerAuth = resolve;
     });
+    let activeCredential = false;
     const activeCalls: string[] = [];
     const peerCalls: string[] = [];
     const fetchImpl = (async (input: string | URL | Request) => {
@@ -1471,6 +1472,7 @@ describe("pi extension wiring", () => {
         }
         return { apiKey: "key-a", source: "stored" };
       }
+      if (activeCredential) return { apiKey: "key-a", source: "stored" };
       // Neither active route has a usable credential, so each reconciliation
       // adopts its own sanitized failure.
       return { ok: false, error: "removed credential" };
@@ -1521,6 +1523,99 @@ describe("pi extension wiring", () => {
     assert.match(text, /no usable credential/);
     assert.equal((text.match(/cpa\/chat/gu) ?? []).length, 1, "one active failure section, not a mix");
     assert.equal(peerCalls.length, 1, "the accepted report still collects the configured peer");
+    assert.equal(activeCalls.length, 0);
+
+    // Once the active provider resolves again, its adopted target re-anchors the
+    // report: the failure pin must not outlive the view it was captured from.
+    activeCredential = true;
+    await command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    assert.equal(fake.widgets.length, 2, "the recovered report is published");
+    const recovered = (fake.widgets[1]?.lines ?? []).join("\n");
+    assert.match(recovered, /cpa\/chat/);
+    assert.doesNotMatch(recovered, /no-credential/);
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /11%/);
+    assert.equal(activeCalls.length, 1, "the recovered route is requested once");
+    host.shutdown(fake.ctx);
+  });
+
+  it("stops a filtered report whose captured active failure is replaced", async () => {
+    let holdPeerAuth = false;
+    let peerAuthReached = false;
+    let releasePeerAuth: (() => void) | undefined;
+    const peerAuthGate = new Promise<void>((resolve) => {
+      releasePeerAuth = resolve;
+    });
+    const activeCalls: string[] = [];
+    const peerCalls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("api.deepseek.com")) {
+        peerCalls.push(url);
+        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
+      }
+      activeCalls.push(url);
+      return codexBody(11);
+    }) as typeof fetch;
+    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
+      if (model.provider === "deepseek") {
+        if (holdPeerAuth) {
+          peerAuthReached = true;
+          return { apiKey: "key-a", source: "stored", wait: peerAuthGate };
+        }
+        return { apiKey: "key-a", source: "stored" };
+      }
+      // Neither active route has a usable credential, so each reconciliation
+      // adopts its own sanitized failure.
+      return { ok: false, error: "removed credential" };
+    };
+    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://a.example/v1" });
+    const cpaMoved = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://b.example/v1" });
+    const deepseek = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [cpa, cpaMoved, deepseek],
+      auth,
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false, providers: { deepseek: { enabled: true } } }),
+    });
+    const selection = { current: cpa };
+    const fake = fakeContext({ modelRef: selection, registry });
+    // The active provider is already in its sanitized failure state when the
+    // command starts, and the requested filter excludes it from the refresh.
+    await host.activate(fake.ctx, cpa, { refresh: false });
+
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    holdPeerAuth = true;
+    const pending = command.handler("deepseek", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => peerAuthReached);
+
+    // A newer reconciliation for a silently replaced same-ID route adopts that
+    // route's failure, replacing the view this filtered report captured.
+    selection.current = cpaMoved;
+    await host.refreshActive(fake.ctx, { reason: "interval" });
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /no-credential/);
+
+    releasePeerAuth?.();
+    await pending;
+
+    assert.equal(peerCalls.length, 0, "the replaced failure authorizes no follow-on peer request");
+    assert.equal(activeCalls.length, 0);
+    assert.equal(fake.widgets.length, 0, "no filtered report is published from a replaced failure");
+    assert.equal(fake.notifications.length, 0);
+    assert.equal(pi.entries.length, 0);
+
+    // A filtered report still works while the active provider stays in the
+    // failure state it captured.
+    holdPeerAuth = false;
+    await command.handler("deepseek", fake.ctx as unknown as ExtensionCommandContext);
+    assert.equal(fake.widgets.length, 1, "the filtered report is published");
+    const text = (fake.widgets[0]?.lines ?? []).join("\n");
+    assert.match(text, /deepseek\/chat/);
+    assert.match(text, /balance \(USD\)/);
+    assert.match(text, /cpa\/chat/);
+    assert.match(text, /state: no-credential/);
+    assert.equal(peerCalls.length, 1);
     assert.equal(activeCalls.length, 0);
     host.shutdown(fake.ctx);
   });

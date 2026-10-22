@@ -490,9 +490,12 @@ export class UniversalUsageHost {
     // changed same-ID route) cancels the report instead of publishing older
     // measurements.
     let source = this.activeSourceToken();
-    // The sanitized failure this report's own attempt adopted, if any. It remains
-    // this report's authority for its whole lifetime, not only at the anchor.
-    let acceptedFailure: TargetSnapshot | undefined;
+    // The sanitized failure this report continues under, if any. A report that
+    // excludes the active provider never refreshes it, so its authority is the
+    // accepted view it starts from; its own active attempt replaces that with the
+    // outcome it accepts. A successful report keeps source semantics instead.
+    let acceptedFailure =
+      this.active !== undefined && this.active.target === undefined ? this.lastSnapshot : undefined;
     // The active target is always included; other providers only when the user
     // opted into them before the session (explicit config entries) or asked.
     for (const target of this.reportTargets(ctx, requested)) {
@@ -510,7 +513,10 @@ export class UniversalUsageHost {
         const anchor = this.activeReportAnchor(outcome);
         if (anchor === undefined) return;
         source = anchor;
-        if (outcome.kind === "failure") acceptedFailure = outcome.snapshot;
+        // The attempt's own outcome replaces the authority this report started
+        // with: an adopted failure pins the new view, an adopted target re-anchors
+        // the report to a live source and drops the pin.
+        acceptedFailure = outcome.kind === "failure" ? outcome.snapshot : undefined;
         snapshot = outcome.snapshot;
       } else {
         snapshot = await this.snapshotForModel(ctx, target.model, generation, source, unadopted, acceptedFailure);
@@ -573,11 +579,11 @@ export class UniversalUsageHost {
 
   /**
    * Report work is bound to the activation generation and effective source it
-   * started with, and -- when its own active attempt adopted a sanitized failure
-   * -- to that exact accepted view. Every target-less failure shares the `-`
-   * source, so only the pinned view distinguishes them: newer work that replaces
-   * it stops the report instead of lending its authority. The route the report
-   * may publish under is the current binding, because the active provider's own
+   * started with, and -- while the report continues under a sanitized failure --
+   * to that exact accepted view. Every target-less failure shares the `-` source,
+   * so only the pinned view distinguishes them: newer work that replaces it
+   * stops the report instead of lending its authority. The route the report may
+   * publish under is the current binding, because the active provider's own
    * reconciliation re-anchors both; while no binding has been adopted yet, the
    * route the command captured before its first await is the one its work must
    * still match.
