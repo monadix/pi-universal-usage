@@ -451,6 +451,79 @@ describe("UsageMonitor", () => {
     assert.equal(a.status, "ok");
   });
 
+  it("does not restart a joined refresh after its run was cancelled", async () => {
+    const modelA = fakeModel({ provider: "openai", id: "chat-a", baseUrl: "https://api.openai.com/v1" });
+    const modelB = fakeModel({ provider: "openai", id: "chat-b", baseUrl: "https://api.openai.com/v1" });
+    const modelC = fakeModel({ provider: "openai", id: "chat-c", baseUrl: "https://api.openai.com/v1" });
+    const registry = fakeRegistry({ apiKey: "test-key" }, [modelA, modelB, modelC]);
+    const resolvedA = await resolveTarget(registry, modelA, { allowInsecureHttp: true });
+    const resolvedB = await resolveTarget(registry, modelB, { allowInsecureHttp: true });
+    const resolvedC = await resolveTarget(registry, modelC, { allowInsecureHttp: true });
+    assert.equal(resolvedA.ok && resolvedB.ok && resolvedC.ok, true);
+    if (!resolvedA.ok || !resolvedB.ok || !resolvedC.ok) return;
+    // One account-level entry for all three models.
+    assert.equal(resolvedA.target.identity.key, resolvedB.target.identity.key);
+    assert.equal(resolvedA.target.identity.key, resolvedC.target.identity.key);
+
+    const { fetchImpl, calls } = sequenceFetch([textResponse("unused")]);
+    const monitor = monitorWith(fetchImpl);
+    monitor.applyPassiveHeaders(resolvedA.target, { "x-codex-secondary-used-percent": "90" }, 200, config);
+
+    // A's no-endpoint run has already retained its snapshot while its promise is
+    // pending, so B joins it; cancelling detaches and aborts that run.
+    const forcedA = monitor.refresh(resolvedA.target, undefined, config, { force: true });
+    const forcedB = monitor.refresh(resolvedB.target, undefined, config, { force: true });
+    monitor.cancel();
+    const replacement = monitor.applyPassiveHeaders(
+      resolvedC.target,
+      { "x-codex-secondary-used-percent": "25" },
+      200,
+      config,
+    );
+    assert.equal(replacement?.metrics[0]?.usedPercent, 25);
+
+    const [forA, forB] = await Promise.all([forcedA, forcedB]);
+    // The cancelled join carries no measurement and starts no replacement run,
+    // so the newer measurement of another model survives untouched.
+    assert.equal(forA.metrics[0]?.usedPercent, 90);
+    assert.deepEqual(forB.metrics, []);
+    assert.notEqual(forB.status, "ok");
+    const cached = monitor.snapshotFor(resolvedC.target.identity.key);
+    assert.equal(cached?.metrics[0]?.usedPercent, 25);
+    assert.equal(cached?.identity.modelId, "chat-c");
+    assert.equal(calls.length, 0);
+  });
+
+  it("does not restart a joined refresh whose caller was already cancelled", async () => {
+    const modelA = fakeModel({ provider: "openai", id: "chat-a", baseUrl: "https://api.openai.com/v1" });
+    const modelB = fakeModel({ provider: "openai", id: "chat-b", baseUrl: "https://api.openai.com/v1" });
+    const modelC = fakeModel({ provider: "openai", id: "chat-c", baseUrl: "https://api.openai.com/v1" });
+    const registry = fakeRegistry({ apiKey: "test-key" }, [modelA, modelB, modelC]);
+    const resolvedA = await resolveTarget(registry, modelA, { allowInsecureHttp: true });
+    const resolvedB = await resolveTarget(registry, modelB, { allowInsecureHttp: true });
+    const resolvedC = await resolveTarget(registry, modelC, { allowInsecureHttp: true });
+    assert.equal(resolvedA.ok && resolvedB.ok && resolvedC.ok, true);
+    if (!resolvedA.ok || !resolvedB.ok || !resolvedC.ok) return;
+    assert.equal(resolvedA.target.identity.key, resolvedC.target.identity.key);
+
+    const { fetchImpl, calls } = sequenceFetch([textResponse("unused")]);
+    const monitor = monitorWith(fetchImpl);
+    monitor.applyPassiveHeaders(resolvedA.target, { "x-codex-secondary-used-percent": "90" }, 200, config);
+
+    const controller = new AbortController();
+    const forcedA = monitor.refresh(resolvedA.target, undefined, config, { force: true });
+    const forcedB = monitor.refresh(resolvedB.target, undefined, config, { force: true, signal: controller.signal });
+    controller.abort();
+    monitor.applyPassiveHeaders(resolvedC.target, { "x-codex-secondary-used-percent": "25" }, 200, config);
+
+    const [forA, forB] = await Promise.all([forcedA, forcedB]);
+    assert.equal(forA.metrics[0]?.usedPercent, 90);
+    assert.equal(forB.status, "error");
+    assert.deepEqual(forB.metrics, []);
+    assert.equal(monitor.snapshotFor(resolvedC.target.identity.key)?.metrics[0]?.usedPercent, 25);
+    assert.equal(calls.length, 0);
+  });
+
   it("does not retain a passive measurement past an explicit disable", async () => {
     const target = await targetFor({ provider: "openai", baseUrl: "https://api.openai.com/v1" });
     const { fetchImpl, calls } = sequenceFetch([textResponse("unused")]);

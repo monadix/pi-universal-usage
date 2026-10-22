@@ -244,13 +244,19 @@ export class UsageMonitor {
       return Promise.resolve(emptySnapshot(target, "unknown", this.now(), "waiting before the next attempt"));
     }
     if (current.run !== undefined) {
-      const joined = current.run.promise;
-      return joined.then((snapshot) => {
+      const joinedRun = current.run;
+      return joinedRun.promise.then((snapshot) => {
         // Joining shares the run's account-scoped endpoint result. A passive
         // header measurement instead belongs to the model whose inference
         // produced it, so it is treated as absent for this model - as the cached
         // path does - and the model is answered through the normal path.
         if (!this.measuresOtherModel(snapshot, target)) return snapshot;
+        // The joined result outlives its run's authority: a run cancelled while
+        // its promise was still pending, or a caller that was already cancelled,
+        // may not start follow-on work that would overwrite a newer measurement.
+        if (joinedRun.controller.signal.aborted || options.signal?.aborted === true) {
+          return cancelledSnapshot(target, this.now());
+        }
         if (!mayAskAgain) return emptySnapshot(target, "unknown", this.now(), "waiting before the next attempt");
         return this.refreshEntry(target, provider, config, options, false);
       });
