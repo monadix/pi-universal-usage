@@ -57,6 +57,11 @@ interface ActiveTarget {
   selection: SelectionBinding;
   /** Absent after a failed reconciliation; the selection is kept so a later retry can resolve it. */
   target?: ResolvedTarget;
+  /**
+   * Route identity of the sanitized failure this target-less binding adopted.
+   * Distinct failures share the `-` source sentinel but not this identity.
+   */
+  failureKey?: string;
 }
 
 /** Authority to adopt one asynchronous resolver result. */
@@ -105,8 +110,8 @@ interface ReportLease {
   selection?: SelectionBinding;
   /** Sanitized failure the report continues under, while it stays the accepted view. */
   acceptedFailure?: TargetSnapshot;
-  /** Source-change epoch the report accepted its authority under. */
-  sourceEpoch: number;
+  /** Accepted-binding epoch the report took its authority from. */
+  bindingEpoch: number;
 }
 
 /** The snapshot an accepted attempt produced, and how its reconciliation accepted it. */
@@ -162,11 +167,11 @@ export class UniversalUsageHost {
   /** Orders asynchronous credential reconciliations within one activation generation. */
   private reconcileRevision = 0;
   /**
-   * Counts changes of the accepted effective source. Authority captured under one
-   * source is not revived by returning to the same source string later, so this
-   * is a lifetime, not a value comparison.
+   * Counts replacements of one accepted binding by another. Authority captured
+   * under one accepted binding is not revived by returning to the same source or
+   * route later, so this is a lifetime, not a value comparison.
    */
-  private sourceEpoch = 0;
+  private bindingEpoch = 0;
   /** Work shared by concurrent refreshes of one identity; never aborted by a same-target join. */
   private refreshWork: { key: string; generation: number; controller: AbortController; promise: Promise<TargetSnapshot | undefined> } | undefined;
   /** The target that started the current turn; passive headers need this attribution. */
@@ -259,7 +264,7 @@ export class UniversalUsageHost {
 
     if (!resolution.ok) {
       // Keep the selection so a later /usage or selection can retry resolution.
-      this.bindActive({ model, selection });
+      this.bindActive({ model, selection, failureKey: resolution.identity.key });
       this.lastSnapshot = {
         identity: resolution.identity,
         status: resolution.status,
@@ -417,7 +422,7 @@ export class UniversalUsageHost {
       // aborted and the old target can no longer satisfy a work lease.
       this.abortRefresh();
       this.monitor.cancel();
-      this.bindActive({ model, selection: lease.selection });
+      this.bindActive({ model, selection: lease.selection, failureKey: resolution.identity.key });
       this.passiveAttribution = undefined;
       const snapshot: TargetSnapshot = {
         identity: resolution.identity,
@@ -497,14 +502,28 @@ export class UniversalUsageHost {
   }
 
   /**
-   * Adopt a binding. A change of the accepted effective source advances the
-   * source epoch, so authority captured under one source is not revived when a
-   * later reconciliation returns to the same source string.
+   * The identity of an accepted binding: the resolved source, or the route
+   * identity of the sanitized failure a target-less binding adopted. Target-less
+   * bindings share the `-` source sentinel, so the failure identity is what tells
+   * one accepted failure route from another.
+   */
+  private activeBindingToken(active: ActiveTarget | undefined): string {
+    if (active === undefined) return "-";
+    return active.target?.identity.key ?? active.failureKey ?? "-";
+  }
+
+  /**
+   * Adopt a binding. Replacing one accepted binding by another advances the
+   * binding epoch, so authority captured under one source or failure route is not
+   * revived when a later reconciliation returns to it. Entering the first
+   * accepted binding is not a replacement: a report that started before adoption
+   * stays compatible with its captured route.
    */
   private bindActive(next: ActiveTarget | undefined): void {
-    const previous = this.activeSourceToken();
+    const previous = this.activeBindingToken(this.active);
     this.active = next;
-    if (this.activeSourceToken() !== previous) this.sourceEpoch++;
+    const adopted = this.activeBindingToken(next);
+    if (previous !== "-" && adopted !== "-" && previous !== adopted) this.bindingEpoch++;
   }
 
   /** `/usage [provider ...]`: detailed report for the active and configured providers. */
@@ -521,7 +540,7 @@ export class UniversalUsageHost {
     const lease: ReportLease = {
       generation: this.generation,
       source: this.activeSourceToken(),
-      sourceEpoch: this.sourceEpoch,
+      bindingEpoch: this.bindingEpoch,
     };
     if (this.active === undefined) {
       // While the initial activation is still resolving there is no adopted
@@ -553,7 +572,7 @@ export class UniversalUsageHost {
         // the accepted source and epoch, drops the pre-adoption route capture,
         // and pins its adopted failure or clears the pin when it adopts a target.
         lease.source = anchor;
-        lease.sourceEpoch = this.sourceEpoch;
+        lease.bindingEpoch = this.bindingEpoch;
         lease.selection = undefined;
         lease.acceptedFailure = outcome.kind === "failure" ? outcome.snapshot : undefined;
         snapshot = outcome.snapshot;
@@ -618,15 +637,16 @@ export class UniversalUsageHost {
 
   /**
    * May this report still work and publish? Its activation, its captured route,
-   * its accepted failure and the source lifetime it accepted must all still
-   * hold. The source epoch, not the source string alone, decides the lifetime: a
-   * source that returns after an intervening one is not the same authority. The
-   * route check prefers the report's own pre-adoption capture, because a binding
+   * its accepted failure and the accepted binding it took authority from must
+   * all still hold. The binding epoch, not the source string alone, decides the
+   * lifetime: one accepted binding replaced by another is not the same authority,
+   * even when a later one returns to the same source or failure route. The route
+   * check prefers the report's own pre-adoption capture, because a binding
    * adopted after the report started belongs to that other work until this
    * report's own attempt replaces the capture.
    */
   private reportStillValid(lease: ReportLease, ctx: ExtensionContext): boolean {
-    if (lease.sourceEpoch !== this.sourceEpoch) return false;
+    if (lease.bindingEpoch !== this.bindingEpoch) return false;
     if (lease.acceptedFailure !== undefined && this.lastSnapshot !== lease.acceptedFailure) return false;
     return this.holdsWork(
       { generation: lease.generation, selection: lease.selection ?? this.active?.selection, source: lease.source },
