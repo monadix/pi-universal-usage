@@ -14,7 +14,7 @@ import type {
   ExtensionCommandContext,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { resolveTarget, type ResolvedTarget } from "./auth.ts";
+import { modelRoutingSignature, resolveTarget, type ResolvedTarget } from "./auth.ts";
 import { loadConfig, STATUS_KEY, type UsageConfig } from "./config.ts";
 import { formatCompact, formatReport } from "./format.ts";
 import { plainText } from "./text.ts";
@@ -35,6 +35,8 @@ export interface HostOptions {
 
 interface ActiveTarget {
   model: Model<any>;
+  /** Routing signature of `model` captured when this selection was bound. */
+  routing: string;
   /** Absent after a failed reconciliation; the model is kept so a later retry can resolve it. */
   target?: ResolvedTarget;
 }
@@ -46,19 +48,16 @@ function sameLogicalModel(left: Model<any>, right: Model<any>): boolean {
   return left.provider === right.provider && left.id === right.id;
 }
 
-function sameModelRouting(left: Model<any>, right: Model<any>): boolean {
-  return left.baseUrl === right.baseUrl && left.api === right.api;
-}
-
 /**
  * Pi suppresses `model_select` when the provider, model id, and type are
- * unchanged, even if the new model object points at another base URL. Such a
- * selection is a routing change the host otherwise cannot observe, so header
- * attribution has to check it explicitly. A different logical model always
- * emits `model_select` and invalidates the activation generation instead.
+ * unchanged, even if the new model object points at another base URL or
+ * routing header. Such a selection is a routing change the host otherwise
+ * cannot observe, so attribution compares the routing signature captured when
+ * the active target was bound. A different logical model always emits
+ * `model_select` and invalidates the activation generation instead.
  */
-function unreportedRoutingChange(selected: Model<any> | undefined, activeModel: Model<any>): boolean {
-  return selected !== undefined && sameLogicalModel(selected, activeModel) && !sameModelRouting(selected, activeModel);
+function unreportedRoutingChange(selected: Model<any> | undefined, active: ActiveTarget): boolean {
+  return selected !== undefined && sameLogicalModel(selected, active.model) && modelRoutingSignature(selected) !== active.routing;
 }
 
 export class UniversalUsageHost {
@@ -162,7 +161,7 @@ export class UniversalUsageHost {
 
     if (!resolution.ok) {
       // Keep the model so a later /usage or selection can retry resolution.
-      this.active = { model };
+      this.active = { model, routing: modelRoutingSignature(model) };
       this.lastSnapshot = {
         identity: resolution.identity,
         status: resolution.status,
@@ -174,7 +173,7 @@ export class UniversalUsageHost {
       this.paint(ctx);
       return;
     }
-    this.active = { model, target: resolution.target };
+    this.active = { model, routing: modelRoutingSignature(model), target: resolution.target };
     if (options.refresh === false) {
       this.paintText(ctx, `${model.provider}: automatic refresh is off`);
       return;
@@ -198,7 +197,7 @@ export class UniversalUsageHost {
     const model =
       options.model ?? (options.resolved !== undefined ? active.model : this.currentSelectedModel(ctx, active.model));
     if (model !== active.model) {
-      this.active = { model };
+      this.active = { model, routing: modelRoutingSignature(model) };
       this.passiveAttribution = undefined;
     }
     const target = options.resolved ?? (await this.reconcileActive(ctx, model, generation, revision));
@@ -288,7 +287,7 @@ export class UniversalUsageHost {
       // aborted and the old target can no longer satisfy completion guards.
       this.abortRefresh();
       this.monitor.cancel();
-      this.active = { model };
+      this.active = { model, routing: modelRoutingSignature(model) };
       this.passiveAttribution = undefined;
       this.lastSnapshot = {
         identity: resolution.identity,
@@ -302,7 +301,7 @@ export class UniversalUsageHost {
       return undefined;
     }
     const previous = this.active?.target?.identity.key;
-    this.active = { model, target: resolution.target };
+    this.active = { model, routing: modelRoutingSignature(model), target: resolution.target };
     if (previous !== resolution.target.identity.key) this.passiveAttribution = undefined;
     return resolution.target;
   }
@@ -320,7 +319,7 @@ export class UniversalUsageHost {
     if (attribution.identityKey !== active.target.identity.key) return;
     // The response carries no model identity. If the selection moved to another
     // routing while the turn ran, these headers cannot be attributed at all.
-    if (unreportedRoutingChange(ctx.model, active.model)) {
+    if (unreportedRoutingChange(ctx.model, active)) {
       this.passiveAttribution = undefined;
       return;
     }
@@ -341,7 +340,7 @@ export class UniversalUsageHost {
     // A same-ID selection Pi did not report (a changed base URL is not part of
     // its model equality check) is unknown routing for this turn. Refuse
     // attribution instead of filing its headers under the previously bound one.
-    if (unreportedRoutingChange(ctx.model, active.model)) {
+    if (unreportedRoutingChange(ctx.model, active)) {
       this.passiveAttribution = undefined;
       return;
     }

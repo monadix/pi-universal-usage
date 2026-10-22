@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { anthropicAuthHeaders, AUTH_RESOLUTION_FAILED, authorizationCredential, chatgptAccountId, NO_CREDENTIAL, resolveTarget } from "../src/auth.ts";
+import {
+  anthropicAuthHeaders,
+  AUTH_RESOLUTION_FAILED,
+  authorizationCredential,
+  chatgptAccountId,
+  modelRoutingSignature,
+  NO_CREDENTIAL,
+  resolveTarget,
+} from "../src/auth.ts";
 import { fakeModel, fakeRegistry } from "./helpers.ts";
 
 describe("target resolution", () => {
@@ -212,5 +220,27 @@ describe("target resolution", () => {
     const apiKey = await resolveTarget(fakeRegistry({ apiKey: `a.${claims}.c`, isOAuth: false }, [keyModel]), keyModel);
     assert.equal(apiKey.ok, true);
     if (apiKey.ok) assert.equal(apiKey.target.accountId, undefined);
+  });
+});
+
+describe("model routing signature", () => {
+  it("ignores header name casing and entry order", () => {
+    const route = { provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1", api: "openai-responses" };
+    const left = fakeModel({ ...route, headers: { "ChatGPT-Account-Id": "acct-a", "x-routing": "blue" } });
+    const right = fakeModel({ ...route, headers: { "x-routing": "blue", "chatgpt-account-id": "acct-a" } });
+    assert.equal(modelRoutingSignature(left), modelRoutingSignature(right));
+  });
+
+  it("separates base URL, API, and an explicitly suppressed header from an absent one", () => {
+    const route = { provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" };
+    const base = fakeModel(route);
+    const otherBase = fakeModel({ ...route, baseUrl: "http://localhost:9999/v1" });
+    const otherApi = fakeModel({ ...route, api: "openai-completions" });
+    // Pi's header type allows `null` to suppress a provider default; runtime
+    // registrations can hand such a map through a model object.
+    const suppressed = fakeModel({ ...route, headers: { "x-routing": null } as unknown as Record<string, string> });
+    const routed = fakeModel({ ...route, headers: { "x-routing": "blue" } });
+    const signatures = [base, otherBase, otherApi, suppressed, routed].map(modelRoutingSignature);
+    assert.equal(new Set(signatures).size, signatures.length);
   });
 });

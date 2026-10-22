@@ -964,6 +964,91 @@ describe("pi extension wiring", () => {
     host.shutdown(fake.ctx);
   });
 
+  it("refuses passive attribution for a header-only same-ID routing change Pi did not report", async () => {
+    const { fetchImpl, calls } = sequenceFetch([codexBody(12)]);
+    const modelA = fakeModel({
+      provider: "cpa",
+      id: "chat",
+      baseUrl: "http://a.example.com/v1",
+      headers: { "ChatGPT-Account-Id": "acct-a" },
+    });
+    const modelB = fakeModel({
+      provider: "cpa",
+      id: "chat",
+      baseUrl: "http://a.example.com/v1",
+      headers: { "ChatGPT-Account-Id": "acct-b" },
+    });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [modelA],
+      config: normalizeConfig({ refreshSeconds: 300, autoRefresh: false }),
+    });
+    const bound = fakeContext({ model: modelA, registry, idle: false });
+    await pi.emit("session_start", { type: "session_start" }, bound.ctx);
+    assert.equal(calls.length, 0);
+
+    // Pi replaces the selection without model_select because provider, id, and
+    // type match; only the account-routing header changed. A turn that starts
+    // after that change cannot inherit A's identity.
+    const moved = fakeContext({ model: modelB, registry, idle: false });
+    await pi.emit("turn_start", { type: "turn_start", turnIndex: 0, timestamp: Date.now() }, moved.ctx);
+    await pi.emit(
+      "after_provider_response",
+      { status: 200, headers: { "x-ratelimit-limit-requests": "100", "x-ratelimit-remaining-requests": "25" } },
+      moved.ctx,
+    );
+    assert.equal(moved.statuses.length, 0);
+
+    // A turn that began on A is sound; the same header change before the
+    // response makes the result ambiguous, so it is dropped too.
+    const sound = fakeContext({ model: modelA, registry, idle: false });
+    await pi.emit("turn_start", { type: "turn_start", turnIndex: 1, timestamp: Date.now() }, sound.ctx);
+    const shifted = fakeContext({ model: modelB, registry, idle: false });
+    await pi.emit(
+      "after_provider_response",
+      { status: 200, headers: { "x-codex-secondary-used-percent": "90" } },
+      shifted.ctx,
+    );
+    assert.equal(shifted.statuses.length, 0);
+    assert.equal(sound.statuses.length, 0);
+    assert.equal(calls.length, 0);
+    host.shutdown(bound.ctx);
+  });
+
+  it("keeps passive attribution for reordered, recased copies of the same routing headers", async () => {
+    const { fetchImpl, calls } = sequenceFetch([codexBody(12)]);
+    const modelA = fakeModel({
+      provider: "cpa",
+      id: "chat",
+      baseUrl: "http://a.example.com/v1",
+      headers: { "X-Routing": "blue", "ChatGPT-Account-Id": "acct-a" },
+    });
+    const equivalent = fakeModel({
+      provider: "cpa",
+      id: "chat",
+      baseUrl: "http://a.example.com/v1",
+      headers: { "chatgpt-account-id": "acct-a", "x-routing": "blue" },
+    });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [modelA],
+      config: normalizeConfig({ refreshSeconds: 300, autoRefresh: false }),
+    });
+    const bound = fakeContext({ model: modelA, registry, idle: false });
+    await pi.emit("session_start", { type: "session_start" }, bound.ctx);
+
+    const equivalentContext = fakeContext({ model: equivalent, registry, idle: false });
+    await pi.emit("turn_start", { type: "turn_start", turnIndex: 0, timestamp: Date.now() }, equivalentContext.ctx);
+    await pi.emit(
+      "after_provider_response",
+      { status: 200, headers: { "x-ratelimit-limit-requests": "100", "x-ratelimit-remaining-requests": "25" } },
+      equivalentContext.ctx,
+    );
+    assert.match(String(equivalentContext.statuses[equivalentContext.statuses.length - 1]), /req 75%/);
+    assert.equal(calls.length, 0);
+    host.shutdown(bound.ctx);
+  });
+
   it("discards passive headers when the selection moves before the response", async () => {
     const { fetchImpl, calls } = sequenceFetch([codexBody(12)]);
     const modelA = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://a.example.com/v1" });
