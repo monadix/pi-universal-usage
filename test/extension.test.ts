@@ -500,6 +500,96 @@ describe("pi extension wiring", () => {
     await pi.emit("session_start", { type: "session_start" }, fake.ctx);
     await new Promise((resolve) => setTimeout(resolve, 5));
     assert.equal(calls.length, callsAfterShutdown);
+    const late = host as unknown as { timer?: unknown; timerContext?: unknown };
+    assert.equal(late.timer, undefined, "the late startup did not rebuild the interval");
+    assert.equal(late.timerContext, undefined, "the late startup did not retain its context");
+  });
+
+  it("ignores a held startup emission released after shutdown invalidated its context", async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let held = false;
+    const { fetchImpl } = sequenceFetch([codexBody(1)]);
+    const model = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
+    const { pi, host, registry } = buildHost({ fetchImpl, models: [model] });
+    const fake = fakeContext({ model, registry });
+
+    // An earlier extension holds a startup emission across a session shutdown and
+    // the reload that invalidates the old runner's context, so this handler runs
+    // after shutdown already cleared its scheduling state.
+    const handlers = pi.handlers.get("session_start");
+    assert.ok(handlers);
+    handlers.unshift(async () => {
+      held = true;
+      await gate;
+    });
+    const pending = pi.emit("session_start", { type: "session_start" }, fake.ctx);
+    await waitFor(() => held);
+    host.shutdown(fake.ctx);
+    const late = host as unknown as { timer?: unknown; timerContext?: unknown };
+    assert.equal(late.timer, undefined);
+    assert.equal(late.timerContext, undefined);
+
+    let contextReads = 0;
+    for (const field of ["mode", "model"] as const) {
+      Object.defineProperty(fake.ctx, field, {
+        get() {
+          contextReads += 1;
+          throw new Error(`STALE_CONTEXT_${field.toUpperCase()}`);
+        },
+        configurable: true,
+      });
+    }
+    const statusesAfterShutdown = fake.statuses.length;
+
+    release?.();
+    await pending;
+
+    assert.equal(contextReads, 0, "a disposed host never reads the invalidated context");
+    assert.equal(fake.statuses.length, statusesAfterShutdown, "no footer is painted");
+    assert.equal(late.timer, undefined, "the late startup did not rebuild the interval");
+    assert.equal(late.timerContext, undefined, "the late startup did not retain its context");
+  });
+
+  it("ignores a held agent_end emission released after shutdown invalidated its context", async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let held = false;
+    const { fetchImpl, calls } = sequenceFetch([codexBody(1)]);
+    const model = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
+    const { pi, host, registry } = buildHost({ fetchImpl, models: [model] });
+    const fake = fakeContext({ model, registry });
+    await pi.emit("session_start", { type: "session_start" }, fake.ctx);
+    await waitFor(() => calls.length === 1);
+
+    const handlers = pi.handlers.get("agent_end");
+    assert.ok(handlers);
+    handlers.unshift(async () => {
+      held = true;
+      await gate;
+    });
+    const pending = pi.emit("agent_end", { type: "agent_end" }, fake.ctx);
+    await waitFor(() => held);
+    host.shutdown(fake.ctx);
+    let contextReads = 0;
+    Object.defineProperty(fake.ctx, "mode", {
+      get() {
+        contextReads += 1;
+        throw new Error("STALE_CONTEXT_MODE");
+      },
+      configurable: true,
+    });
+    const callsAfterShutdown = calls.length;
+
+    release?.();
+    await pending;
+
+    assert.equal(contextReads, 0, "a disposed host reads no mode from the invalidated context");
+    assert.equal(calls.length, callsAfterShutdown, "no after-turn work is started");
   });
 
   it("does not fetch or start a timer outside TUI mode", async () => {

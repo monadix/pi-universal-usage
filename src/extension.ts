@@ -208,6 +208,11 @@ export class UniversalUsageHost {
     });
 
     this.pi.on("session_start", async (_event, ctx) => {
+      // A startup emission an earlier handler already started can reach this
+      // handler after `session_shutdown`: Pi invalidates the old runner's context
+      // afterwards, so reading or scheduling through it would either throw from a
+      // guarded getter or rebuild the timer state shutdown just cleared.
+      if (this.disposed) return;
       this.config = this.readConfig();
       this.startTimer(ctx);
       const model = ctx.model;
@@ -893,8 +898,13 @@ export class UniversalUsageHost {
     }
   }
 
-  /** Automatic reads are TUI-only and obey `autoRefresh`; explicit `/usage` is unaffected. */
+  /**
+   * Automatic reads are TUI-only and obey `autoRefresh`; explicit `/usage` is
+   * unaffected. A disposed host answers before it reads any context field, so a
+   * late `agent_end` cannot touch a context Pi has already invalidated.
+   */
   private backgroundAllowed(ctx: ExtensionContext): boolean {
+    if (this.disposed) return false;
     return this.timersEnabled && this.config.autoRefresh && ctx.mode === "tui";
   }
 
@@ -903,7 +913,9 @@ export class UniversalUsageHost {
   }
 
   private startTimer(ctx: ExtensionContext): void {
-    if (!this.timersEnabled || !this.config.autoRefresh || ctx.mode !== "tui") return;
+    // The same guarded predicate the lifecycle handlers use: a shutdown that lands
+    // before this call must not leave an interval or a captured context behind.
+    if (!this.backgroundAllowed(ctx)) return;
     this.stopTimer();
     const intervalMs = Math.max(this.config.refreshSeconds, this.config.minRefreshSeconds) * 1000;
     this.timer = setInterval(() => {
