@@ -90,6 +90,23 @@ interface RefreshOptions {
 /** What one reconciliation that still owned its activation adopted. */
 type AdoptedResolution = { kind: "target"; target: ResolvedTarget } | { kind: "failure"; snapshot: TargetSnapshot };
 
+/**
+ * The authority one `/usage` report holds for its own work: the activation, the
+ * effective source lifetime it accepted, the route it captured before any
+ * binding existed, and the sanitized failure it continues under. A binding or a
+ * source adopted by other work afterwards belongs to that work, so only this
+ * report's own active attempt may replace these facts.
+ */
+interface ReportLease {
+  generation: number;
+  /** Effective source (identity key, or `-` while no target is reconciled). */
+  source: string;
+  /** Route captured before a binding existed; omitted once this report's attempt owns the route. */
+  selection?: SelectionBinding;
+  /** Sanitized failure the report continues under, while it stays the accepted view. */
+  acceptedFailure?: TargetSnapshot;
+}
+
 /** The snapshot an accepted attempt produced, and how its reconciliation accepted it. */
 interface AcceptedOutcome {
   kind: "snapshot" | "failure";
@@ -473,29 +490,29 @@ export class UniversalUsageHost {
 
   /** `/usage [provider ...]`: detailed report for the active and configured providers. */
   async report(ctx: ExtensionCommandContext, args: string): Promise<void> {
-    const generation = this.generation;
     const requested = args
       .split(/\s+/u)
       .map((part) => part.trim())
       .filter((part) => part !== "");
 
-    // While the initial activation is still resolving there is no adopted binding
-    // to compare against, yet the command reports the live selection. Capture it
-    // so this report's work keeps matching the route it started from.
-    const unadopted = this.active === undefined ? this.captureSelected(ctx) : undefined;
     const snapshots: TargetSnapshot[] = [];
-    // The effective source this report belongs to. The active provider is
-    // reported first, so the outcome its own attempt accepted re-anchors the
-    // guard; a source change caused by later work (a rotated credential or a
-    // changed same-ID route) cancels the report instead of publishing older
-    // measurements.
-    let source = this.activeSourceToken();
-    // The sanitized failure this report continues under, if any. A report that
-    // excludes the active provider never refreshes it, so its authority is the
-    // accepted view it starts from; its own active attempt replaces that with the
-    // outcome it accepts. A successful report keeps source semantics instead.
-    let acceptedFailure =
-      this.active !== undefined && this.active.target === undefined ? this.lastSnapshot : undefined;
+    // The authority this report holds for its own work. It is captured here, and
+    // only this report's own active attempt may replace it: a binding or source
+    // adopted by other work afterwards belongs to that work, not to this batch.
+    const lease: ReportLease = {
+      generation: this.generation,
+      source: this.activeSourceToken(),
+    };
+    if (this.active === undefined) {
+      // While the initial activation is still resolving there is no adopted
+      // binding to compare against, yet the command reports the live selection.
+      // That capture stays this report's route even after activation adopts.
+      lease.selection = this.captureSelected(ctx);
+    } else if (this.active.target === undefined) {
+      // A report can start under a sanitized failure, including one that its
+      // provider filter never refreshes.
+      lease.acceptedFailure = this.lastSnapshot;
+    }
     // The active target is always included; other providers only when the user
     // opted into them before the session (explicit config entries) or asked.
     for (const target of this.reportTargets(ctx, requested)) {
@@ -512,22 +529,23 @@ export class UniversalUsageHost {
         if (outcome.kind === "none") return;
         const anchor = this.activeReportAnchor(outcome);
         if (anchor === undefined) return;
-        source = anchor;
-        // The attempt's own outcome replaces the authority this report started
-        // with: an adopted failure pins the new view, an adopted target re-anchors
-        // the report to a live source and drops the pin.
-        acceptedFailure = outcome.kind === "failure" ? outcome.snapshot : undefined;
+        // The attempt's own outcome owns the report from here on: it re-anchors
+        // the accepted source, drops the pre-adoption route capture, and pins its
+        // adopted failure or clears the pin when it adopts a target.
+        lease.source = anchor;
+        lease.selection = undefined;
+        lease.acceptedFailure = outcome.kind === "failure" ? outcome.snapshot : undefined;
         snapshot = outcome.snapshot;
       } else {
-        snapshot = await this.snapshotForModel(ctx, target.model, generation, source, unadopted, acceptedFailure);
+        snapshot = await this.snapshotForModel(ctx, target.model, lease);
       }
       // A model switch, shutdown, effective source change, or a replaced failure
       // cancels the report silently: it must not fetch the next provider or
       // publish measurements from an authority it no longer holds.
-      if (!this.reportStillValid(generation, source, ctx, unadopted, acceptedFailure)) return;
+      if (!this.reportStillValid(lease, ctx)) return;
       if (snapshot !== undefined) snapshots.push(snapshot);
     }
-    if (!this.reportStillValid(generation, source, ctx, unadopted, acceptedFailure)) return;
+    if (!this.reportStillValid(lease, ctx)) return;
     const active = this.lastSnapshot;
     const activeTargetKey = this.active?.target?.identity.key;
     // With no reconciled target the last snapshot is the accepted failure state
@@ -540,7 +558,7 @@ export class UniversalUsageHost {
 
     const lines = formatReport(snapshots, this.config, this.now());
     // Pi rejects a stale context after a reload; stop before touching it.
-    if (!this.reportStillValid(generation, source, ctx, unadopted, acceptedFailure)) return;
+    if (!this.reportStillValid(lease, ctx)) return;
     if (ctx.hasUI) {
       ctx.ui.setWidget(REPORT_WIDGET_KEY, lines);
       ctx.ui.notify("pi-universal-usage: report updated", "info");
@@ -578,25 +596,18 @@ export class UniversalUsageHost {
   }
 
   /**
-   * Report work is bound to the activation generation and effective source it
-   * started with, and -- while the report continues under a sanitized failure --
-   * to that exact accepted view. Every target-less failure shares the `-` source,
-   * so only the pinned view distinguishes them: newer work that replaces it
-   * stops the report instead of lending its authority. The route the report may
-   * publish under is the current binding, because the active provider's own
-   * reconciliation re-anchors both; while no binding has been adopted yet, the
-   * route the command captured before its first await is the one its work must
-   * still match.
+   * May this report still work and publish? Its activation, its captured route
+   * and its accepted failure must all still hold. The route check prefers the
+   * report's own pre-adoption capture, because a binding adopted after the report
+   * started belongs to that other work until this report's own attempt replaces
+   * the capture.
    */
-  private reportStillValid(
-    generation: number,
-    source: string | undefined,
-    ctx: ExtensionContext,
-    unadopted: SelectionBinding | undefined,
-    acceptedFailure: TargetSnapshot | undefined,
-  ): boolean {
-    if (acceptedFailure !== undefined && this.lastSnapshot !== acceptedFailure) return false;
-    return this.holdsWork({ generation, selection: this.active?.selection ?? unadopted, source }, ctx);
+  private reportStillValid(lease: ReportLease, ctx: ExtensionContext): boolean {
+    if (lease.acceptedFailure !== undefined && this.lastSnapshot !== lease.acceptedFailure) return false;
+    return this.holdsWork(
+      { generation: lease.generation, selection: lease.selection ?? this.active?.selection, source: lease.source },
+      ctx,
+    );
   }
 
   /** The live selection, captured for work that has no adopted binding to compare against yet. */
@@ -720,19 +731,16 @@ export class UniversalUsageHost {
 
   /**
    * One provider of a report that is not the active target: it owns no host
-   * binding, so its own resolution and request are bound to the report's source.
+   * binding, so its own resolution and request are bound to the report's lease.
    */
   private async snapshotForModel(
     ctx: ExtensionCommandContext,
     model: Model<any>,
-    generation: number,
-    source: string | undefined,
-    unadopted: SelectionBinding | undefined,
-    acceptedFailure: TargetSnapshot | undefined,
+    lease: ReportLease,
   ): Promise<TargetSnapshot | undefined> {
     const selection = bindSelection(model);
     const resolution = await resolveTarget(ctx.modelRegistry, selection.model, { allowInsecureHttp: true });
-    if (!this.reportStillValid(generation, source, ctx, unadopted, acceptedFailure)) return undefined;
+    if (!this.reportStillValid(lease, ctx)) return undefined;
     if (!resolution.ok) {
       return {
         identity: resolution.identity,
@@ -751,7 +759,7 @@ export class UniversalUsageHost {
     );
     // The monitor may return a cancelled or post-shutdown placeholder snapshot;
     // a stale report discards it instead of reporting it as quota data.
-    if (!this.reportStillValid(generation, source, ctx, unadopted, acceptedFailure)) return undefined;
+    if (!this.reportStillValid(lease, ctx)) return undefined;
     return snapshot;
   }
 

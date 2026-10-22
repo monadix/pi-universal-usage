@@ -1620,6 +1620,165 @@ describe("pi extension wiring", () => {
     host.shutdown(fake.ctx);
   });
 
+  it("stops a pending-activation report when a later failure adopts another route", async () => {
+    let holdActivationAuth = true;
+    let activationAuthReached = false;
+    let releaseActivationAuth: (() => void) | undefined;
+    const activationAuthGate = new Promise<void>((resolve) => {
+      releaseActivationAuth = resolve;
+    });
+    let holdPeerAuth = false;
+    let peerAuthReached = false;
+    let releasePeerAuth: (() => void) | undefined;
+    const peerAuthGate = new Promise<void>((resolve) => {
+      releasePeerAuth = resolve;
+    });
+    const activeCalls: string[] = [];
+    const peerCalls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("api.deepseek.com")) {
+        peerCalls.push(url);
+        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
+      }
+      activeCalls.push(url);
+      return codexBody(11);
+    }) as typeof fetch;
+    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
+      if (model.provider === "deepseek") {
+        if (holdPeerAuth) {
+          peerAuthReached = true;
+          return { apiKey: "key-a", source: "stored", wait: peerAuthGate };
+        }
+        return { apiKey: "key-a", source: "stored" };
+      }
+      if (model.baseUrl.includes("b.example")) return { ok: false, error: "removed credential" };
+      if (holdActivationAuth) {
+        // Only the activation's resolution is held, and it ends in a sanitized
+        // failure; the command resolves the same route on its own and succeeds.
+        holdActivationAuth = false;
+        activationAuthReached = true;
+        return { ok: false, error: "removed credential", wait: activationAuthGate };
+      }
+      return { apiKey: "key-a", source: "stored" };
+    };
+    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://a.example/v1" });
+    const cpaMoved = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://b.example/v1" });
+    const deepseek = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [cpa, cpaMoved, deepseek],
+      auth,
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false, providers: { deepseek: { enabled: true } } }),
+    });
+    const selection = { current: cpa };
+    const fake = fakeContext({ modelRef: selection, registry });
+    const activation = host.activate(fake.ctx, cpa, { refresh: false });
+    await waitFor(() => activationAuthReached);
+
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    holdPeerAuth = true;
+    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => peerAuthReached);
+    assert.equal(activeCalls.length, 1, "the report collected its own measurement for the captured route");
+
+    // Activation completes with a sanitized failure while the captured route is
+    // still selected, so the report's capture still holds.
+    releaseActivationAuth?.();
+    await activation;
+
+    // A newer reconciliation adopts another same-ID route's sanitized failure.
+    selection.current = cpaMoved;
+    await host.refreshActive(fake.ctx, { reason: "interval" });
+
+    releasePeerAuth?.();
+    await pending;
+
+    assert.equal(peerCalls.length, 0, "the captured route, not the adopted binding, is this report's route");
+    assert.equal(activeCalls.length, 1, "no follow-on request for the abandoned route");
+    assert.equal(fake.widgets.length, 0, "no report publishes its measurement under another route");
+    assert.equal(fake.notifications.length, 0);
+    assert.equal(pi.entries.length, 0);
+    host.shutdown(fake.ctx);
+  });
+
+  it("keeps a pending-activation report after activation adopts the same route's failure", async () => {
+    let holdActivationAuth = true;
+    let activationAuthReached = false;
+    let releaseActivationAuth: (() => void) | undefined;
+    const activationAuthGate = new Promise<void>((resolve) => {
+      releaseActivationAuth = resolve;
+    });
+    let holdPeerAuth = false;
+    let peerAuthReached = false;
+    let releasePeerAuth: (() => void) | undefined;
+    const peerAuthGate = new Promise<void>((resolve) => {
+      releasePeerAuth = resolve;
+    });
+    const activeCalls: string[] = [];
+    const peerCalls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("api.deepseek.com")) {
+        peerCalls.push(url);
+        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
+      }
+      activeCalls.push(url);
+      return codexBody(11);
+    }) as typeof fetch;
+    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
+      if (model.provider === "deepseek") {
+        if (holdPeerAuth) {
+          peerAuthReached = true;
+          return { apiKey: "key-a", source: "stored", wait: peerAuthGate };
+        }
+        return { apiKey: "key-a", source: "stored" };
+      }
+      if (holdActivationAuth) {
+        holdActivationAuth = false;
+        activationAuthReached = true;
+        return { ok: false, error: "removed credential", wait: activationAuthGate };
+      }
+      return { apiKey: "key-a", source: "stored" };
+    };
+    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://a.example/v1" });
+    const deepseek = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [cpa, deepseek],
+      auth,
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false, providers: { deepseek: { enabled: true } } }),
+    });
+    const fake = fakeContext({ model: cpa, registry });
+    const activation = host.activate(fake.ctx, cpa, { refresh: false });
+    await waitFor(() => activationAuthReached);
+
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    holdPeerAuth = true;
+    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => peerAuthReached);
+    assert.equal(activeCalls.length, 1);
+
+    // Activation adopts a sanitized failure for the same route the report
+    // captured, so the pending report still owns its authority.
+    releaseActivationAuth?.();
+    await activation;
+    releasePeerAuth?.();
+    await pending;
+
+    assert.equal(peerCalls.length, 1, "the captured route still authorizes the peer");
+    assert.equal(fake.widgets.length, 1, "the report is published");
+    const text = (fake.widgets[0]?.lines ?? []).join("\n");
+    assert.match(text, /11%/);
+    assert.match(text, /balance \(USD\)/);
+    assert.equal(activeCalls.length, 1);
+    host.shutdown(fake.ctx);
+  });
+
   it("discards a pending active refresh when the live selection changes route without an event", async () => {
     let release: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {
