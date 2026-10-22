@@ -152,6 +152,40 @@ describe("endpoints", () => {
     assert.equal(result.requests[0]?.headers["x-api-key"], undefined);
   });
 
+  it("plans the Anthropic subscription endpoint for a header-owned subscription token", async () => {
+    // `ANTHROPIC_AUTH_TOKEN` resolves to only this header, with no API key.
+    const target = await targetFor({
+      provider: "anthropic",
+      baseUrl: "https://api.anthropic.com",
+      apiKey: null,
+      headers: { Authorization: "Bearer sk-ant-oat-test" },
+      api: "anthropic-messages",
+    });
+    const result = plan(target);
+    assert.equal(result.kind, "requests");
+    if (result.kind !== "requests") return;
+    assert.equal(result.requests[0]?.url.href, "https://api.anthropic.com/api/oauth/usage");
+    const headers = new Headers(result.requests[0]?.headers);
+    assert.equal(headers.get("authorization"), "Bearer sk-ant-oat-test");
+    assert.equal(headers.get("x-api-key"), null);
+    assert.equal(headers.get("anthropic-beta"), "oauth-2025-04-20");
+  });
+
+  it("keeps a header-owned non-subscription Anthropic bearer unsupported", async () => {
+    const target = await targetFor({
+      provider: "anthropic",
+      baseUrl: "https://api.anthropic.com",
+      apiKey: null,
+      headers: { Authorization: "Bearer sk-ant-api03-test" },
+      api: "anthropic-messages",
+    });
+    const result = plan(target);
+    assert.equal(result.kind, "none");
+    if (result.kind !== "none") return;
+    assert.equal(result.status, "unsupported");
+    assert.match(result.notice, /OAuth/);
+  });
+
   it("uses x-api-key for Anthropic API-key credentials on a custom origin", async () => {
     const target = await targetFor({ provider: "anthropic", baseUrl: "https://claude-proxy.example.com", apiKey: "sk-ant-api03-x", api: "anthropic-messages" });
     const result = plan(target);

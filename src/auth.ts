@@ -78,6 +78,15 @@ export function anthropicAuthHeaders(apiKey: string): Record<string, string> {
 const AUTH_SCHEME_NAMES = new Set(["basic", "bearer", "digest", "hoba", "negotiate"]);
 
 /**
+ * Pi identifies an Anthropic subscription token by its `sk-ant-oat` prefix.
+ * Such a token can arrive either as the resolved API key or, for
+ * `ANTHROPIC_AUTH_TOKEN`, only as an effective `Authorization: Bearer` header.
+ */
+function isAnthropicSubscriptionToken(model: Model<any>, credential: string | undefined): boolean {
+  return model.api === "anthropic-messages" && credential !== undefined && credential.includes("sk-ant-oat");
+}
+
+/**
  * The credential carried by an effective `Authorization` header. `Bearer`
  * tokens and raw token values are returned; an unrelated auth scheme is
  * undefined because its payload is not a credential this package understands.
@@ -227,11 +236,9 @@ export async function resolveTarget(
   // additional wire-level signal when that snapshot is not available yet.
   let isOAuth = false;
   try {
-    isOAuth =
-      registry.isUsingOAuth(model) ||
-      (model.api === "anthropic-messages" && apiKeyValue !== undefined && apiKeyValue.includes("sk-ant-oat"));
+    isOAuth = registry.isUsingOAuth(model) || isAnthropicSubscriptionToken(model, apiKeyValue);
   } catch {
-    isOAuth = apiKeyValue !== undefined && model.api === "anthropic-messages" && apiKeyValue.includes("sk-ant-oat");
+    isOAuth = isAnthropicSubscriptionToken(model, apiKeyValue);
   }
 
   let effectiveBase = parsedBase;
@@ -272,6 +279,13 @@ export async function resolveTarget(
     }
   }
 
+  // Pi's header-owned auth path (`ANTHROPIC_AUTH_TOKEN`) returns only
+  // `headers.Authorization` and is reported as the api_key mechanism, so the
+  // registry snapshot cannot identify the subscription token it carries.
+  const effectiveAuthorization = authorizationHeaderValue(originHeaders);
+  const effectiveToken = effectiveAuthorization !== undefined ? authorizationCredential(effectiveAuthorization) : undefined;
+  if (isAnthropicSubscriptionToken(model, effectiveToken)) isOAuth = true;
+
   const identity = identityFor(
     model,
     effectiveBase,
@@ -281,8 +295,6 @@ export async function resolveTarget(
   );
   // Account attribution belongs to the token Pi actually sends, not to a
   // separately returned API key that endpoint planning must never substitute.
-  const effectiveAuthorization = authorizationHeaderValue(originHeaders);
-  const effectiveToken = effectiveAuthorization !== undefined ? authorizationCredential(effectiveAuthorization) : undefined;
   const accountId =
     isOAuth && (model.provider === "openai-codex" || model.provider === "openai") && effectiveToken !== undefined
       ? chatgptAccountId(effectiveToken)

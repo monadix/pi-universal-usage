@@ -149,6 +149,33 @@ describe("target resolution", () => {
     assert.equal(chatgptAccountId(`a.${noClaim}.c`), undefined);
   });
 
+  it("recognizes a header-owned Anthropic subscription token as OAuth", async () => {
+    const model = fakeModel({ provider: "anthropic", id: "chat", baseUrl: "https://api.anthropic.com", api: "anthropic-messages" });
+    // `ANTHROPIC_AUTH_TOKEN`: Pi returns only the header and labels the
+    // mechanism api_key, so the registry snapshot says nothing about OAuth.
+    const registry = fakeRegistry({ headers: { Authorization: "Bearer sk-ant-oat-test" } }, [model]);
+    const resolution = await resolveTarget(registry, model);
+    assert.equal(resolution.ok, true);
+    if (!resolution.ok) return;
+    assert.equal(resolution.target.isOAuth, true);
+    assert.equal(resolution.target.identity.isOAuth, true);
+    assert.equal(resolution.target.identity.key.includes("|oauth|"), true);
+    assert.equal(new Headers(resolution.target.originHeaders).get("authorization"), "Bearer sk-ant-oat-test");
+    assert.equal(new Headers(resolution.target.originHeaders).get("x-api-key"), null);
+    assert.equal(resolution.target.hasApiKey, false);
+  });
+
+  it("keeps an ordinary header-owned Anthropic bearer a non-OAuth credential", async () => {
+    const model = fakeModel({ provider: "anthropic", id: "chat", baseUrl: "https://api.anthropic.com", api: "anthropic-messages" });
+    const registry = fakeRegistry({ headers: { Authorization: "Bearer sk-ant-api03-test" } }, [model]);
+    const resolution = await resolveTarget(registry, model);
+    assert.equal(resolution.ok, true);
+    if (!resolution.ok) return;
+    assert.equal(resolution.target.isOAuth, false);
+    assert.equal(resolution.target.identity.isOAuth, false);
+    assert.equal(new Headers(resolution.target.originHeaders).get("authorization"), "Bearer sk-ant-api03-test");
+  });
+
   it("normalizes only bearer or raw authorization credentials", () => {
     assert.equal(authorizationCredential("Bearer token-a"), "token-a");
     assert.equal(authorizationCredential("bearer   token-a"), "token-a");

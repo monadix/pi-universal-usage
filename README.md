@@ -100,7 +100,10 @@ Elapsed resets are shown as `reset elapsed`, not silently replenished.
 
    API-key credentials for `anthropic` or `openai` have no quota interface here
    and are reported as unsupported without a request (passive response headers
-   still update the footer). Pi's native `openai` OAuth flow obtains an
+   still update the footer). An Anthropic subscription token supplied through
+   `ANTHROPIC_AUTH_TOKEN` arrives as a header-only bearer credential and is
+   still recognized by its `sk-ant-oat` prefix, so it uses the subscription
+   endpoint with the header Pi resolved. Pi's native `openai` OAuth flow obtains an
    API-audience token, which is not an established legacy ChatGPT/WHAM
    credential; `https://api.openai.com` is therefore reported as unsupported
    rather than sending that token to `chatgpt.com`. Only the legacy
