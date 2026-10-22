@@ -1064,6 +1064,39 @@ describe("pi extension wiring", () => {
     host.shutdown(bound.ctx);
   });
 
+  it("keeps turn attribution when a refresh meets an equivalent model replacement", async () => {
+    const { fetchImpl, calls } = sequenceFetch([textResponse("unexpected request")]);
+    const model = fakeModel({ provider: "openai", id: "chat", baseUrl: "https://api.openai.com/v1" });
+    // Pi substitutes an equivalent object for the same logical model: same URL,
+    // API, and equivalent header map, so it emits no `model_select`.
+    const equivalent = fakeModel({ provider: "openai", id: "chat", baseUrl: "https://api.openai.com/v1" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [model],
+      config: normalizeConfig({ autoRefresh: false }),
+    });
+    const selection = { current: model };
+    const fake = fakeContext({ modelRef: selection, registry, idle: false });
+    await pi.emit("session_start", { type: "session_start" }, fake.ctx);
+    await pi.emit("turn_start", { type: "turn_start", turnIndex: 0, timestamp: Date.now() }, fake.ctx);
+
+    selection.current = equivalent;
+    // An intervening refresh resolves the equivalent object back to the same
+    // effective identity, so the turn's attribution stays sound.
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    await command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await pi.emit(
+      "after_provider_response",
+      { status: 200, headers: { "x-ratelimit-limit-requests": "1000", "x-ratelimit-remaining-requests": "500" } },
+      fake.ctx,
+    );
+
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /req 50%/);
+    assert.equal(calls.length, 0, "the passive-only target still needs no request");
+    host.shutdown(fake.ctx);
+  });
+
   it("discards passive headers when the selection moves before the response", async () => {
     const { fetchImpl, calls } = sequenceFetch([codexBody(12)]);
     const modelA = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://a.example.com/v1" });

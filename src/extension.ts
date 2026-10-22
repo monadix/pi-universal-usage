@@ -242,10 +242,10 @@ export class UniversalUsageHost {
     // describe the route the user is on now. A resolution handed in by the caller
     // is already bound to the capture it was produced from.
     const selection = options.resolved !== undefined ? active.selection : bindSelection(model);
-    if (model !== active.model) {
-      this.active = { model, selection };
-      this.passiveAttribution = undefined;
-    }
+    // The adopted binding is replaced by the resolver result, never before it.
+    // Pi can substitute an equivalent model object without an event, so
+    // dropping the binding eagerly would discard a still-sound turn attribution
+    // before the resolver can show that the effective identity is unchanged.
     const target =
       options.resolved ?? (await this.reconcileActive(ctx, model, { generation, revision, selection }));
     if (target === undefined) return undefined;
