@@ -1,0 +1,49 @@
+{
+  "name": "pi-universal-usage",
+  "version": "0.1.0",
+  "description": "Read-only Pi usage monitor: auto-detects popular quota-compatible endpoints and headers, with optional per-provider scheme and path overrides.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi",
+    "pi-package",
+    "pi-extension",
+    "usage",
+    "quota",
+    "rate-limit",
+    "balance"
+  ],
+  "files": [
+    "extensions",
+    "src",
+    "scripts",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ]
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test",
+    "pack:dry-run": "npm pack --dry-run",
+    "live-smoke": "node scripts/live-smoke.ts",
+    "load-check": "node scripts/load-check.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.2.0",
+    "@earendil-works/pi-coding-agent": "1.2.0",
+    "@types/node": "^24.10.0",
+    "typescript": "^5.9.3"
+  }
+}
