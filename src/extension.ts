@@ -78,11 +78,43 @@ interface WorkLease {
   signal?: AbortSignal;
 }
 
+/** How one refresh of the active target was asked for. */
+interface RefreshOptions {
+  reason: string;
+  force?: boolean;
+  /** A resolution the caller already produced from its own capture. */
+  resolved?: ResolvedTarget;
+  model?: Model<any>;
+}
+
+/** What one reconciliation that still owned its activation adopted. */
+type AdoptedResolution = { kind: "target"; target: ResolvedTarget } | { kind: "failure"; snapshot: TargetSnapshot };
+
+/** The snapshot an accepted attempt produced, and how its reconciliation accepted it. */
+interface AcceptedOutcome {
+  kind: "snapshot" | "failure";
+  snapshot: TargetSnapshot;
+}
+
+/**
+ * What one active-provider attempt established for its caller. A published
+ * snapshot and a sanitized resolver failure adopted by the attempt's own
+ * reconciliation are accepted outcomes; `none` means a newer reconciliation, a
+ * changed live route, or cancellation revoked the attempt before it accepted
+ * anything, so it grants no authority at all.
+ */
+type ActiveOutcome = AcceptedOutcome | { kind: "none" };
+
 /** One `/usage` entry: a resolvable model, or a provider id with no registered model. */
 type ReportTarget = { kind: "model"; model: Model<any> } | { kind: "unresolved"; providerId: string };
 
 function sameLogicalModel(left: Model<any>, right: Model<any>): boolean {
   return left.provider === right.provider && left.id === right.id;
+}
+
+/** An attempt that published a snapshot accepted it; one that published nothing accepted nothing. */
+function publishedOutcome(snapshot: TargetSnapshot | undefined): ActiveOutcome {
+  return snapshot === undefined ? { kind: "none" } : { kind: "snapshot", snapshot };
 }
 
 /**
@@ -227,12 +259,21 @@ export class UniversalUsageHost {
    * base URL first, and a concurrent refresh of the same identity joins the
    * work already in flight instead of aborting the request it would then await.
    */
-  async refreshActive(
-    ctx: ExtensionContext,
-    options: { reason: string; force?: boolean; resolved?: ResolvedTarget; model?: Model<any> },
-  ): Promise<TargetSnapshot | undefined> {
+  async refreshActive(ctx: ExtensionContext, options: RefreshOptions): Promise<TargetSnapshot | undefined> {
+    const outcome = await this.refreshAttempt(ctx, options);
+    return outcome.kind === "none" ? undefined : outcome.snapshot;
+  }
+
+  /**
+   * One active-provider attempt, reported as the outcome it accepted. A request
+   * only needs the measurement through `refreshActive()`; a report also needs
+   * the sanitized failure its own reconciliation adopted, because an absent
+   * measurement alone cannot distinguish that from an attempt that forfeited
+   * its authority to newer work.
+   */
+  private async refreshAttempt(ctx: ExtensionContext, options: RefreshOptions): Promise<ActiveOutcome> {
     const active = this.active;
-    if (this.disposed || active === undefined) return undefined;
+    if (this.disposed || active === undefined) return { kind: "none" };
     const generation = this.generation;
     const revision = ++this.reconcileRevision;
     const model =
@@ -246,18 +287,22 @@ export class UniversalUsageHost {
     // Pi can substitute an equivalent model object without an event, so
     // dropping the binding eagerly would discard a still-sound turn attribution
     // before the resolver can show that the effective identity is unchanged.
-    const target =
-      options.resolved ?? (await this.reconcileActive(ctx, model, { generation, revision, selection }));
-    if (target === undefined) return undefined;
+    const adopted: AdoptedResolution | undefined =
+      options.resolved !== undefined
+        ? { kind: "target", target: options.resolved }
+        : await this.reconcileActive(ctx, model, { generation, revision, selection });
+    if (adopted === undefined) return { kind: "none" };
+    if (adopted.kind === "failure") return { kind: "failure", snapshot: adopted.snapshot };
+    const target = adopted.target;
     // This request is bound to the reconciled source: the captured activation,
     // route and cancellation decide, not the reconciliation order.
     const bound: WorkLease = { generation, selection, source: target.identity.key };
-    if (!this.holdsWork(bound, ctx)) return undefined;
+    if (!this.holdsWork(bound, ctx)) return { kind: "none" };
 
     const key = target.identity.key;
     const existing = this.refreshWork;
     if (existing !== undefined && existing.generation === generation && existing.key === key) {
-      return existing.promise;
+      return publishedOutcome(await existing.promise);
     }
     this.abortRefresh();
 
@@ -280,7 +325,7 @@ export class UniversalUsageHost {
     })();
     this.refreshWork = { key, generation, controller, promise };
     try {
-      return await promise;
+      return publishedOutcome(await promise);
     } finally {
       if (this.refreshWork?.promise === promise) this.refreshWork = undefined;
     }
@@ -308,12 +353,13 @@ export class UniversalUsageHost {
     // A target here already passed the adoption check: it is the newest
     // reconciliation of this activation and the live route still matches it.
     const lease: ResolutionLease = { generation, revision, selection };
-    const target = await this.reconcileActive(ctx, model, lease);
+    const adopted = await this.reconcileActive(ctx, model, lease);
     // Adoption happened one asynchronous boundary ago. A shutdown, a newer
     // activation, or a newer reconciliation in between revokes this reselection
     // before it may restore attribution, change the accepted view, or touch the
     // context its work would publish through.
-    if (target === undefined || !this.adoptsResolution(lease, ctx)) return;
+    if (adopted?.kind !== "target" || !this.adoptsResolution(lease, ctx)) return;
+    const target = adopted.target;
     if (previousKey !== target.identity.key) {
       // The route changed; do not repaint measurements from the old origin/auth.
       this.lastSnapshot = undefined;
@@ -335,7 +381,7 @@ export class UniversalUsageHost {
     ctx: ExtensionContext,
     model: Model<any>,
     lease: ResolutionLease,
-  ): Promise<ResolvedTarget | undefined> {
+  ): Promise<AdoptedResolution | undefined> {
     const resolution = await resolveTarget(ctx.modelRegistry, lease.selection.model, { allowInsecureHttp: true });
     // Auth resolution is asynchronous: only the newest reconciliation for this
     // activation may mutate the active binding, even when an older resolver
@@ -348,7 +394,7 @@ export class UniversalUsageHost {
       this.monitor.cancel();
       this.active = { model, selection: lease.selection };
       this.passiveAttribution = undefined;
-      this.lastSnapshot = {
+      const snapshot: TargetSnapshot = {
         identity: resolution.identity,
         status: resolution.status,
         metrics: [],
@@ -356,13 +402,14 @@ export class UniversalUsageHost {
         fetchedAt: this.now(),
         source: "cache",
       };
+      this.lastSnapshot = snapshot;
       this.paint(ctx);
-      return undefined;
+      return { kind: "failure", snapshot };
     }
     const previous = this.active?.target?.identity.key;
     this.active = { model, selection: lease.selection, target: resolution.target };
     if (previous !== resolution.target.identity.key) this.passiveAttribution = undefined;
-    return resolution.target;
+    return { kind: "target", target: resolution.target };
   }
 
   /**
@@ -438,26 +485,31 @@ export class UniversalUsageHost {
     const unadopted = this.active === undefined ? this.captureSelected(ctx) : undefined;
     const snapshots: TargetSnapshot[] = [];
     // The effective source this report belongs to. The active provider is
-    // reported first, so its own reconciliation re-anchors the guard; a source
-    // change caused by later work (a rotated credential or a changed same-ID
-    // route) cancels the report instead of publishing older measurements.
+    // reported first, so the outcome its own attempt accepted re-anchors the
+    // guard; a source change caused by later work (a rotated credential or a
+    // changed same-ID route) cancels the report instead of publishing older
+    // measurements.
     let source = this.activeSourceToken();
     // The active target is always included; other providers only when the user
     // opted into them before the session (explicit config entries) or asked.
     for (const target of this.reportTargets(ctx, requested)) {
-      const isActive = target.kind === "model" && this.isCurrentModel(target.model);
-      const snapshot =
-        target.kind === "unresolved"
-          ? this.unresolvedSnapshot(target.providerId)
-          : await this.snapshotForModel(ctx, target.model, generation, isActive ? undefined : source, unadopted);
-      if (isActive) {
-        // The active provider's own reconciliation may re-anchor this report,
-        // but only under the authority its outcome carries. Reading the current
-        // source here instead would let a source adopted after that outcome
-        // authorize measurements collected under the previous one.
-        const anchor = this.activeReportAnchor(snapshot);
+      let snapshot: TargetSnapshot | undefined;
+      if (target.kind === "unresolved") {
+        snapshot = this.unresolvedSnapshot(target.providerId);
+      } else if (this.isCurrentModel(target.model)) {
+        // The active provider's own attempt may re-anchor this report, but only
+        // under the authority it accepted: a snapshot it published, or the
+        // sanitized failure its own reconciliation adopted while that failure is
+        // still the accepted view. A rejected or cancelled attempt carries none,
+        // and no later outcome may lend one to it.
+        const outcome = await this.refreshAttempt(ctx, { reason: "command", force: true, model: target.model });
+        if (outcome.kind === "none") return;
+        const anchor = this.activeReportAnchor(outcome);
         if (anchor === undefined) return;
         source = anchor;
+        snapshot = outcome.snapshot;
+      } else {
+        snapshot = await this.snapshotForModel(ctx, target.model, generation, source, unadopted);
       }
       // A model switch, shutdown, or effective source change cancels the report
       // silently: it must not fetch the next provider or publish measurements
@@ -468,8 +520,9 @@ export class UniversalUsageHost {
     if (!this.reportStillValid(generation, source, ctx, unadopted)) return;
     const active = this.lastSnapshot;
     const activeTargetKey = this.active?.target?.identity.key;
-    // With no reconciled target the last snapshot is this attempt's failure
-    // state; with one, a key mismatch means it belongs to an older source.
+    // With no reconciled target the last snapshot is the accepted failure state
+    // of this report's attempt; with one, a key mismatch means it belongs to an
+    // older source.
     const activeIsCurrent = active !== undefined && (activeTargetKey === undefined || active.identity.key === activeTargetKey);
     if (activeIsCurrent && !snapshots.some((snapshot) => snapshot.identity.key === active.identity.key)) {
       snapshots.unshift(active);
@@ -496,20 +549,21 @@ export class UniversalUsageHost {
   }
 
   /**
-   * The source a report may continue under once its active provider has been
-   * attempted, or undefined when that attempt left no authority to report from.
-   * A returned snapshot was accepted by its own reconciliation, so it anchors
-   * the report only while the host still holds that source. Without a snapshot,
-   * the target-less binding of a sanitized resolver failure is the only outcome
-   * that carries an authority of its own; a rejected or cancelled attempt
-   * carries none and must not fall back to the current source.
+   * The source a report may continue under after its active attempt, or
+   * undefined when that attempt lost the authority it had accepted. A published
+   * snapshot anchors while the host still holds the source it was accepted for;
+   * an adopted sanitized failure anchors while it is still the accepted view.
+   * Both are checked against what the attempt itself established, never inferred
+   * from later state.
    */
-  private activeReportAnchor(snapshot: TargetSnapshot | undefined): string | undefined {
-    if (snapshot !== undefined) {
+  private activeReportAnchor(outcome: AcceptedOutcome): string | undefined {
+    if (outcome.kind === "snapshot") {
       const current = this.activeSourceToken();
-      return current === snapshot.identity.key ? current : undefined;
+      return current === outcome.snapshot.identity.key ? current : undefined;
     }
-    if (this.active?.target !== undefined || this.lastSnapshot === undefined) return undefined;
+    // A failure anchors only while no target replaced the target-less binding
+    // that adopted it, so a newer failure or success cannot substitute for it.
+    if (this.active?.target !== undefined || this.lastSnapshot !== outcome.snapshot) return undefined;
     return this.activeSourceToken();
   }
 
@@ -648,6 +702,10 @@ export class UniversalUsageHost {
     };
   }
 
+  /**
+   * One provider of a report that is not the active target: it owns no host
+   * binding, so its own resolution and request are bound to the report's source.
+   */
   private async snapshotForModel(
     ctx: ExtensionCommandContext,
     model: Model<any>,
@@ -655,9 +713,6 @@ export class UniversalUsageHost {
     source: string | undefined,
     unadopted: SelectionBinding | undefined,
   ): Promise<TargetSnapshot | undefined> {
-    if (this.active !== undefined && this.isCurrentModel(model)) {
-      return this.refreshActive(ctx, { reason: "command", force: true, model });
-    }
     const selection = bindSelection(model);
     const resolution = await resolveTarget(ctx.modelRegistry, selection.model, { allowInsecureHttp: true });
     if (!this.reportStillValid(generation, source, ctx, unadopted)) return undefined;

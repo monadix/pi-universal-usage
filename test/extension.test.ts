@@ -1310,6 +1310,141 @@ describe("pi extension wiring", () => {
     host.shutdown(fake.ctx);
   });
 
+  it("stops a report whose rejected active attempt has no failure authority of its own", async () => {
+    let holdActiveAuth = false;
+    let activeAuthReached = false;
+    let releaseActiveAuth: (() => void) | undefined;
+    const activeAuthGate = new Promise<void>((resolve) => {
+      releaseActiveAuth = resolve;
+    });
+    const activeCalls: string[] = [];
+    const peerCalls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("api.deepseek.com")) {
+        peerCalls.push(url);
+        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
+      }
+      activeCalls.push(url);
+      return codexBody(11);
+    }) as typeof fetch;
+    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
+      // The replaced route has no credential at all, so a newer reconciliation
+      // for it adopts a sanitized failure.
+      if (model.baseUrl.includes("b.example")) return { ok: false, error: "removed credential" };
+      if (holdActiveAuth) {
+        activeAuthReached = true;
+        return { apiKey: "key-a", source: "stored", wait: activeAuthGate };
+      }
+      return { apiKey: "key-a", source: "stored" };
+    };
+    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://a.example/v1" });
+    const cpaMoved = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://b.example/v1" });
+    const deepseek = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [cpa, cpaMoved, deepseek],
+      auth,
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false, providers: { deepseek: { enabled: true } } }),
+    });
+    const selection = { current: cpa };
+    const fake = fakeContext({ modelRef: selection, registry });
+    await host.activate(fake.ctx, cpa, { refresh: false });
+
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    holdActiveAuth = true;
+    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => activeAuthReached);
+
+    // The selection moves to another same-ID route without an event, and a newer
+    // reconciliation adopts that route's sanitized failure. The report's own
+    // attempt is therefore rejected and may not inherit that failure's authority.
+    selection.current = cpaMoved;
+    await host.refreshActive(fake.ctx, { reason: "interval" });
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /no-credential/);
+
+    releaseActiveAuth?.();
+    await pending;
+
+    assert.equal(peerCalls.length, 0, "no peer is fetched for an authority the report never had");
+    assert.equal(activeCalls.length, 0, "no request is started for the abandoned route");
+    assert.equal(fake.widgets.length, 0, "no report is published from a revoked attempt");
+    assert.equal(fake.notifications.length, 0);
+    assert.equal(pi.entries.length, 0);
+
+    // A sanitized failure the report's own reconciliation adopts still reports:
+    // the newer failure above carries no authority, but this one is accepted here.
+    await command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    assert.equal(fake.widgets.length, 1, "the report's own adopted failure is published");
+    const text = (fake.widgets[0]?.lines ?? []).join("\n");
+    assert.match(text, /cpa\/chat/);
+    assert.match(text, /state: no-credential/);
+    assert.match(text, /no usable credential/);
+    assert.equal(peerCalls.length, 1, "the accepted report still collects the configured peer");
+    assert.equal(activeCalls.length, 0);
+    host.shutdown(fake.ctx);
+  });
+
+  it("stops a report whose cancelled active request has no failure authority of its own", async () => {
+    let releaseActiveGet: (() => void) | undefined;
+    const activeGetGate = new Promise<void>((resolve) => {
+      releaseActiveGet = resolve;
+    });
+    const activeCalls: string[] = [];
+    const peerCalls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("api.deepseek.com")) {
+        peerCalls.push(url);
+        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
+      }
+      activeCalls.push(url);
+      if (url.includes("a.example")) await activeGetGate;
+      return codexBody(11);
+    }) as typeof fetch;
+    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
+      if (model.baseUrl.includes("b.example")) return { ok: false, error: "removed credential" };
+      return { apiKey: "key-a", source: "stored" };
+    };
+    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://a.example/v1" });
+    const cpaMoved = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://b.example/v1" });
+    const deepseek = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [cpa, cpaMoved, deepseek],
+      auth,
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false, providers: { deepseek: { enabled: true } } }),
+    });
+    const selection = { current: cpa };
+    const fake = fakeContext({ modelRef: selection, registry });
+    await host.activate(fake.ctx, cpa, { refresh: false });
+
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => activeCalls.length === 1);
+
+    // A newer reconciliation for the replaced route adopts its sanitized failure
+    // and cancels the report's request. The cancelled request returns no
+    // accepted snapshot, so the report owns no authority to continue under.
+    selection.current = cpaMoved;
+    await host.refreshActive(fake.ctx, { reason: "interval" });
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /no-credential/);
+
+    releaseActiveGet?.();
+    await pending;
+
+    assert.equal(peerCalls.length, 0, "no peer is fetched for a cancelled attempt");
+    assert.equal(activeCalls.length, 1, "the cancelled route starts no follow-on request");
+    assert.equal(fake.widgets.length, 0, "no report is published from a cancelled attempt");
+    assert.equal(fake.notifications.length, 0);
+    assert.equal(pi.entries.length, 0);
+    host.shutdown(fake.ctx);
+  });
+
   it("discards a pending active refresh when the live selection changes route without an event", async () => {
     let release: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {
