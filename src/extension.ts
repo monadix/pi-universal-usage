@@ -450,7 +450,15 @@ export class UniversalUsageHost {
         target.kind === "unresolved"
           ? this.unresolvedSnapshot(target.providerId)
           : await this.snapshotForModel(ctx, target.model, generation, isActive ? undefined : source, unadopted);
-      if (isActive) source = this.activeSourceToken();
+      if (isActive) {
+        // The active provider's own reconciliation may re-anchor this report,
+        // but only under the authority its outcome carries. Reading the current
+        // source here instead would let a source adopted after that outcome
+        // authorize measurements collected under the previous one.
+        const anchor = this.activeReportAnchor(snapshot);
+        if (anchor === undefined) return;
+        source = anchor;
+      }
       // A model switch, shutdown, or effective source change cancels the report
       // silently: it must not fetch the next provider or publish measurements
       // from an older source.
@@ -485,6 +493,24 @@ export class UniversalUsageHost {
    */
   private activeSourceToken(): string {
     return this.active?.target?.identity.key ?? "-";
+  }
+
+  /**
+   * The source a report may continue under once its active provider has been
+   * attempted, or undefined when that attempt left no authority to report from.
+   * A returned snapshot was accepted by its own reconciliation, so it anchors
+   * the report only while the host still holds that source. Without a snapshot,
+   * the target-less binding of a sanitized resolver failure is the only outcome
+   * that carries an authority of its own; a rejected or cancelled attempt
+   * carries none and must not fall back to the current source.
+   */
+  private activeReportAnchor(snapshot: TargetSnapshot | undefined): string | undefined {
+    if (snapshot !== undefined) {
+      const current = this.activeSourceToken();
+      return current === snapshot.identity.key ? current : undefined;
+    }
+    if (this.active?.target !== undefined || this.lastSnapshot === undefined) return undefined;
+    return this.activeSourceToken();
   }
 
   /**

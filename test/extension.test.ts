@@ -1194,6 +1194,89 @@ describe("pi extension wiring", () => {
     host.shutdown(activation.ctx);
   });
 
+  it("stops a report whose active source rotates after its snapshot was accepted", async () => {
+    let currentKey = "key-a";
+    let holdRotatedAuth = false;
+    let rotatedAuthReached = false;
+    let releaseRotatedAuth: (() => void) | undefined;
+    const rotatedAuthGate = new Promise<void>((resolve) => {
+      releaseRotatedAuth = resolve;
+    });
+    let releaseActiveGet: (() => void) | undefined;
+    const activeGetGate = new Promise<void>((resolve) => {
+      releaseActiveGet = resolve;
+    });
+    const activeCalls: string[] = [];
+    const peerCalls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("api.deepseek.com")) {
+        peerCalls.push(url);
+        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
+      }
+      activeCalls.push(url);
+      if (activeCalls.length === 1) await activeGetGate;
+      return codexBody(activeCalls.length === 1 ? 11 : 22);
+    }) as typeof fetch;
+    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
+      if (model.provider === "cpa" && holdRotatedAuth) {
+        rotatedAuthReached = true;
+        return { apiKey: currentKey, source: "stored", wait: rotatedAuthGate };
+      }
+      return { apiKey: currentKey, source: "stored" };
+    };
+    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://a.example.com/v1" });
+    const deepseek = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [cpa, deepseek],
+      auth,
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false, providers: { deepseek: { enabled: true } } }),
+    });
+    const fake = fakeContext({ model: cpa, registry });
+    await host.activate(fake.ctx, cpa, { refresh: false });
+
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => activeCalls.length === 1);
+
+    // A newer reconciliation for the same route with a rotated credential is
+    // pending its own authentication while the active provider's request runs.
+    // Reconciliation order alone does not invalidate the older request.
+    currentKey = "key-b";
+    holdRotatedAuth = true;
+    const rotation = host.refreshActive(fake.ctx, { reason: "interval" });
+    await waitFor(() => rotatedAuthReached);
+
+    // The active snapshot is accepted and painted here; the newer credential
+    // then adopts during the asynchronous return before `report()` resumes.
+    const statuses = fake.ctx.ui.setStatus.bind(fake.ctx.ui);
+    let released = false;
+    fake.ctx.ui.setStatus = (key: string, text: string | undefined) => {
+      statuses(key, text);
+      if (!released && String(text ?? "").includes("11%")) {
+        released = true;
+        releaseRotatedAuth?.();
+      }
+    };
+    releaseActiveGet?.();
+    await pending;
+    await rotation;
+
+    assert.equal(released, true, "the older source published its own measurement");
+    assert.equal(peerCalls.length, 0, "no configured provider is fetched for the older source");
+    assert.equal(fake.widgets.length, 0, "no report mixes two credential sources");
+    assert.equal(fake.notifications.length, 0);
+    assert.equal(pi.entries.length, 0);
+    // The rotation itself still owns the footer: the report detaches, not the
+    // legitimate refresh of the new source.
+    assert.equal(activeCalls.length, 2);
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /22%/);
+    host.shutdown(fake.ctx);
+  });
+
   it("discards a pending active refresh when the live selection changes route without an event", async () => {
     let release: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {
