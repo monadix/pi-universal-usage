@@ -167,8 +167,10 @@ export class UniversalUsageHost {
    * route later, so this is a lifetime, not a value comparison.
    */
   private bindingEpoch = 0;
-  /** Work shared by concurrent refreshes of one identity; never aborted by a same-target join. */
-  private refreshWork: { key: string; generation: number; controller: AbortController; promise: Promise<TargetSnapshot | undefined> } | undefined;
+  /** Work shared by concurrent refreshes of one source and route; never aborted by a same-target join. */
+  private refreshWork:
+    | { key: string; generation: number; routing: string; controller: AbortController; promise: Promise<TargetSnapshot | undefined> }
+    | undefined;
   /** The target that started the current turn; passive headers need this attribution. */
   private passiveAttribution: { identityKey: string; generation: number } | undefined;
   private timer: ReturnType<typeof setInterval> | undefined;
@@ -326,7 +328,17 @@ export class UniversalUsageHost {
 
     const key = target.identity.key;
     const existing = this.refreshWork;
-    if (existing !== undefined && existing.generation === generation && existing.key === key) {
+    // Sharing the request is safe for one source and one captured route: Pi can
+    // resolve two selections to the same effective identity (an auth base URL
+    // override), but the existing work publishes under *its* captured route, so a
+    // different route must start its own publication instead of inheriting the
+    // other route's rejection.
+    if (
+      existing !== undefined &&
+      existing.generation === generation &&
+      existing.key === key &&
+      existing.routing === selection.routing
+    ) {
       return publishedOutcome(await existing.promise);
     }
     this.abortRefresh();
@@ -348,7 +360,7 @@ export class UniversalUsageHost {
       this.paint(ctx);
       return snapshot;
     })();
-    this.refreshWork = { key, generation, controller, promise };
+    this.refreshWork = { key, generation, routing: selection.routing, controller, promise };
     try {
       return publishedOutcome(await promise);
     } finally {

@@ -2854,6 +2854,111 @@ describe("host routing binding", () => {
     host.shutdown(fake.ctx);
   });
 
+  it("publishes a current-route report instead of joining an incompatible route's work", async () => {
+    let releaseFirstGet: (() => void) | undefined;
+    const firstGetGate = new Promise<void>((resolve) => {
+      releaseFirstGet = resolve;
+    });
+    const calls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      calls.push(url);
+      if (calls.length === 1) {
+        await firstGetGate;
+        return codexBody(11);
+      }
+      return codexBody(22);
+    }) as typeof fetch;
+    // Pi authentication overrides the declared base URL, so both selections share
+    // one effective origin and credential while their declared routes differ.
+    const auth = (): FakeAuth => ({ apiKey: "key-a", source: "stored", baseUrl: "https://effective.example/v1" });
+    const declared = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://a.example/v1" });
+    const rerouted = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://b.example/v1" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [declared, rerouted],
+      auth,
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false }),
+    });
+    const selection = { current: declared };
+    const fake = fakeContext({ modelRef: selection, registry });
+    await host.activate(fake.ctx, declared, { refresh: false });
+
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    const first = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => calls.length === 1);
+    assert.match(calls[0] ?? "", /effective\.example/);
+
+    // The live selection moves to another declared route that resolves to the
+    // same effective origin while the first route's response is still pending.
+    selection.current = rerouted;
+    const second = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    releaseFirstGet?.();
+
+    // The current route needs its own publication instead of inheriting the
+    // first route's rejection.
+    await waitFor(() => calls.length === 2);
+    assert.match(calls[1] ?? "", /effective\.example/);
+    await second;
+    assert.equal(fake.widgets.length, 1, "the current-route command publishes its own report");
+    assert.match((fake.widgets[0]?.lines ?? []).join("\n"), /22%/);
+
+    // The obsolete route's late response publishes nothing.
+    await first;
+    assert.equal(fake.widgets.length, 1, "the obsolete route publishes nothing");
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /22%/);
+    assert.equal(calls.length, 2);
+    host.shutdown(fake.ctx);
+  });
+
+  it("joins an equivalent-header command to the same HTTP sequence", async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const calls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      calls.push(String(input));
+      await gate;
+      return codexBody(12);
+    }) as typeof fetch;
+    const declared = fakeModel({
+      provider: "cpa",
+      id: "chat",
+      baseUrl: "https://a.example/v1",
+      headers: { Authorization: "Bearer synthetic-a", "ChatGPT-Account-Id": "a" },
+    });
+    const equivalent = modelWithHeaders(declared, { "chatgpt-account-id": "a", authorization: "Bearer synthetic-a" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [declared, equivalent],
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false }),
+    });
+    const selection = { current: declared };
+    const fake = fakeContext({ modelRef: selection, registry });
+    await host.activate(fake.ctx, declared, { refresh: false });
+
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    const first = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => calls.length === 1);
+
+    // A recased, reordered copy of the same routing is the same route.
+    selection.current = equivalent;
+    const second = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    release?.();
+    await Promise.all([first, second]);
+
+    assert.equal(calls.length, 1, "an equivalent route joins the same HTTP sequence");
+    assert.equal(fake.widgets.length, 2, "each command publishes its own report");
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /12%/);
+    host.shutdown(fake.ctx);
+  });
+
   it("does not paint or fetch a credential that resolves after shutdown", async () => {
     let release: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {
