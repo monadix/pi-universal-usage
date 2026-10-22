@@ -219,7 +219,9 @@ export class UsageMonitor {
   /**
    * Apply passive response headers from an inference response to the active
    * target. The caller is responsible for attribution; this only merges the
-   * parsed header dimensions when they carry data.
+   * parsed header dimensions when they carry data. An explicitly disabled
+   * provider stays disabled: a live response must not revive its footer or
+   * replace the cached disabled state.
    */
   applyPassiveHeaders(
     target: ResolvedTarget,
@@ -228,6 +230,7 @@ export class UsageMonitor {
     config: UsageConfig,
   ): TargetSnapshot | undefined {
     if (this.closed) return undefined;
+    if (config.providers.get(target.identity.providerId)?.enabled === false) return undefined;
     const now = this.now();
     const results = parseHeaderPayload(headers, status, now);
     if (results.length === 0) return undefined;

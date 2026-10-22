@@ -395,6 +395,33 @@ describe("UsageMonitor", () => {
     assert.equal(calls.length, 0);
   });
 
+  it("ignores passive response headers for an explicitly disabled provider", async () => {
+    const target = await targetFor({ provider: "openai", baseUrl: "https://api.openai.com/v1" });
+    const { fetchImpl, calls } = sequenceFetch([textResponse("unused")]);
+    const monitor = monitorWith(fetchImpl);
+    const provider = { enabled: false };
+    const disabledConfig = normalizeConfig({ refreshSeconds: 300, providers: { openai: provider } });
+    const disabled = await monitor.refresh(target, provider, disabledConfig, { force: true });
+    assert.equal(disabled.status, "unsupported");
+    assert.match(disabled.notice ?? "", /disabled/);
+
+    // The inference response still arrives; it must not overwrite the disabled
+    // snapshot or produce a snapshot the footer would paint.
+    const passive = monitor.applyPassiveHeaders(
+      target,
+      { "x-ratelimit-limit-requests": "100", "x-ratelimit-remaining-requests": "25" },
+      200,
+      disabledConfig,
+    );
+    assert.equal(passive, undefined);
+    assert.equal(monitor.snapshotFor(target.identity.key), disabled);
+
+    // Subsequent ordinary refreshes keep serving the disabled state.
+    const next = await monitor.refresh(target, provider, disabledConfig);
+    assert.equal(next, disabled);
+    assert.equal(calls.length, 0);
+  });
+
   it("reuses an account-level endpoint snapshot across models of one provider", async () => {
     const modelA = fakeModel({ provider: "deepseek", id: "chat-a", baseUrl: "https://api.deepseek.com" });
     const modelB = fakeModel({ provider: "deepseek", id: "chat-b", baseUrl: "https://api.deepseek.com" });
