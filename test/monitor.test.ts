@@ -283,6 +283,65 @@ describe("UsageMonitor", () => {
     assert.equal(passive, http);
   });
 
+  it("does not serve a passive snapshot cached by another logical model", async () => {
+    const modelA = fakeModel({ provider: "openai", id: "chat-a", baseUrl: "https://api.openai.com/v1" });
+    const modelB = fakeModel({ provider: "openai", id: "chat-b", baseUrl: "https://api.openai.com/v1" });
+    const registry = fakeRegistry({ apiKey: "test-key" }, [modelA, modelB]);
+    const resolvedA = await resolveTarget(registry, modelA, { allowInsecureHttp: true });
+    const resolvedB = await resolveTarget(registry, modelB, { allowInsecureHttp: true });
+    assert.equal(resolvedA.ok && resolvedB.ok, true);
+    if (!resolvedA.ok || !resolvedB.ok) return;
+    // Same provider, origin, credential, and routing: one account-level entry.
+    assert.equal(resolvedA.target.identity.key, resolvedB.target.identity.key);
+
+    const { fetchImpl, calls } = sequenceFetch([textResponse("unused")]);
+    const monitor = monitorWith(fetchImpl);
+    const forA = await monitor.refresh(resolvedA.target, undefined, config);
+    assert.equal(forA.status, "unsupported");
+    assert.equal(calls.length, 0);
+
+    const passiveA = monitor.applyPassiveHeaders(
+      resolvedA.target,
+      { "x-codex-secondary-used-percent": "90", "x-codex-secondary-window-minutes": "10080" },
+      200,
+      config,
+    );
+    assert.equal(passiveA?.metrics[0]?.usedPercent, 90);
+
+    // The same model keeps serving its own passive measurement from the cache.
+    assert.equal(await monitor.refresh(resolvedA.target, undefined, config), passiveA);
+
+    // Another model of the same account must not inherit A's passive measurement.
+    const forB = await monitor.refresh(resolvedB.target, undefined, config);
+    assert.notEqual(forB, passiveA);
+    assert.equal(forB.metrics.length, 0);
+    assert.notEqual(forB.status, "ok");
+    assert.match(forB.notice ?? "", /waiting before the next attempt/);
+    assert.equal(calls.length, 0);
+  });
+
+  it("reuses an account-level endpoint snapshot across models of one provider", async () => {
+    const modelA = fakeModel({ provider: "deepseek", id: "chat-a", baseUrl: "https://api.deepseek.com" });
+    const modelB = fakeModel({ provider: "deepseek", id: "chat-b", baseUrl: "https://api.deepseek.com" });
+    const registry = fakeRegistry({ apiKey: "test-key" }, [modelA, modelB]);
+    const resolvedA = await resolveTarget(registry, modelA, { allowInsecureHttp: true });
+    const resolvedB = await resolveTarget(registry, modelB, { allowInsecureHttp: true });
+    assert.equal(resolvedA.ok && resolvedB.ok, true);
+    if (!resolvedA.ok || !resolvedB.ok) return;
+    assert.equal(resolvedA.target.identity.key, resolvedB.target.identity.key);
+
+    const { fetchImpl, calls } = sequenceFetch([
+      jsonResponse({ is_available: true, balance_infos: [{ currency: "USD", total_balance: "4" }] }),
+    ]);
+    const monitor = monitorWith(fetchImpl);
+    const forA = await monitor.refresh(resolvedA.target, undefined, config);
+    assert.equal(forA.status, "ok");
+
+    const forB = await monitor.refresh(resolvedB.target, undefined, config);
+    assert.equal(forB, forA);
+    assert.equal(calls.length, 1);
+  });
+
   it("cancels an in-flight refresh and refuses work after shutdown", async () => {
     const target = await targetFor({ provider: "deepseek", baseUrl: "https://api.deepseek.com" });
     const fetchImpl = ((_input: unknown, init?: RequestInit) =>

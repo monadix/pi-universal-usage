@@ -203,7 +203,8 @@ export class UsageMonitor {
     }
     const current = entry;
     if (options.force !== true && current.nextAttemptAt > this.now()) {
-      if (current.snapshot !== undefined) return Promise.resolve(current.snapshot);
+      const cached = this.reusableSnapshot(current, target);
+      if (cached !== undefined) return Promise.resolve(cached);
       return Promise.resolve(emptySnapshot(target, "unknown", this.now(), "waiting before the next attempt"));
     }
     if (current.inFlight !== undefined) return current.inFlight;
@@ -563,6 +564,19 @@ export class UsageMonitor {
     const deferred = entry.optionalRetry ?? new Map<string, OptionalDeferral>();
     entry.optionalRetry = deferred;
     deferred.set(request.url.href, { nextAttemptAt, reason });
+  }
+
+  /**
+   * The cache key is account-level, so endpoint results are shared across the
+   * models of one credential route. A passive header snapshot instead measures
+   * one logical model's inference response: another model of the same account
+   * must not inherit it while the retry gate blocks a fresh attempt.
+   */
+  private reusableSnapshot(entry: Entry, target: ResolvedTarget): TargetSnapshot | undefined {
+    const snapshot = entry.snapshot;
+    if (snapshot === undefined) return undefined;
+    if (snapshot.source === "headers" && snapshot.identity.modelId !== target.identity.modelId) return undefined;
+    return snapshot;
   }
 
   /**
