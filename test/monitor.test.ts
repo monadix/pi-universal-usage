@@ -198,6 +198,21 @@ describe("UsageMonitor", () => {
     assert.equal(calls[0]?.headers["x-custom-auth"], "routing-auth");
   });
 
+  it("sends the Kimi quota bearer for a native API key", async () => {
+    const target = await targetFor({
+      provider: "kimi-coding",
+      baseUrl: "https://api.kimi.com/coding",
+      api: "anthropic-messages",
+    });
+    const { fetchImpl, calls } = sequenceFetch([jsonResponse({ usage: { limit: 1000, used: 250 } })]);
+    const monitor = monitorWith(fetchImpl);
+    const snapshot = await monitor.refresh(target, undefined, config);
+    assert.equal(snapshot.status, "ok");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.url, "https://api.kimi.com/coding/v1/usages");
+    assert.equal(calls[0]?.headers.authorization, "Bearer test-key");
+  });
+
   it("does not accept a Z.ai error envelope as a successful snapshot", async () => {
     const target = await targetFor({ provider: "zai", baseUrl: "https://api.z.ai/api/paas/v4", apiKey: "zai-key" });
     const { fetchImpl, calls } = sequenceFetch([

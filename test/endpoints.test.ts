@@ -9,7 +9,8 @@ import { fakeModel, fakeRegistry } from "./helpers.ts";
 async function targetFor(options: {
   provider: string;
   baseUrl: string;
-  apiKey?: string;
+  /** `null` models a resolver that returns headers without a separate API key. */
+  apiKey?: string | null;
   headers?: Record<string, string | null>;
   isOAuth?: boolean;
   api?: string;
@@ -22,7 +23,7 @@ async function targetFor(options: {
   });
   const registry = fakeRegistry(
     {
-      apiKey: options.apiKey ?? "test-key",
+      ...(options.apiKey === null ? {} : { apiKey: options.apiKey ?? "test-key" }),
       ...(options.headers !== undefined ? { headers: options.headers } : {}),
       isOAuth: options.isOAuth === true,
     },
@@ -227,6 +228,77 @@ describe("endpoints", () => {
     if (result.kind !== "requests") return;
     assert.equal(new Headers(result.requests[0]?.headers).get("authorization"), "key-A");
     assert.equal(new Headers(result.requests[0]?.headers).get("x-api-key"), "key-B");
+  });
+
+  it("sends the Kimi quota bearer for a native API key on its official origin", async () => {
+    // Pi's anthropic-messages transport resolves a Kimi API key as x-api-key;
+    // the quota endpoint documents an Authorization bearer instead.
+    const target = await targetFor({
+      provider: "kimi-coding",
+      baseUrl: "https://api.kimi.com/coding",
+      apiKey: "kimi-key",
+      api: "anthropic-messages",
+    });
+    assert.equal(target.originHeaders["x-api-key"], "kimi-key");
+    assert.equal(target.originHeaders.authorization, undefined);
+    const automatic = plan(target);
+    const pinned = plan(target, { path: "/coding/v1/usages", pathMode: "origin" });
+    for (const result of [automatic, pinned]) {
+      assert.equal(result.kind, "requests");
+      if (result.kind !== "requests") return;
+      assert.equal(result.requests[0]?.url.href, "https://api.kimi.com/coding/v1/usages");
+      assert.equal(new Headers(result.requests[0]?.headers).get("authorization"), "Bearer kimi-key");
+    }
+  });
+
+  it("keeps Kimi's explicit subscription authorization instead of replacing it", async () => {
+    const target = await targetFor({
+      provider: "kimi-coding",
+      baseUrl: "https://api.kimi.com/coding",
+      apiKey: null,
+      headers: { Authorization: "Bearer kimi-oauth-token" },
+      isOAuth: true,
+      api: "anthropic-messages",
+    });
+    const result = plan(target);
+    assert.equal(result.kind, "requests");
+    if (result.kind !== "requests") return;
+    const headers = new Headers(result.requests[0]?.headers);
+    assert.equal(headers.get("authorization"), "Bearer kimi-oauth-token");
+    assert.equal(headers.get("x-api-key"), null);
+  });
+
+  it("does not synthesize a suppressed Kimi quota bearer", async () => {
+    const target = await targetFor({
+      provider: "kimi-coding",
+      baseUrl: "https://api.kimi.com/coding",
+      apiKey: "kimi-key",
+      headers: { Authorization: null },
+      api: "anthropic-messages",
+    });
+    assert.deepEqual(target.suppressedHeaders, ["authorization"]);
+    const result = plan(target);
+    assert.equal(result.kind, "requests");
+    if (result.kind !== "requests") return;
+    const headers = new Headers(result.requests[0]?.headers);
+    assert.equal(headers.get("authorization"), null);
+    assert.equal(headers.get("x-api-key"), "kimi-key");
+  });
+
+  it("does not add a Kimi bearer on a custom origin", async () => {
+    const target = await targetFor({
+      provider: "kimi-coding",
+      baseUrl: "https://kimi-proxy.example.com/coding",
+      apiKey: "kimi-key",
+      api: "anthropic-messages",
+    });
+    const result = plan(target);
+    assert.equal(result.kind, "requests");
+    if (result.kind !== "requests") return;
+    for (const request of result.requests) {
+      assert.equal(request.url.origin, "https://kimi-proxy.example.com");
+      assert.equal(new Headers(request.headers).get("authorization"), null);
+    }
   });
 
   it("replaces protocol headers case-insensitively", async () => {

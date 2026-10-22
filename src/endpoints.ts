@@ -42,6 +42,8 @@ interface FirstPartyHint {
   protocolHeaders?: Record<string, string>;
   /** The endpoint expects the raw credential in `authorization` (no scheme prefix). */
   rawAuthorization?: boolean;
+  /** The endpoint expects the effective credential as `Authorization: Bearer`. */
+  bearerAuthorization?: boolean;
   /** Send the ChatGPT account id header extracted from the OAuth token. */
   accountIdHeader?: boolean;
 }
@@ -96,6 +98,7 @@ export const FIRST_PARTY_HINTS: readonly FirstPartyHint[] = [
     officialOrigins: ["https://api.kimi.com"],
     scheme: "kimi-json",
     sameOrigin: [{ path: "/coding/v1/usages", mode: "origin", label: "kimi coding usage" }],
+    bearerAuthorization: true,
   },
   {
     providerIds: ["zai", "z-ai", "zai-coding-plan", "glm", "zhipu", "zhipuai"],
@@ -219,8 +222,29 @@ function sameOriginHeaders(target: ResolvedTarget, hint: FirstPartyHint | undefi
     if (normalized === undefined) throw new EndpointAuthError();
     replaceHeader(headers, "authorization", normalized);
   }
+  applyBearerAuthorization(headers, target, hint);
   applyAccountIdHeader(headers, target, hint);
   return headers;
+}
+
+/**
+ * Kimi's coding quota endpoint takes the plan credential as a bearer token,
+ * but Pi's `anthropic-messages` transport resolves an ordinary Kimi API key as
+ * `x-api-key`. Normalize that effective credential into the required header.
+ * An explicit Authorization is the credential Pi already sends and wins; a
+ * suppressed one stays absent.
+ */
+function applyBearerAuthorization(
+  headers: Record<string, string>,
+  target: ResolvedTarget,
+  hint: FirstPartyHint | undefined,
+): void {
+  if (hint?.bearerAuthorization !== true) return;
+  if (authHeaderSuppressed(target, "authorization")) return;
+  if (headerValue(headers, "authorization") !== undefined) return;
+  const credential = headerValue(headers, "x-api-key")?.trim();
+  if (credential === undefined || credential === "") return;
+  replaceHeader(headers, "authorization", `Bearer ${credential}`);
 }
 
 function applyAccountIdHeader(

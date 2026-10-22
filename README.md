@@ -95,7 +95,7 @@ Elapsed resets are shown as `reset elapsed`, not silently replenished.
    | `anthropic` (OAuth only) | `https://api.anthropic.com` | `GET /api/oauth/usage` (`anthropic-version`, OAuth `anthropic-beta`) |
    | `deepseek` | `https://api.deepseek.com` | `GET /user/balance` |
    | `openrouter` | `https://openrouter.ai` | `GET /api/v1/key` (+ optional `/api/v1/credits`) |
-   | `kimi`, `kimi-coding`, `moonshot`, … | `https://api.kimi.com` | `GET /coding/v1/usages` |
+   | `kimi`, `kimi-coding`, `moonshot`, … | `https://api.kimi.com` | `GET /coding/v1/usages` (`Authorization: Bearer <coding credential>`) |
    | `zai`, `glm`, `zhipu`, … | `https://api.z.ai` | `GET /api/monitor/usage/quota/limit` (raw key in `Authorization`, no `Bearer`) |
 
    API-key credentials for `anthropic` or `openai` have no quota interface here
@@ -110,6 +110,10 @@ Elapsed resets are shown as `reset elapsed`, not silently replenished.
    official origins; custom origins keep the credentials and headers Pi
    resolved. Header normalization always acts on the effective authorization
    credential Pi resolved: a separately returned API key is never substituted.
+   Kimi's quota endpoint requires a bearer token, so the `x-api-key` credential
+   Pi's Anthropic transport resolved for an ordinary Kimi API key is normalized
+   to `Authorization: Bearer`; an explicit Authorization header is kept and a
+   suppressed one stays absent.
    An explicit `ChatGPT-Account-Id` routing header is preserved, a
    null-suppressed one stays absent, and token attribution is added only when
    neither applies. Transport defaults are synthesized per header name, so an
