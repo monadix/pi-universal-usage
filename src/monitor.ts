@@ -215,21 +215,6 @@ export class UsageMonitor {
     config: UsageConfig,
     options: { force?: boolean; signal?: AbortSignal } = {},
   ): Promise<TargetSnapshot> {
-    return this.refreshEntry(target, provider, config, options, true);
-  }
-
-  /**
-   * The body of a refresh. `mayAskAgain` is true for the caller's own request; a
-   * request that re-enters after refusing another model's joined passive
-   * measurement must not join and refuse the same way a second time.
-   */
-  private refreshEntry(
-    target: ResolvedTarget,
-    provider: ProviderConfig | undefined,
-    config: UsageConfig,
-    options: { force?: boolean; signal?: AbortSignal },
-    mayAskAgain: boolean,
-  ): Promise<TargetSnapshot> {
     if (this.closed) return Promise.resolve(emptySnapshot(target, "unknown", this.now(), "monitor is shut down"));
     const key = target.identity.key;
     let entry = this.entries.get(key);
@@ -247,18 +232,16 @@ export class UsageMonitor {
       const joinedRun = current.run;
       return joinedRun.promise.then((snapshot) => {
         // Joining shares the run's account-scoped endpoint result. A passive
-        // header measurement instead belongs to the model whose inference
-        // produced it, so it is treated as absent for this model - as the cached
-        // path does - and the model is answered through the normal path.
+        // header measurement belongs to the model whose inference produced it,
+        // so it is answered for this model without reading back or writing the
+        // cache. That continuation must never start work either: the run can be
+        // cancelled after it produced this result but before its cleanup leaves
+        // the entry, which leaves nothing for cancel() to abort.
         if (!this.measuresOtherModel(snapshot, target)) return snapshot;
-        // The joined result outlives its run's authority: a run cancelled while
-        // its promise was still pending, or a caller that was already cancelled,
-        // may not start follow-on work that would overwrite a newer measurement.
         if (joinedRun.controller.signal.aborted || options.signal?.aborted === true) {
           return cancelledSnapshot(target, this.now());
         }
-        if (!mayAskAgain) return emptySnapshot(target, "unknown", this.now(), "waiting before the next attempt");
-        return this.refreshEntry(target, provider, config, options, false);
+        return emptySnapshot(target, "unknown", this.now(), "waiting before the next attempt");
       });
     }
 
