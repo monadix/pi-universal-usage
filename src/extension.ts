@@ -87,8 +87,22 @@ interface RefreshOptions {
   model?: Model<any>;
 }
 
+/**
+ * The authority behind an accepted outcome: the accepted binding lifetime when
+ * the attempt accepted it, and the route its work was captured under. Both are
+ * read at acceptance, not when the caller resumes, because a later
+ * reconciliation that adopts another binding must lend neither to this outcome.
+ */
+interface AcceptedFacts {
+  snapshot: TargetSnapshot;
+  /** Accepted binding lifetime at acceptance. */
+  bindingEpoch: number;
+  /** Route the accepted work was captured under; the report continues under it. */
+  selection: SelectionBinding;
+}
+
 /** What one reconciliation that still owned its activation adopted. */
-type AdoptedResolution = { kind: "target"; target: ResolvedTarget } | { kind: "failure"; snapshot: TargetSnapshot };
+type AdoptedResolution = { kind: "target"; target: ResolvedTarget } | (AcceptedFacts & { kind: "failure" });
 
 /**
  * The authority one `/usage` report holds for its own work: the activation, the
@@ -101,7 +115,10 @@ interface ReportLease {
   generation: number;
   /** Effective source (identity key, or `-` while no target is reconciled). */
   source: string;
-  /** Route captured before a binding existed; omitted once this report's attempt owns the route. */
+  /**
+   * Route this report's work must still match: the capture taken before a
+   * binding existed, or the route its own attempt accepted an outcome under.
+   */
   selection?: SelectionBinding;
   /** Sanitized failure the report continues under, while it stays the accepted view. */
   acceptedFailure?: TargetSnapshot;
@@ -110,10 +127,7 @@ interface ReportLease {
 }
 
 /** The snapshot an accepted attempt produced, and how its reconciliation accepted it. */
-interface AcceptedOutcome {
-  kind: "snapshot" | "failure";
-  snapshot: TargetSnapshot;
-}
+type AcceptedOutcome = AcceptedFacts & { kind: "snapshot" | "failure" };
 
 /**
  * What one active-provider attempt established for its caller. A published
@@ -129,11 +143,6 @@ type ReportTarget = { kind: "model"; model: Model<any> } | { kind: "unresolved";
 
 function sameLogicalModel(left: Model<any>, right: Model<any>): boolean {
   return left.provider === right.provider && left.id === right.id;
-}
-
-/** An attempt that published a snapshot accepted it; one that published nothing accepted nothing. */
-function publishedOutcome(snapshot: TargetSnapshot | undefined): ActiveOutcome {
-  return snapshot === undefined ? { kind: "none" } : { kind: "snapshot", snapshot };
 }
 
 /**
@@ -169,7 +178,7 @@ export class UniversalUsageHost {
   private bindingEpoch = 0;
   /** Work shared by concurrent refreshes of one source and route; never aborted by a same-target join. */
   private refreshWork:
-    | { key: string; generation: number; routing: string; controller: AbortController; promise: Promise<TargetSnapshot | undefined> }
+    | { key: string; generation: number; routing: string; controller: AbortController; promise: Promise<ActiveOutcome> }
     | undefined;
   /** The target that started the current turn; passive headers need this attribution. */
   private passiveAttribution: { identityKey: string; generation: number } | undefined;
@@ -319,7 +328,8 @@ export class UniversalUsageHost {
         ? { kind: "target", target: options.resolved }
         : await this.reconcileActive(ctx, model, { generation, revision, selection });
     if (adopted === undefined) return { kind: "none" };
-    if (adopted.kind === "failure") return { kind: "failure", snapshot: adopted.snapshot };
+    // The failure already carries the binding lifetime and route it adopted.
+    if (adopted.kind === "failure") return adopted;
     const target = adopted.target;
     // This request is bound to the reconciled source: the captured activation,
     // route and cancellation decide, not the reconciliation order.
@@ -339,14 +349,16 @@ export class UniversalUsageHost {
       existing.key === key &&
       existing.routing === selection.routing
     ) {
-      return publishedOutcome(await existing.promise);
+      // The shared publication carries the binding it published under, so this
+      // caller reports under that lifetime instead of whatever is current later.
+      return await existing.promise;
     }
     this.abortRefresh();
 
     const controller = new AbortController();
     this.lastAutoRefreshAt = this.now();
     const work: WorkLease = { ...bound, signal: controller.signal };
-    const promise = (async (): Promise<TargetSnapshot | undefined> => {
+    const promise = (async (): Promise<ActiveOutcome> => {
       const snapshot = await this.monitor.refresh(
         target,
         this.config.providers.get(target.identity.providerId),
@@ -355,14 +367,17 @@ export class UniversalUsageHost {
       );
       // A cancelled run, a replaced activation, a rotated source, or a live
       // selection that moved without an event may not publish.
-      if (!this.holdsWork(work, ctx)) return undefined;
+      if (!this.holdsWork(work, ctx)) return { kind: "none" };
+      // The binding accepted here is the one this publication holds authority
+      // under; capture it before publishing, never after the caller resumes.
+      const bindingEpoch = this.bindingEpoch;
       this.lastSnapshot = snapshot;
       this.paint(ctx);
-      return snapshot;
+      return { kind: "snapshot", snapshot, bindingEpoch, selection };
     })();
     this.refreshWork = { key, generation, routing: selection.routing, controller, promise };
     try {
-      return publishedOutcome(await promise);
+      return await promise;
     } finally {
       if (this.refreshWork?.promise === promise) this.refreshWork = undefined;
     }
@@ -441,7 +456,8 @@ export class UniversalUsageHost {
       };
       this.lastSnapshot = snapshot;
       this.paint(ctx);
-      return { kind: "failure", snapshot };
+      // The failure's authority is the target-less binding it just adopted.
+      return { kind: "failure", snapshot, bindingEpoch: this.bindingEpoch, selection: lease.selection };
     }
     const previous = this.active?.target?.identity.key;
     this.bindActive({ model, selection: lease.selection, target: resolution.target });
@@ -579,11 +595,12 @@ export class UniversalUsageHost {
         const anchor = this.activeReportAnchor(outcome);
         if (anchor === undefined) return;
         // The attempt's own outcome owns the report from here on: it re-anchors
-        // the accepted source and epoch, drops the pre-adoption route capture,
-        // and pins its adopted failure or clears the pin when it adopts a target.
+        // the source, epoch, and route it was accepted under instead of reading
+        // them from state other work may have changed since, and pins its adopted
+        // failure or clears the pin when it adopts a target.
         lease.source = anchor;
-        lease.bindingEpoch = this.bindingEpoch;
-        lease.selection = undefined;
+        lease.bindingEpoch = outcome.bindingEpoch;
+        lease.selection = outcome.selection;
         lease.acceptedFailure = outcome.kind === "failure" ? outcome.snapshot : undefined;
         snapshot = outcome.snapshot;
       } else {
@@ -632,9 +649,11 @@ export class UniversalUsageHost {
    * snapshot anchors while the host still holds the source it was accepted for;
    * an adopted sanitized failure anchors while it is still the accepted view.
    * Both are checked against what the attempt itself established, never inferred
-   * from later state.
+   * from later state: a binding adopted after the acceptance, even one for the
+   * same effective identity, cannot supply the report with its own epoch.
    */
   private activeReportAnchor(outcome: AcceptedOutcome): string | undefined {
+    if (this.bindingEpoch !== outcome.bindingEpoch) return undefined;
     if (outcome.kind === "snapshot") {
       const current = this.activeSourceToken();
       return current === outcome.snapshot.identity.key ? current : undefined;
@@ -651,9 +670,9 @@ export class UniversalUsageHost {
    * all still hold. The binding epoch, not the source string alone, decides the
    * lifetime: one accepted binding replaced by another is not the same authority,
    * even when a later one returns to the same source or failure route. The route
-   * check prefers the report's own pre-adoption capture, because a binding
-   * adopted after the report started belongs to that other work until this
-   * report's own attempt replaces the capture.
+   * check uses the report's own capture, because a binding adopted after the
+   * report started belongs to that other work until this report's own attempt
+   * accepts an outcome and pins the route it was accepted under.
    */
   private reportStillValid(lease: ReportLease, ctx: ExtensionContext): boolean {
     if (lease.bindingEpoch !== this.bindingEpoch) return false;

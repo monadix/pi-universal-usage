@@ -2913,6 +2913,73 @@ describe("host routing binding", () => {
     host.shutdown(fake.ctx);
   });
 
+  it("stops an accepted report when another route's binding is adopted before it anchors", async () => {
+    let releaseActiveGet: (() => void) | undefined;
+    const activeGetGate = new Promise<void>((resolve) => {
+      releaseActiveGet = resolve;
+    });
+    const activeCalls: string[] = [];
+    const peerCalls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes("api.deepseek.com")) {
+        peerCalls.push(url);
+        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
+      }
+      activeCalls.push(url);
+      if (activeCalls.length === 1) await activeGetGate;
+      return codexBody(activeCalls.length === 1 ? 11 : 22);
+    }) as typeof fetch;
+    // Pi authentication overrides the declared base URL, so both selections share
+    // one effective identity while their captured routes differ.
+    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth =>
+      model.provider === "cpa"
+        ? { apiKey: "key-a", source: "stored", baseUrl: "https://effective.example/v1" }
+        : { apiKey: "peer-key", source: "stored" };
+    const declared = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://a.example/v1" });
+    const rerouted = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://b.example/v1" });
+    const peer = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [declared, rerouted, peer],
+      auth,
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false, providers: { deepseek: { enabled: true } } }),
+    });
+    const selection = { current: declared };
+    const fake = fakeContext({ modelRef: selection, registry });
+    await host.activate(fake.ctx, declared, { refresh: false });
+
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => activeCalls.length === 1);
+
+    // At the accepted 11% status publication, the live selection silently moves to
+    // another declared route that resolves to the same effective identity, and a
+    // newer reconciliation adopts that route before the report resumes.
+    const statuses = fake.ctx.ui.setStatus.bind(fake.ctx.ui);
+    let reroutedWork: Promise<unknown> | undefined;
+    fake.ctx.ui.setStatus = (key: string, text: string | undefined) => {
+      statuses(key, text);
+      if (reroutedWork === undefined && String(text ?? "").includes("11%")) {
+        selection.current = rerouted;
+        reroutedWork = host.refreshActive(fake.ctx, { reason: "interval", force: true });
+      }
+    };
+    releaseActiveGet?.();
+    await pending;
+    await reroutedWork;
+
+    assert.equal(activeCalls.length, 2, "the rerouted selection still refreshes");
+    assert.equal(peerCalls.length, 0, "the obsolete report collects no peer under the new binding");
+    assert.equal(fake.widgets.length, 0, "no obsolete report is published");
+    assert.equal(fake.notifications.length, 0);
+    assert.equal(pi.entries.length, 0);
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /22%/);
+    host.shutdown(fake.ctx);
+  });
+
   it("joins an equivalent-header command to the same HTTP sequence", async () => {
     let release: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {
