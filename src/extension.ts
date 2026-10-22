@@ -202,6 +202,10 @@ export class UniversalUsageHost {
     }
     const target = options.resolved ?? (await this.reconcileActive(ctx, model, generation, revision));
     if (target === undefined || this.disposed || generation !== this.generation) return undefined;
+    // An unreported same-ID selection can move the live route while the
+    // credential resolves; the resolved target then describes a route the host
+    // can no longer verify, so no request is started for it.
+    if (this.selectedRoutingChanged(ctx)) return undefined;
 
     const key = target.identity.key;
     const existing = this.refreshWork;
@@ -221,6 +225,9 @@ export class UniversalUsageHost {
       );
       if (controller.signal.aborted) return undefined;
       if (this.disposed || generation !== this.generation) return undefined;
+      // The response belongs to the route this request was planned for. A live
+      // selection that moved without an event makes publication ambiguous.
+      if (this.selectedRoutingChanged(ctx)) return undefined;
       if (this.active?.target?.identity.key !== snapshot.identity.key) return undefined;
       this.lastSnapshot = snapshot;
       this.paint(ctx);
@@ -378,10 +385,10 @@ export class UniversalUsageHost {
       // A model switch, shutdown, or effective source change cancels the report
       // silently: it must not fetch the next provider or publish measurements
       // from an older source.
-      if (this.reportCancelled(generation, source)) return;
+      if (this.reportCancelled(ctx, generation, source)) return;
       if (snapshot !== undefined) snapshots.push(snapshot);
     }
-    if (this.reportCancelled(generation, source)) return;
+    if (this.reportCancelled(ctx, generation, source)) return;
     const active = this.lastSnapshot;
     const activeTargetKey = this.active?.target?.identity.key;
     // With no reconciled target the last snapshot is this attempt's failure
@@ -393,7 +400,7 @@ export class UniversalUsageHost {
 
     const lines = formatReport(snapshots, this.config, this.now());
     // Pi rejects a stale context after a reload; stop before touching it.
-    if (this.reportCancelled(generation, source)) return;
+    if (this.reportCancelled(ctx, generation, source)) return;
     if (ctx.hasUI) {
       ctx.ui.setWidget(REPORT_WIDGET_KEY, lines);
       ctx.ui.notify("pi-universal-usage: report updated", "info");
@@ -415,11 +422,24 @@ export class UniversalUsageHost {
    * A report may only continue and publish within the activation generation it
    * started in. When a source token is supplied, the effective credential and
    * routing must also be unchanged; the active provider's own reconciliation is
-   * exempt because it re-anchors the report.
+   * exempt because it re-anchors the report. A live selection that moved to
+   * another route without an event invalidates either kind of report.
    */
-  private reportCancelled(generation: number, source?: string): boolean {
+  private reportCancelled(ctx: ExtensionCommandContext, generation: number, source?: string): boolean {
     if (this.disposed || generation !== this.generation) return true;
+    if (this.selectedRoutingChanged(ctx)) return true;
     return source !== undefined && this.activeSourceToken() !== source;
+  }
+
+  /**
+   * True when the live selection moved to another route for the same logical
+   * model without a `model_select`. Pi's model-equality check ignores base URL
+   * and routing headers, so such a selection is only visible through the live
+   * model getter and must end work bound to the previous route.
+   */
+  private selectedRoutingChanged(ctx: ExtensionContext): boolean {
+    const active = this.active;
+    return active !== undefined && unreportedRoutingChange(ctx.model, active);
   }
 
   /** Idempotent cleanup for reload, session replacement, and quit. */
@@ -508,7 +528,7 @@ export class UniversalUsageHost {
       return this.refreshActive(ctx, { reason: "command", force: true, model });
     }
     const resolution = await resolveTarget(ctx.modelRegistry, model, { allowInsecureHttp: true });
-    if (this.reportCancelled(generation, source)) return undefined;
+    if (this.reportCancelled(ctx, generation, source)) return undefined;
     if (!resolution.ok) {
       return {
         identity: resolution.identity,
@@ -527,7 +547,7 @@ export class UniversalUsageHost {
     );
     // The monitor may return a cancelled or post-shutdown placeholder snapshot;
     // a stale report discards it instead of reporting it as quota data.
-    if (this.reportCancelled(generation, source)) return undefined;
+    if (this.reportCancelled(ctx, generation, source)) return undefined;
     return snapshot;
   }
 

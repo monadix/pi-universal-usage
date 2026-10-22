@@ -54,6 +54,8 @@ interface FakeContext {
 
 function fakeContext(options: {
   model?: ReturnType<typeof fakeModel>;
+  /** Live selection read through a `model` getter, for silent same-ID route changes. */
+  modelRef?: { current: ReturnType<typeof fakeModel> };
   registry: unknown;
   mode?: "tui" | "print" | "rpc" | "json";
   hasUI?: boolean;
@@ -82,6 +84,11 @@ function fakeContext(options: {
     cwd: "/tmp",
     simpleStream: undefined,
   } as unknown as ExtensionContext;
+  if (options.modelRef !== undefined) {
+    // Pi exposes the selection as a live getter, so an unreported same-ID
+    // replacement is observable without a model_select event.
+    Object.defineProperty(ctx, "model", { get: () => options.modelRef?.current, enumerable: true, configurable: true });
+  }
   return { ctx, statuses, widgets, notifications };
 }
 
@@ -669,9 +676,13 @@ describe("pi extension wiring", () => {
     const modelA = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
     const modelB = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:9999/v1" });
     const { pi, host, registry } = buildHost({ fetchImpl, models: [modelA, modelB] });
-    const fake = fakeContext({ model: modelA, registry });
+    // Pi installs the new model object before it emits model_select, so the
+    // live selection already reads modelB when the handler runs.
+    const selection = { current: modelA };
+    const fake = fakeContext({ modelRef: selection, registry });
     await pi.emit("session_start", { type: "session_start" }, fake.ctx);
     await waitFor(() => calls.length === 1);
+    selection.current = modelB;
     await pi.emit("model_select", { type: "model_select", model: modelB, previousModel: modelA, source: "set" }, fake.ctx);
     await waitFor(() => calls.length === 2);
     assert.match(calls[1]?.url ?? "", /localhost:9999/);
@@ -867,7 +878,8 @@ describe("pi extension wiring", () => {
       return { apiKey: "key-a", baseUrl: selected.baseUrl };
     };
     const { pi, host, registry } = buildHost({ fetchImpl, models: [modelA, modelB], auth });
-    const fake = fakeContext({ model: modelA, registry });
+    const selection = { current: modelA };
+    const fake = fakeContext({ modelRef: selection, registry });
     await pi.emit("session_start", { type: "session_start" }, fake.ctx);
     await waitFor(() => calls.length === 1);
     assert.match(calls[0]?.url ?? "", /localhost:8317/);
@@ -875,6 +887,9 @@ describe("pi extension wiring", () => {
     holdNext = true;
     const older = host.refreshActive(fake.ctx, { reason: "older", force: true, model: modelA });
     await waitFor(() => heldStarted);
+    // The live selection moves to the newer same-ID route while the older
+    // reconciliation is still pending.
+    selection.current = modelB;
     const newer = host.refreshActive(fake.ctx, { reason: "newer", force: true, model: modelB });
     await newer;
     await waitFor(() => calls.length === 2);
@@ -1172,6 +1187,141 @@ describe("pi extension wiring", () => {
     // published under it.
     currentKey = "key-b";
     await host.refreshActive(fake.ctx, { reason: "interval" });
+    release?.();
+    await pending;
+    assert.equal(fake.widgets.length, 0);
+    assert.equal(fake.notifications.length, 0);
+    host.shutdown(activation.ctx);
+  });
+
+  it("discards a pending active refresh when the live selection changes route without an event", async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const calls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      calls.push(url);
+      await gate;
+      return codexBody(88);
+    }) as typeof fetch;
+    const modelA = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://a.example.com/v1" });
+    const modelB = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://b.example.com/v1" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [modelA, modelB],
+      config: normalizeConfig({ refreshSeconds: 300, autoRefresh: false }),
+    });
+    const activation = fakeContext({ model: modelA, registry, mode: "rpc" });
+    await pi.emit("session_start", { type: "session_start" }, activation.ctx);
+    assert.equal(calls.length, 0);
+
+    const selection = { current: modelA };
+    const fake = fakeContext({ modelRef: selection, registry });
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => calls.length === 1);
+
+    // Pi replaces the selected model object without model_select because
+    // provider, id, and type still match. The request in flight belongs to A.
+    selection.current = modelB;
+    release?.();
+    await pending;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(calls.length, 1);
+    assert.equal(fake.statuses.length, 0);
+    assert.equal(fake.widgets.length, 0);
+    assert.equal(fake.notifications.length, 0);
+    host.shutdown(activation.ctx);
+  });
+
+  it("discards a pending report credential resolution after an unreported route change", async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let heldStarted = false;
+    const calls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      calls.push(url);
+      if (url.includes("api.deepseek.com")) return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
+      return codexBody(15);
+    }) as typeof fetch;
+    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
+      if (model.provider === "deepseek") {
+        heldStarted = true;
+        return { apiKey: "test-key", baseUrl: model.baseUrl, wait: gate };
+      }
+      return { apiKey: "test-key", baseUrl: model.baseUrl };
+    };
+    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://a.example.com/v1" });
+    const cpaMoved = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://b.example.com/v1" });
+    const deepseek = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [cpa, deepseek],
+      auth,
+      config: normalizeConfig({ providers: { deepseek: { enabled: true } } }),
+    });
+    const activation = fakeContext({ model: cpa, registry, mode: "rpc" });
+    await pi.emit("model_select", { type: "model_select", model: cpa, previousModel: undefined, source: "set" }, activation.ctx);
+
+    const selection = { current: cpa };
+    const fake = fakeContext({ modelRef: selection, registry });
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => heldStarted);
+    assert.equal(calls.length, 1);
+
+    // The active provider's snapshot is already collected while the next
+    // provider's credential resolution is still pending.
+    selection.current = cpaMoved;
+    release?.();
+    await pending;
+    assert.equal(calls.length, 1);
+    assert.equal(fake.widgets.length, 0);
+    assert.equal(fake.notifications.length, 0);
+    host.shutdown(activation.ctx);
+  });
+
+  it("discards a report waiting on another provider after an unreported route change", async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const calls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      calls.push(url);
+      if (url.includes("api.deepseek.com")) {
+        await gate;
+        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
+      }
+      return codexBody(15);
+    }) as typeof fetch;
+    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://a.example.com/v1" });
+    const cpaMoved = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://b.example.com/v1" });
+    const deepseek = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [cpa, deepseek],
+      config: normalizeConfig({ providers: { deepseek: { enabled: true } } }),
+    });
+    const activation = fakeContext({ model: cpa, registry, mode: "rpc" });
+    await pi.emit("model_select", { type: "model_select", model: cpa, previousModel: undefined, source: "set" }, activation.ctx);
+
+    const selection = { current: cpa };
+    const fake = fakeContext({ modelRef: selection, registry });
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => calls.some((url) => url.includes("api.deepseek.com")));
+
+    selection.current = cpaMoved;
     release?.();
     await pending;
     assert.equal(fake.widgets.length, 0);
