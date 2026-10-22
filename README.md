@@ -222,10 +222,14 @@ creating a 1 ms timer.
   only when a `turn_start` bound the current turn to the active target, and only
   when the headers carry a quota dimension. A model or credential switch inside
   a turn discards passive attribution until the next turn; a fresh endpoint
-  snapshot always wins over passive headers. A passive measurement stays bound
-  to the logical model whose inference response produced it: another model of
-  the same provider and credential route still shares the account-level
-  endpoint cache and its retry gate, but never inherits that measurement.
+  snapshot always wins over passive headers. Pi emits no `model_select` when a
+  selection keeps the provider, model id, and type but changes the base URL, so
+  the turn boundary and the response both compare the selected model's routing:
+  attribution is refused instead of filing that route's headers under the
+  previously bound one. A passive measurement stays bound to the logical model
+  whose inference response produced it: another model of the same provider and
+  credential route still shares the account-level endpoint cache and its retry
+  gate, but never inherits that measurement.
 - A model switch cancels in-flight work, detaches the cancelled request so a
   replacement starts fresh, clears the previous provider's snapshot, and marks
   the result generation so a late answer cannot paint the new provider. A

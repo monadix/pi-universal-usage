@@ -924,4 +924,69 @@ describe("pi extension wiring", () => {
     assert.match(String(fake.statuses[fake.statuses.length - 1]), /req 75%/);
     host.shutdown(fake.ctx);
   });
+
+  it("refuses passive attribution for a same-ID routing change Pi did not report", async () => {
+    const { fetchImpl, calls } = sequenceFetch([codexBody(12)]);
+    const modelA = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://a.example.com/v1" });
+    const modelB = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://b.example.com/v1" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [modelA, modelB],
+      config: normalizeConfig({ refreshSeconds: 300, autoRefresh: false }),
+    });
+    const fake = fakeContext({ model: modelA, registry, idle: false });
+    await pi.emit("session_start", { type: "session_start" }, fake.ctx);
+    assert.equal(calls.length, 0);
+
+    // Pi's setModel() updates the selection but suppresses model_select for a
+    // same provider/id/type model, even when its base URL changed. Only ctx.model
+    // reveals routing B, so its headers must not land on A's identity.
+    const selected = fakeContext({ model: modelB, registry, idle: false });
+    await pi.emit("turn_start", { type: "turn_start", turnIndex: 0, timestamp: Date.now() }, selected.ctx);
+    await pi.emit(
+      "after_provider_response",
+      { status: 200, headers: { "x-codex-secondary-used-percent": "90" } },
+      selected.ctx,
+    );
+    assert.equal(selected.statuses.length, 0);
+    assert.equal(calls.length, 0);
+
+    // An unreported selection of the same routing keeps attribution sound.
+    const sameRoute = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://a.example.com/v1" });
+    const unchanged = fakeContext({ model: sameRoute, registry, idle: false });
+    await pi.emit("turn_start", { type: "turn_start", turnIndex: 1, timestamp: Date.now() }, unchanged.ctx);
+    await pi.emit(
+      "after_provider_response",
+      { status: 200, headers: { "x-ratelimit-limit-requests": "100", "x-ratelimit-remaining-requests": "25" } },
+      unchanged.ctx,
+    );
+    assert.match(String(unchanged.statuses[unchanged.statuses.length - 1]), /req 75%/);
+    host.shutdown(fake.ctx);
+  });
+
+  it("discards passive headers when the selection moves before the response", async () => {
+    const { fetchImpl, calls } = sequenceFetch([codexBody(12)]);
+    const modelA = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://a.example.com/v1" });
+    const modelB = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://b.example.com/v1" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [modelA, modelB],
+      config: normalizeConfig({ refreshSeconds: 300, autoRefresh: false }),
+    });
+    const fake = fakeContext({ model: modelA, registry, idle: false });
+    await pi.emit("session_start", { type: "session_start" }, fake.ctx);
+    // The turn begins on A's routing, so the boundary itself is sound.
+    await pi.emit("turn_start", { type: "turn_start", turnIndex: 0, timestamp: Date.now() }, fake.ctx);
+
+    // The selection moves to the unreported same-ID routing before the answer.
+    const moved = fakeContext({ model: modelB, registry, idle: false });
+    await pi.emit(
+      "after_provider_response",
+      { status: 200, headers: { "x-ratelimit-limit-requests": "100", "x-ratelimit-remaining-requests": "25" } },
+      moved.ctx,
+    );
+    assert.equal(moved.statuses.length, 0);
+    assert.equal(calls.length, 0);
+    host.shutdown(fake.ctx);
+  });
 });

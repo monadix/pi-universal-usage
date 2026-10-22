@@ -43,6 +43,21 @@ function sameLogicalModel(left: Model<any>, right: Model<any>): boolean {
   return left.provider === right.provider && left.id === right.id;
 }
 
+function sameModelRouting(left: Model<any>, right: Model<any>): boolean {
+  return left.baseUrl === right.baseUrl && left.api === right.api;
+}
+
+/**
+ * Pi suppresses `model_select` when the provider, model id, and type are
+ * unchanged, even if the new model object points at another base URL. Such a
+ * selection is a routing change the host otherwise cannot observe, so header
+ * attribution has to check it explicitly. A different logical model always
+ * emits `model_select` and invalidates the activation generation instead.
+ */
+function unreportedRoutingChange(selected: Model<any> | undefined, activeModel: Model<any>): boolean {
+  return selected !== undefined && sameLogicalModel(selected, activeModel) && !sameModelRouting(selected, activeModel);
+}
+
 export class UniversalUsageHost {
   private readonly pi: ExtensionAPI;
   private readonly monitor: UsageMonitor;
@@ -109,8 +124,8 @@ export class UniversalUsageHost {
       await this.activate(ctx, event.model, { refresh: this.backgroundAllowed(ctx) });
     });
 
-    this.pi.on("turn_start", async () => {
-      this.markTurnBoundary();
+    this.pi.on("turn_start", async (_event, ctx) => {
+      this.markTurnBoundary(ctx);
     });
 
     this.pi.on("agent_end", async (_event, ctx) => {
@@ -300,6 +315,12 @@ export class UniversalUsageHost {
     if (this.disposed || active?.target === undefined || attribution === undefined) return;
     if (attribution.generation !== this.generation) return;
     if (attribution.identityKey !== active.target.identity.key) return;
+    // The response carries no model identity. If the selection moved to another
+    // routing while the turn ran, these headers cannot be attributed at all.
+    if (unreportedRoutingChange(ctx.model, active.model)) {
+      this.passiveAttribution = undefined;
+      return;
+    }
     if (ctx.isIdle()) return;
     const snapshot = this.monitor.applyPassiveHeaders(active.target, headers, status, this.config);
     if (snapshot === undefined) return;
@@ -308,9 +329,16 @@ export class UniversalUsageHost {
   }
 
   /** A new turn is the only sound boundary for passive response attribution. */
-  private markTurnBoundary(): void {
+  private markTurnBoundary(ctx: ExtensionContext): void {
     const active = this.active;
     if (this.disposed || active?.target === undefined) {
+      this.passiveAttribution = undefined;
+      return;
+    }
+    // A same-ID selection Pi did not report (a changed base URL is not part of
+    // its model equality check) is unknown routing for this turn. Refuse
+    // attribution instead of filing its headers under the previously bound one.
+    if (unreportedRoutingChange(ctx.model, active.model)) {
       this.passiveAttribution = undefined;
       return;
     }
