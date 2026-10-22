@@ -3191,6 +3191,110 @@ describe("host routing binding", () => {
     host.shutdown(fake.ctx);
   });
 
+  it("does not hand a valid report a stale owner's cancelled peer run", async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let peerCalls = 0;
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (!url.includes("peer.example.com")) return codexBody(12);
+      peerCalls += 1;
+      if (peerCalls === 1) {
+        await gate;
+        // The first report's discovery would continue here; its lease is gone.
+        return textResponse("not found", { status: 404 });
+      }
+      return codexBody(25);
+    }) as typeof fetch;
+    let currentKey = "key-a";
+    const auth = (model: ReturnType<typeof fakeModel>): FakeAuth =>
+      model.provider === "cpa"
+        ? { apiKey: currentKey, source: "stored" }
+        : { apiKey: "peer-key", source: "stored" };
+    const active = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://a.example/v1" });
+    const peer = fakeModel({ provider: "peer", id: "chat", baseUrl: "https://peer.example.com/v1" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [active, peer],
+      auth,
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false, providers: { peer: { enabled: true } } }),
+    });
+    const selection = { current: active };
+    const first = fakeContext({ modelRef: selection, registry });
+    const second = fakeContext({ modelRef: selection, registry });
+    await host.activate(first.ctx, active, { refresh: false });
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+
+    // The first report owns the held peer run; its own lease then expires when
+    // the active credential rotates, while the later report keeps its authority.
+    const firstReport = command.handler("", first.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => peerCalls === 1);
+    currentKey = "key-b";
+    const secondReport = command.handler("", second.ctx as unknown as ExtensionCommandContext);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    release?.();
+    await Promise.all([firstReport, secondReport]);
+
+    assert.equal(peerCalls, 2, "the eligible report starts its own peer work");
+    assert.equal(first.widgets.length + first.notifications.length, 0, "the expired report publishes nothing");
+    assert.equal(second.widgets.length, 1, "the eligible report publishes");
+    const text = (second.widgets[0]?.lines ?? []).join("\n");
+    assert.doesNotMatch(text, /refresh cancelled/);
+    assert.match(text, /peer\/chat/);
+    assert.match(text, /25%/);
+    host.shutdown(first.ctx);
+  });
+
+  it("still shares a peer run whose owner remains eligible", async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let peerCalls = 0;
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (!url.includes("peer.example.com")) return codexBody(12);
+      peerCalls += 1;
+      await gate;
+      return codexBody(25);
+    }) as typeof fetch;
+    const active = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://a.example/v1" });
+    const peer = fakeModel({ provider: "peer", id: "chat", baseUrl: "https://peer.example.com/v1" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [active, peer],
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false, providers: { peer: { enabled: true } } }),
+    });
+    const selection = { current: active };
+    const first = fakeContext({ modelRef: selection, registry });
+    const second = fakeContext({ modelRef: selection, registry });
+    await host.activate(first.ctx, active, { refresh: false });
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+
+    const firstReport = command.handler("", first.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => peerCalls === 1);
+    const secondReport = command.handler("", second.ctx as unknown as ExtensionCommandContext);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    release?.();
+    await Promise.all([firstReport, secondReport]);
+
+    assert.equal(peerCalls, 1, "an eligible owner's run is still shared");
+    for (const fake of [first, second]) {
+      assert.equal(fake.widgets.length, 1);
+      const text = (fake.widgets[0]?.lines ?? []).join("\n");
+      assert.match(text, /peer\/chat/);
+      assert.match(text, /25%/);
+      assert.doesNotMatch(text, /refresh cancelled/);
+    }
+    host.shutdown(first.ctx);
+  });
+
   it("keeps the captured route and resolver input when the selected model is mutated in place", async () => {
     const model = fakeModel({
       provider: "cpa",

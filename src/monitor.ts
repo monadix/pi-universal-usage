@@ -38,9 +38,10 @@ interface OptionalDeferral {
 }
 
 /**
- * One entry-owned refresh run. The promise concurrent refreshes join and the
- * controller that cancels the request sequence travel together, so joining,
- * aborting, detaching and ownership checks all consult a single index.
+ * One entry-owned refresh run. The promise concurrent refreshes join, the
+ * controller that cancels the request sequence, and the continuation authority
+ * of the caller that started it travel together, so joining, aborting, detaching
+ * and ownership checks all consult a single index.
  */
 interface Run {
   readonly controller: AbortController;
@@ -50,6 +51,12 @@ interface Run {
    * network await already owns its entry.
    */
   promise: Promise<TargetSnapshot>;
+  /**
+   * The starting caller's own continuation authority, when it supplied one. It
+   * stays with this run: a joiner never inherits it, and a run whose owner has
+   * lost that authority is replaced instead of joined.
+   */
+  mayContinue?: () => boolean;
 }
 
 interface Entry {
@@ -207,7 +214,8 @@ export class UsageMonitor {
   /**
    * Refresh one target. Concurrent calls for the same identity share one request
    * sequence, and a joined account-scoped result is theirs too; a passive header
-   * measurement of another logical model is not.
+   * measurement of another logical model is not. A run is only joined while the
+   * caller that started it still holds its own continuation authority.
    */
   refresh(
     target: ResolvedTarget,
@@ -229,27 +237,35 @@ export class UsageMonitor {
       return Promise.resolve(emptySnapshot(target, "unknown", this.now(), "waiting before the next attempt"));
     }
     if (current.run !== undefined) {
-      const joinedRun = current.run;
-      return joinedRun.promise.then((snapshot) => {
-        // Joining shares the run's account-scoped endpoint result. A passive
-        // header measurement belongs to the model whose inference produced it,
-        // so it is answered for this model without reading back or writing the
-        // cache. That continuation must never start work either: the run can be
-        // cancelled after it produced this result but before its cleanup leaves
-        // the entry, which leaves nothing for cancel() to abort.
-        if (!this.measuresOtherModel(snapshot, target)) return snapshot;
-        if (joinedRun.controller.signal.aborted || options.signal?.aborted === true) {
-          return cancelledSnapshot(target, this.now());
-        }
-        return emptySnapshot(target, "unknown", this.now(), "waiting before the next attempt");
-      });
+      const joined = current.run;
+      // Continuation authority belongs to the caller that started the run. A
+      // caller that still holds a valid lease must not inherit a cancellation
+      // decided by an owner that has since lost its own, so such a run is
+      // detached and the eligible caller starts fresh work instead. A run with no
+      // caller-supplied check, and one whose owner is still eligible, is shared.
+      if (joined.mayContinue === undefined || joined.mayContinue()) {
+        return joined.promise.then((snapshot) => {
+          // Joining shares the run's account-scoped endpoint result. A passive
+          // header measurement belongs to the model whose inference produced it,
+          // so it is answered for this model without reading back or writing the
+          // cache. That continuation must never start work either: the run can be
+          // cancelled after it produced this result but before its cleanup leaves
+          // the entry, which leaves nothing for cancel() to abort.
+          if (!this.measuresOtherModel(snapshot, target)) return snapshot;
+          if (joined.controller.signal.aborted || options.signal?.aborted === true) {
+            return cancelledSnapshot(target, this.now());
+          }
+          return emptySnapshot(target, "unknown", this.now(), "waiting before the next attempt");
+        });
+      }
+      this.detach(current, joined);
     }
 
     // One record owns the request sequence and the controller that cancels it.
     // Install it before any work starts, so even a path that answers without a
     // network await is joinable and cancellable through its entry; its promise
     // is attached immediately below.
-    const run = { controller: new AbortController() } as Run;
+    const run = { controller: new AbortController(), mayContinue: options.mayContinue } as Run;
     current.run = run;
     run.promise = this.executeRun(target, provider, config, current, run, options.signal, options.mayContinue).finally(() => {
       // A cancelled entry may already have installed a replacement run.
