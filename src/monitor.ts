@@ -294,12 +294,18 @@ export class UsageMonitor {
   cancel(): void {
     for (const entry of this.entries.values()) {
       const run = entry.run;
-      if (run === undefined) continue;
-      // Detach before aborting: no listener or late continuation may see the
-      // cancelled run as the entry's owner.
-      entry.run = undefined;
-      run.controller.abort();
+      if (run !== undefined) this.detach(entry, run);
     }
+  }
+
+  /**
+   * Detach one run from its entry and abort it. A cancelled run must never stay
+   * joinable, or a replacement would inherit its cancellation, while a run that
+   * has already been replaced must not detach its replacement.
+   */
+  private detach(entry: Entry, run: Run): void {
+    if (entry.run === run) entry.run = undefined;
+    run.controller.abort();
   }
 
   /** Idempotent shutdown: abort in-flight requests, forget cached state, refuse new work. */
@@ -322,7 +328,8 @@ export class UsageMonitor {
 
   /**
    * Run one request sequence for an installed run, forwarding the caller's
-   * cancellation signal onto the run's own controller.
+   * cancellation onto the run's own controller. Cancellation detaches first, so
+   * a replacement never joins work its parent aborted.
    */
   private async executeRun(
     target: ResolvedTarget,
@@ -332,12 +339,16 @@ export class UsageMonitor {
     run: Run,
     parent: AbortSignal | undefined,
   ): Promise<TargetSnapshot> {
-    const abortFromParent = () => run.controller.abort();
+    const abortFromParent = () => this.detach(entry, run);
     const forwardParent = parent !== undefined && !parent.aborted;
     if (forwardParent) parent.addEventListener("abort", abortFromParent, { once: true });
 
     try {
-      if (parent?.aborted === true) return cancelledSnapshot(target, this.now());
+      if (parent?.aborted === true) {
+        // An already-cancelled caller must not leave a joinable run behind.
+        this.detach(entry, run);
+        return cancelledSnapshot(target, this.now());
+      }
       return await this.runPlan(target, provider, config, entry, run);
     } finally {
       if (forwardParent) parent?.removeEventListener("abort", abortFromParent);

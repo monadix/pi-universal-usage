@@ -909,6 +909,63 @@ describe("UsageMonitor", () => {
     assert.equal(call, 2);
   });
 
+  it("detaches a run whose parent signal is aborted so a replacement starts", async () => {
+    const target = await targetFor({ provider: "deepseek", baseUrl: "https://api.deepseek.com" });
+    const parent = new AbortController();
+    let releaseOld: (() => void) | undefined;
+    const oldGate = new Promise<void>((resolve) => {
+      releaseOld = resolve;
+    });
+    let call = 0;
+    const fetchImpl = (async () => {
+      call += 1;
+      if (call === 1) {
+        await oldGate;
+        return jsonResponse({ is_available: true, balance_infos: [{ currency: "USD", total_balance: "11" }] });
+      }
+      return jsonResponse({ is_available: true, balance_infos: [{ currency: "USD", total_balance: "22" }] });
+    }) as typeof fetch;
+    const monitor = monitorWith(fetchImpl);
+
+    const cancelledRun = monitor.refresh(target, undefined, config, { signal: parent.signal });
+    assert.equal(call, 1);
+    // A caller aborts through the parent signal, not through cancel(): the run
+    // must be detached just the same, or the replacement joins its cancellation.
+    parent.abort();
+    const replacement = monitor.refresh(target, undefined, config, { force: true });
+    assert.equal(call, 2, "the replacement starts its own request sequence");
+
+    releaseOld?.();
+    const old = await cancelledRun;
+    assert.equal(old.status, "error");
+    assert.match(old.error ?? "", /cancelled/);
+    const replacementSnapshot = await replacement;
+    assert.equal(replacementSnapshot.status, "ok");
+    assert.equal(replacementSnapshot.metrics[0]?.remaining, 22);
+    assert.equal(monitor.snapshotFor(target.identity.key)?.metrics[0]?.remaining, 22);
+    assert.equal(call, 2);
+  });
+
+  it("starts new work when the caller's signal was already aborted", async () => {
+    const target = await targetFor({ provider: "deepseek", baseUrl: "https://api.deepseek.com" });
+    const parent = new AbortController();
+    parent.abort();
+    const { fetchImpl, calls } = sequenceFetch([
+      jsonResponse({ is_available: true, balance_infos: [{ currency: "USD", total_balance: "9" }] }),
+    ]);
+    const monitor = monitorWith(fetchImpl);
+
+    const cancelledRun = monitor.refresh(target, undefined, config, { signal: parent.signal });
+    // The cancelled run must not stay joinable even for a synchronous caller.
+    const replacement = monitor.refresh(target, undefined, config, { force: true });
+    const [old, replacementSnapshot] = await Promise.all([cancelledRun, replacement]);
+    assert.equal(old.status, "error");
+    assert.match(old.error ?? "", /cancelled/);
+    assert.equal(replacementSnapshot.status, "ok");
+    assert.equal(replacementSnapshot.metrics[0]?.remaining, 9);
+    assert.equal(calls.length, 1, "only the replacement requested");
+  });
+
   it("marks a snapshot stale after twice the refresh interval", async () => {
     const target = await targetFor({ provider: "deepseek", baseUrl: "https://api.deepseek.com" });
     const monitor = new UsageMonitor({

@@ -1804,4 +1804,68 @@ describe("host routing binding", () => {
     assert.equal(pi.entries.length, 0);
     assert.equal(calls.length, 0);
   });
+
+  it("starts a replacement request after rotating back to a credential whose run was cancelled", async () => {
+    let currentKey = "key-a";
+    let releaseFirst: (() => void) | undefined;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let releaseSecond: (() => void) | undefined;
+    const secondGate = new Promise<void>((resolve) => {
+      releaseSecond = resolve;
+    });
+    const calls: Array<string | undefined> = [];
+    const fetchImpl = (async (_input: string | URL | Request, init?: RequestInit) => {
+      calls.push(new Headers(init?.headers as Record<string, string>).get("authorization") ?? undefined);
+      const index = calls.length;
+      if (index === 1) await firstGate;
+      if (index === 2) await secondGate;
+      return jsonResponse({ is_available: true, balance_infos: [{ currency: "USD", total_balance: String(index * 11) }] });
+    }) as typeof fetch;
+    const model = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl,
+      models: [model],
+      auth: () => ({ apiKey: currentKey, source: "stored" }),
+      timers: false,
+      config: normalizeConfig({ autoRefresh: false }),
+    });
+    const fake = fakeContext({ model, registry });
+    await pi.emit("session_start", { type: "session_start" }, fake.ctx);
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+
+    // Credential A's request is held.
+    const first = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => calls.length === 1);
+    assert.equal(calls[0], "Bearer key-a");
+
+    // Rotate to B: the host aborts A through the work controller's signal.
+    currentKey = "key-b";
+    const second = host.refreshActive(fake.ctx, { reason: "interval" });
+    await waitFor(() => calls.length === 2);
+    assert.equal(calls[1], "Bearer key-b");
+
+    // Rotate back to A while both older responses are still pending.
+    currentKey = "key-a";
+    const third = host.refreshActive(fake.ctx, { reason: "interval", force: true });
+    await waitFor(() => calls.length === 3);
+    assert.equal(calls[2], "Bearer key-a");
+    const snapshot = await third;
+    assert.equal(snapshot?.status, "ok");
+    const footer = String(fake.statuses[fake.statuses.length - 1]);
+    assert.match(footer, /USD \$33/);
+    assert.doesNotMatch(footer, /cancelled|error/);
+
+    // The cancelled runs completing late change neither the view nor the requests.
+    const statusesAfterReplacement = fake.statuses.length;
+    releaseFirst?.();
+    releaseSecond?.();
+    await Promise.all([first, second]);
+    assert.equal(fake.statuses.length, statusesAfterReplacement);
+    assert.match(String(fake.statuses[fake.statuses.length - 1]), /USD \$33/);
+    assert.equal(calls.length, 3);
+    host.shutdown(fake.ctx);
+  });
 });
