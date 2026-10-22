@@ -1093,4 +1093,43 @@ describe("pi extension wiring", () => {
     assert.equal(fake.notifications.length, 0);
     host.shutdown(activation.ctx);
   });
+
+  it("reports a configured provider with no registered model instead of omitting it", async () => {
+    const { fetchImpl, calls } = sequenceFetch([codexBody(15)]);
+    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
+    const config = normalizeConfig({
+      providers: { cpa: { enabled: true }, "missing-provider": { enabled: true } },
+    });
+    const { pi, host, registry } = buildHost({ fetchImpl, models: [cpa], config });
+    const fake = fakeContext({ model: cpa, registry });
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    await command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    const text = (fake.widgets[fake.widgets.length - 1]?.lines ?? []).join("\n");
+    assert.match(text, /cpa\/chat/);
+    assert.match(text, /missing-provider\/no model/);
+    assert.match(text, /state: unknown/);
+    assert.match(text, /notice: no registered model could be resolved for this provider/);
+    assert.equal(calls.length, 1);
+    host.shutdown(fake.ctx);
+  });
+
+  it("explains a requested provider with no registered model alongside the active snapshot", async () => {
+    const { fetchImpl, calls } = sequenceFetch([codexBody(12)]);
+    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
+    const { pi, host, registry } = buildHost({ fetchImpl, models: [cpa] });
+    const fake = fakeContext({ model: cpa, registry });
+    await pi.emit("session_start", { type: "session_start" }, fake.ctx);
+    await waitFor(() => String(fake.statuses[fake.statuses.length - 1] ?? "").includes("12%"));
+
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    await command.handler("missing-provider", fake.ctx as unknown as ExtensionCommandContext);
+    const text = (fake.widgets[fake.widgets.length - 1]?.lines ?? []).join("\n");
+    assert.match(text, /missing-provider\/no model/);
+    assert.match(text, /notice: no registered model could be resolved for this provider/);
+    assert.match(text, /cpa\/chat/);
+    assert.equal(calls.length, 1);
+    host.shutdown(fake.ctx);
+  });
 });

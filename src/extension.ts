@@ -39,6 +39,9 @@ interface ActiveTarget {
   target?: ResolvedTarget;
 }
 
+/** One `/usage` entry: a resolvable model, or a provider id with no registered model. */
+type ReportTarget = { kind: "model"; model: Model<any> } | { kind: "unresolved"; providerId: string };
+
 function sameLogicalModel(left: Model<any>, right: Model<any>): boolean {
   return left.provider === right.provider && left.id === right.id;
 }
@@ -366,9 +369,12 @@ export class UniversalUsageHost {
     let source = this.activeSourceToken();
     // The active target is always included; other providers only when the user
     // opted into them before the session (explicit config entries) or asked.
-    for (const model of this.reportModels(ctx, requested)) {
-      const isActive = this.isCurrentModel(model);
-      const snapshot = await this.snapshotForModel(ctx, model, generation, isActive ? undefined : source);
+    for (const target of this.reportTargets(ctx, requested)) {
+      const isActive = target.kind === "model" && this.isCurrentModel(target.model);
+      const snapshot =
+        target.kind === "unresolved"
+          ? this.unresolvedSnapshot(target.providerId)
+          : await this.snapshotForModel(ctx, target.model, generation, isActive ? undefined : source);
       if (isActive) source = this.activeSourceToken();
       // A model switch, shutdown, or effective source change cancels the report
       // silently: it must not fetch the next provider or publish measurements
@@ -447,12 +453,15 @@ export class UniversalUsageHost {
   /**
    * Every selected provider is included; the report processes them one at a
    * time, so the bound is the finite user registry and configuration, not a
-   * silent provider cap.
+   * silent provider cap. A provider with no registered model becomes an
+   * unresolved entry instead of disappearing from the selection.
    */
-  private reportModels(ctx: ExtensionCommandContext, requested: readonly string[]): Model<any>[] {
-    const models: Model<any>[] = [];
+  private reportTargets(ctx: ExtensionCommandContext, requested: readonly string[]): ReportTarget[] {
+    const targets: ReportTarget[] = [];
     const active = this.active === undefined ? ctx.model : this.currentSelectedModel(ctx, this.active.model);
-    if (active !== undefined && (requested.length === 0 || requested.includes(active.provider))) models.push(active);
+    if (active !== undefined && (requested.length === 0 || requested.includes(active.provider))) {
+      targets.push({ kind: "model", model: active });
+    }
 
     const providerIds = requested.length > 0 ? requested : [...this.config.providers.keys()];
     for (const providerId of providerIds) {
@@ -461,9 +470,33 @@ export class UniversalUsageHost {
       const candidate =
         ctx.modelRegistry.getAvailable().find((model) => model.provider === providerId) ??
         ctx.modelRegistry.getAll().find((model) => model.provider === providerId);
-      if (candidate !== undefined) models.push(candidate);
+      targets.push(candidate === undefined ? { kind: "unresolved", providerId } : { kind: "model", model: candidate });
     }
-    return models;
+    return targets;
+  }
+
+  /**
+   * A requested or configured provider with no registered model is reported as
+   * unknown with a notice. There is no model whose credential or origin could be
+   * used, so no request is made, and the omission is no longer silent.
+   */
+  private unresolvedSnapshot(providerId: string): TargetSnapshot {
+    return {
+      identity: {
+        key: `unresolved|${providerId}`,
+        providerId,
+        modelId: "no model",
+        origin: "",
+        basePath: "/",
+        authSource: "unknown",
+        isOAuth: false,
+      },
+      status: "unknown",
+      metrics: [],
+      notice: "no registered model could be resolved for this provider",
+      fetchedAt: this.now(),
+      source: "cache",
+    };
   }
 
   private async snapshotForModel(
