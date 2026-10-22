@@ -23,7 +23,6 @@ import type { TargetSnapshot } from "./types.ts";
 
 export const COMMAND_NAME = "usage";
 export const REPORT_WIDGET_KEY = "universal-usage-report";
-const MAX_REPORT_PROVIDERS = 5;
 
 export interface HostOptions {
   monitor?: UsageMonitor;
@@ -390,6 +389,11 @@ export class UniversalUsageHost {
     return selected !== undefined && sameLogicalModel(selected, activeModel) ? selected : activeModel;
   }
 
+  /**
+   * Every selected provider is included; the report processes them one at a
+   * time, so the bound is the finite user registry and configuration, not a
+   * silent provider cap.
+   */
   private reportModels(ctx: ExtensionCommandContext, requested: readonly string[]): Model<any>[] {
     const models: Model<any>[] = [];
     const active = this.active === undefined ? ctx.model : this.currentSelectedModel(ctx, this.active.model);
@@ -397,7 +401,6 @@ export class UniversalUsageHost {
 
     const providerIds = requested.length > 0 ? requested : [...this.config.providers.keys()];
     for (const providerId of providerIds) {
-      if (models.length >= MAX_REPORT_PROVIDERS) break;
       if (providerId === active?.provider) continue;
       if (this.config.providers.get(providerId)?.enabled === false) continue;
       const candidate =

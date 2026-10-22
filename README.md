@@ -43,7 +43,8 @@ extension entry point is `extensions/index.ts`; Pi loads the TypeScript directly
 
 - `/usage` — refresh the active provider and every provider listed in your
   configuration, then show the detailed report. Accepts provider ids:
-  `/usage deepseek`, `/usage deepseek cpa`.
+  `/usage deepseek`, `/usage deepseek cpa`. Providers are reported sequentially
+  and all selected providers are included; there is no silent provider cap.
 - The footer shows a compact line for the active provider, for example
   `cpa: weekly 42% · reset 2d 3h` or `deepseek: USD $8.82`. An elapsed window is
   qualified as `reset elapsed` on its own metric, the nearest future reset is

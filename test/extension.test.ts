@@ -284,6 +284,25 @@ describe("pi extension wiring", () => {
     host.shutdown(fake.ctx);
   });
 
+  it("reports every configured provider beyond five", async () => {
+    const models = ["prov1", "prov2", "prov3", "prov4", "prov5", "prov6"].map((provider) =>
+      fakeModel({ provider, id: "chat", baseUrl: `https://${provider}.example.com/v1` }),
+    );
+    const { fetchImpl, calls } = sequenceFetch([codexBody(15)]);
+    const config = normalizeConfig({
+      providers: Object.fromEntries(models.map((model) => [model.provider, { enabled: true }])),
+    });
+    const { pi, host, registry } = buildHost({ fetchImpl, models, config });
+    const fake = fakeContext({ model: models[0], registry });
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    await command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    const text = (fake.widgets[fake.widgets.length - 1]?.lines ?? []).join("\n");
+    for (const model of models) assert.match(text, new RegExp(`${model.provider}/chat`));
+    assert.equal(calls.length, models.length);
+    host.shutdown(fake.ctx);
+  });
+
   it("stops a report whose non-active provider credential resolves after a model switch", async () => {
     const { fetchImpl, calls } = sequenceFetch([codexBody(10)]);
     const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
