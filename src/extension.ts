@@ -3,9 +3,10 @@
  *
  * The factory registers handlers only: no network happens until a session
  * starts or `/usage` is invoked, and background refresh runs in TUI mode only.
- * Every result is checked against the activation generation and the active
- * target identity before it can be painted, so a cancelled refresh can never
- * label the wrong provider.
+ * Selection and routing are captured before asynchronous work, and every
+ * mutation passes one of two ownership checks: adopting a resolver result, or
+ * publishing work bound to a captured activation and source. A cancelled
+ * refresh therefore cannot label the wrong provider.
  */
 
 import type { Model } from "@earendil-works/pi-ai";
@@ -33,12 +34,48 @@ export interface HostOptions {
   timers?: boolean;
 }
 
-interface ActiveTarget {
+/**
+ * Immutable selection facts captured before asynchronous resolution. The model
+ * copy keeps every field Pi needs; only the header map is copied, so mutating
+ * Pi's selected model object in place cannot change the route a request was
+ * planned for.
+ */
+interface SelectionBinding {
   model: Model<any>;
-  /** Routing signature of `model` captured when this selection was bound. */
+  /**
+   * Routing signature of the captured selection, with the same header case,
+   * order, and `null` suppression semantics as `modelRoutingSignature()`.
+   */
   routing: string;
-  /** Absent after a failed reconciliation; the model is kept so a later retry can resolve it. */
+}
+
+/** The selection adopted for one activation generation. */
+interface ActiveTarget {
+  /** The model object this binding was adopted from; Pi may replace or mutate it later. */
+  model: Model<any>;
+  /** Facts captured at adoption; every later routing comparison uses these. */
+  selection: SelectionBinding;
+  /** Absent after a failed reconciliation; the selection is kept so a later retry can resolve it. */
   target?: ResolvedTarget;
+}
+
+/** Authority to adopt one asynchronous resolver result. */
+interface ResolutionLease {
+  generation: number;
+  /** Reconciliation order within the activation; omitted for the activation's own resolution. */
+  revision?: number;
+  selection: SelectionBinding;
+}
+
+/** Authority for work already bound to a captured activation and source. */
+interface WorkLease {
+  generation: number;
+  /** Captured routing the live selection must still match; omitted when no binding existed. */
+  selection?: SelectionBinding;
+  /** Effective source (identity key); omitted when only the activation is bound. */
+  source?: string;
+  /** Cancellation of the work carrying the lease. */
+  signal?: AbortSignal;
 }
 
 /** One `/usage` entry: a resolvable model, or a provider id with no registered model. */
@@ -49,15 +86,15 @@ function sameLogicalModel(left: Model<any>, right: Model<any>): boolean {
 }
 
 /**
- * Pi suppresses `model_select` when the provider, model id, and type are
- * unchanged, even if the new model object points at another base URL or
- * routing header. Such a selection is a routing change the host otherwise
- * cannot observe, so attribution compares the routing signature captured when
- * the active target was bound. A different logical model always emits
- * `model_select` and invalidates the activation generation instead.
+ * Capture the logical selection and its routing before asynchronous work. A
+ * reference to Pi's model object is not an immutable routing fact: Pi replaces
+ * or reconfigures it without emitting `model_select` when provider, id, and
+ * type are unchanged.
  */
-function unreportedRoutingChange(selected: Model<any> | undefined, active: ActiveTarget): boolean {
-  return selected !== undefined && sameLogicalModel(selected, active.model) && modelRoutingSignature(selected) !== active.routing;
+function bindSelection(model: Model<any>): SelectionBinding {
+  const bound: Model<any> = { ...model };
+  if (model.headers !== undefined) bound.headers = { ...model.headers };
+  return { model: bound, routing: modelRoutingSignature(bound) };
 }
 
 export class UniversalUsageHost {
@@ -149,6 +186,7 @@ export class UniversalUsageHost {
   async activate(ctx: ExtensionContext, model: Model<any>, options: { refresh?: boolean } = {}): Promise<void> {
     if (this.disposed) return;
     const generation = ++this.generation;
+    const selection = bindSelection(model);
     this.abortRefresh();
     this.active = undefined;
     this.lastSnapshot = undefined;
@@ -156,12 +194,15 @@ export class UniversalUsageHost {
     this.monitor.cancel();
     this.paintText(ctx, `${model.provider}: checking usage...`);
 
-    const resolution = await resolveTarget(ctx.modelRegistry, model, { allowInsecureHttp: true });
-    if (generation !== this.generation || this.disposed) return;
+    const resolution = await resolveTarget(ctx.modelRegistry, selection.model, { allowInsecureHttp: true });
+    // The activation's resolution is the first of its generation, so only the
+    // live route can invalidate it. A silent same-ID replacement while it was
+    // pending must neither paint its success or failure nor start a request.
+    if (!this.adoptsResolution({ generation, selection }, ctx)) return;
 
     if (!resolution.ok) {
-      // Keep the model so a later /usage or selection can retry resolution.
-      this.active = { model, routing: modelRoutingSignature(model) };
+      // Keep the selection so a later /usage or selection can retry resolution.
+      this.active = { model, selection };
       this.lastSnapshot = {
         identity: resolution.identity,
         status: resolution.status,
@@ -173,7 +214,7 @@ export class UniversalUsageHost {
       this.paint(ctx);
       return;
     }
-    this.active = { model, routing: modelRoutingSignature(model), target: resolution.target };
+    this.active = { model, selection, target: resolution.target };
     if (options.refresh === false) {
       this.paintText(ctx, `${model.provider}: automatic refresh is off`);
       return;
@@ -196,16 +237,20 @@ export class UniversalUsageHost {
     const revision = ++this.reconcileRevision;
     const model =
       options.model ?? (options.resolved !== undefined ? active.model : this.currentSelectedModel(ctx, active.model));
+    // Reuse the binding captured for the adopted model: re-capturing after an
+    // in-place mutation would adopt a route that was never resolved.
+    const selection = model === active.model ? active.selection : bindSelection(model);
     if (model !== active.model) {
-      this.active = { model, routing: modelRoutingSignature(model) };
+      this.active = { model, selection };
       this.passiveAttribution = undefined;
     }
-    const target = options.resolved ?? (await this.reconcileActive(ctx, model, generation, revision));
-    if (target === undefined || this.disposed || generation !== this.generation) return undefined;
-    // An unreported same-ID selection can move the live route while the
-    // credential resolves; the resolved target then describes a route the host
-    // can no longer verify, so no request is started for it.
-    if (this.selectedRoutingChanged(ctx)) return undefined;
+    const target =
+      options.resolved ?? (await this.reconcileActive(ctx, model, { generation, revision, selection }));
+    if (target === undefined) return undefined;
+    // This request is bound to the reconciled source: the captured activation,
+    // route and cancellation decide, not the reconciliation order.
+    const bound: WorkLease = { generation, selection, source: target.identity.key };
+    if (!this.holdsWork(bound, ctx)) return undefined;
 
     const key = target.identity.key;
     const existing = this.refreshWork;
@@ -216,6 +261,7 @@ export class UniversalUsageHost {
 
     const controller = new AbortController();
     this.lastAutoRefreshAt = this.now();
+    const work: WorkLease = { ...bound, signal: controller.signal };
     const promise = (async (): Promise<TargetSnapshot | undefined> => {
       const snapshot = await this.monitor.refresh(
         target,
@@ -223,12 +269,9 @@ export class UniversalUsageHost {
         this.config,
         { force: options.force === true, signal: controller.signal },
       );
-      if (controller.signal.aborted) return undefined;
-      if (this.disposed || generation !== this.generation) return undefined;
-      // The response belongs to the route this request was planned for. A live
-      // selection that moved without an event makes publication ambiguous.
-      if (this.selectedRoutingChanged(ctx)) return undefined;
-      if (this.active?.target?.identity.key !== snapshot.identity.key) return undefined;
+      // A cancelled run, a replaced activation, a rotated source, or a live
+      // selection that moved without an event may not publish.
+      if (!this.holdsWork(work, ctx)) return undefined;
       this.lastSnapshot = snapshot;
       this.paint(ctx);
       return snapshot;
@@ -251,6 +294,7 @@ export class UniversalUsageHost {
   private async reselectActive(ctx: ExtensionContext, model: Model<any>): Promise<void> {
     const generation = this.generation;
     const revision = ++this.reconcileRevision;
+    const selection = bindSelection(model);
     const previousKey = this.active?.target?.identity.key;
     const previousAttribution = this.passiveAttribution;
     this.abortRefresh();
@@ -259,8 +303,10 @@ export class UniversalUsageHost {
     this.monitor.cancel();
     this.passiveAttribution = undefined;
 
-    const target = await this.reconcileActive(ctx, model, generation, revision);
-    if (target === undefined || this.disposed || generation !== this.generation) return;
+    // A target here already passed the adoption check: it is the newest
+    // reconciliation of this activation and the live route still matches it.
+    const target = await this.reconcileActive(ctx, model, { generation, revision, selection });
+    if (target === undefined) return;
     if (previousKey !== target.identity.key) {
       // The route changed; do not repaint measurements from the old origin/auth.
       this.lastSnapshot = undefined;
@@ -277,24 +323,23 @@ export class UniversalUsageHost {
     else this.paint(ctx);
   }
 
-  /** Re-resolve the active model and replace its target when auth or routing changed. */
+  /** Re-resolve a captured selection and replace the active binding when this resolution still owns it. */
   private async reconcileActive(
     ctx: ExtensionContext,
     model: Model<any>,
-    generation: number,
-    revision: number,
+    lease: ResolutionLease,
   ): Promise<ResolvedTarget | undefined> {
-    const resolution = await resolveTarget(ctx.modelRegistry, model, { allowInsecureHttp: true });
-    // Auth resolution is asynchronous. Only the newest reconciliation for this
-    // activation may mutate the active target, even when an older resolver
+    const resolution = await resolveTarget(ctx.modelRegistry, lease.selection.model, { allowInsecureHttp: true });
+    // Auth resolution is asynchronous: only the newest reconciliation for this
+    // activation may mutate the active binding, even when an older resolver
     // completes after a newer failure or routing change.
-    if (this.disposed || generation !== this.generation || revision !== this.reconcileRevision) return undefined;
+    if (!this.adoptsResolution(lease, ctx)) return undefined;
     if (!resolution.ok) {
       // A failed reconciliation invalidates older work: its controller is
-      // aborted and the old target can no longer satisfy completion guards.
+      // aborted and the old target can no longer satisfy a work lease.
       this.abortRefresh();
       this.monitor.cancel();
-      this.active = { model, routing: modelRoutingSignature(model) };
+      this.active = { model, selection: lease.selection };
       this.passiveAttribution = undefined;
       this.lastSnapshot = {
         identity: resolution.identity,
@@ -308,7 +353,7 @@ export class UniversalUsageHost {
       return undefined;
     }
     const previous = this.active?.target?.identity.key;
-    this.active = { model, routing: modelRoutingSignature(model), target: resolution.target };
+    this.active = { model, selection: lease.selection, target: resolution.target };
     if (previous !== resolution.target.identity.key) this.passiveAttribution = undefined;
     return resolution.target;
   }
@@ -319,22 +364,35 @@ export class UniversalUsageHost {
    * carries no model identity, so a switch during the turn makes it ambiguous.
    */
   afterProviderResponse(status: number, headers: Record<string, string>, ctx: ExtensionContext): void {
-    const active = this.active;
-    const attribution = this.passiveAttribution;
-    if (this.disposed || active?.target === undefined || attribution === undefined) return;
-    if (attribution.generation !== this.generation) return;
-    if (attribution.identityKey !== active.target.identity.key) return;
-    // The response carries no model identity. If the selection moved to another
-    // routing while the turn ran, these headers cannot be attributed at all.
-    if (unreportedRoutingChange(ctx.model, active)) {
-      this.passiveAttribution = undefined;
-      return;
-    }
+    const target = this.passiveBinding(ctx);
+    if (target === undefined) return;
     if (ctx.isIdle()) return;
-    const snapshot = this.monitor.applyPassiveHeaders(active.target, headers, status, this.config);
+    const snapshot = this.monitor.applyPassiveHeaders(target, headers, status, this.config);
     if (snapshot === undefined) return;
     this.lastSnapshot = snapshot;
     this.paint(ctx);
+  }
+
+  /**
+   * The target a response may still be attributed to, or undefined when the
+   * attribution is no longer sound. Validity is decided here, before the monitor
+   * measurement is written, not only before the footer is painted.
+   */
+  private passiveBinding(ctx: ExtensionContext): ResolvedTarget | undefined {
+    const active = this.active;
+    const attribution = this.passiveAttribution;
+    if (this.disposed || active?.target === undefined || attribution === undefined) return undefined;
+    const bound: WorkLease = {
+      generation: attribution.generation,
+      selection: active.selection,
+      source: active.target.identity.key,
+    };
+    if (this.holdsWork(bound, ctx)) return active.target;
+    // A selection that moved to another route without an event cannot be
+    // attributed at all; drop the attribution instead of filing these headers
+    // under the previously bound routing.
+    if (!this.routeHolds(active.selection, ctx)) this.passiveAttribution = undefined;
+    return undefined;
   }
 
   /** A new turn is the only sound boundary for passive response attribution. */
@@ -347,7 +405,7 @@ export class UniversalUsageHost {
     // A same-ID selection Pi did not report (a changed base URL is not part of
     // its model equality check) is unknown routing for this turn. Refuse
     // attribution instead of filing its headers under the previously bound one.
-    if (unreportedRoutingChange(ctx.model, active)) {
+    if (!this.routeHolds(active.selection, ctx)) {
       this.passiveAttribution = undefined;
       return;
     }
@@ -385,10 +443,10 @@ export class UniversalUsageHost {
       // A model switch, shutdown, or effective source change cancels the report
       // silently: it must not fetch the next provider or publish measurements
       // from an older source.
-      if (this.reportCancelled(ctx, generation, source)) return;
+      if (!this.reportStillValid(generation, source, ctx)) return;
       if (snapshot !== undefined) snapshots.push(snapshot);
     }
-    if (this.reportCancelled(ctx, generation, source)) return;
+    if (!this.reportStillValid(generation, source, ctx)) return;
     const active = this.lastSnapshot;
     const activeTargetKey = this.active?.target?.identity.key;
     // With no reconciled target the last snapshot is this attempt's failure
@@ -400,7 +458,7 @@ export class UniversalUsageHost {
 
     const lines = formatReport(snapshots, this.config, this.now());
     // Pi rejects a stale context after a reload; stop before touching it.
-    if (this.reportCancelled(ctx, generation, source)) return;
+    if (!this.reportStillValid(generation, source, ctx)) return;
     if (ctx.hasUI) {
       ctx.ui.setWidget(REPORT_WIDGET_KEY, lines);
       ctx.ui.notify("pi-universal-usage: report updated", "info");
@@ -419,27 +477,50 @@ export class UniversalUsageHost {
   }
 
   /**
-   * A report may only continue and publish within the activation generation it
-   * started in. When a source token is supplied, the effective credential and
-   * routing must also be unchanged; the active provider's own reconciliation is
-   * exempt because it re-anchors the report. A live selection that moved to
-   * another route without an event invalidates either kind of report.
+   * Report work is bound to the activation generation and effective source it
+   * started with. The route it may publish under is the one the current binding
+   * captured: the active provider's own reconciliation re-anchors both, while a
+   * live selection that moved without an event invalidates either kind of work.
    */
-  private reportCancelled(ctx: ExtensionCommandContext, generation: number, source?: string): boolean {
-    if (this.disposed || generation !== this.generation) return true;
-    if (this.selectedRoutingChanged(ctx)) return true;
-    return source !== undefined && this.activeSourceToken() !== source;
+  private reportStillValid(generation: number, source: string | undefined, ctx: ExtensionContext): boolean {
+    return this.holdsWork({ generation, selection: this.active?.selection, source }, ctx);
   }
 
   /**
-   * True when the live selection moved to another route for the same logical
-   * model without a `model_select`. Pi's model-equality check ignores base URL
-   * and routing headers, so such a selection is only visible through the live
-   * model getter and must end work bound to the previous route.
+   * May this asynchronous resolver result replace the active binding? It must be
+   * the newest reconciliation of the current activation, and the live selection
+   * must still route the captured model the same way.
    */
-  private selectedRoutingChanged(ctx: ExtensionContext): boolean {
-    const active = this.active;
-    return active !== undefined && unreportedRoutingChange(ctx.model, active);
+  private adoptsResolution(lease: ResolutionLease, ctx: ExtensionContext): boolean {
+    if (this.disposed || lease.generation !== this.generation) return false;
+    if (lease.revision !== undefined && lease.revision !== this.reconcileRevision) return false;
+    return this.routeHolds(lease.selection, ctx);
+  }
+
+  /**
+   * May this already-bound work still mutate or publish? Its captured activation,
+   * source, and route must be current and its cancellation must not have fired.
+   * Reconciliation order deliberately plays no part, so equivalent same-target
+   * work joins the run it would otherwise abort.
+   */
+  private holdsWork(lease: WorkLease, ctx: ExtensionContext): boolean {
+    if (this.disposed || lease.generation !== this.generation) return false;
+    if (lease.signal?.aborted === true) return false;
+    if (lease.source !== undefined && this.activeSourceToken() !== lease.source) return false;
+    return lease.selection === undefined || this.routeHolds(lease.selection, ctx);
+  }
+
+  /**
+   * True when the live selection still routes the captured logical model the same
+   * way. Pi suppresses `model_select` when provider, model id, and type are
+   * unchanged, even if the new model object points at another base URL or
+   * routing header, so only the live model getter reveals such a change. A
+   * different logical model emits `model_select` and starts a new generation.
+   */
+  private routeHolds(selection: SelectionBinding, ctx: ExtensionContext): boolean {
+    const selected = ctx.model;
+    if (selected === undefined || !sameLogicalModel(selected, selection.model)) return true;
+    return modelRoutingSignature(selected) === selection.routing;
   }
 
   /** Idempotent cleanup for reload, session replacement, and quit. */
@@ -527,8 +608,9 @@ export class UniversalUsageHost {
     if (this.active !== undefined && this.isCurrentModel(model)) {
       return this.refreshActive(ctx, { reason: "command", force: true, model });
     }
-    const resolution = await resolveTarget(ctx.modelRegistry, model, { allowInsecureHttp: true });
-    if (this.reportCancelled(ctx, generation, source)) return undefined;
+    const selection = bindSelection(model);
+    const resolution = await resolveTarget(ctx.modelRegistry, selection.model, { allowInsecureHttp: true });
+    if (!this.reportStillValid(generation, source, ctx)) return undefined;
     if (!resolution.ok) {
       return {
         identity: resolution.identity,
@@ -547,7 +629,7 @@ export class UniversalUsageHost {
     );
     // The monitor may return a cancelled or post-shutdown placeholder snapshot;
     // a stale report discards it instead of reporting it as quota data.
-    if (this.reportCancelled(ctx, generation, source)) return undefined;
+    if (!this.reportStillValid(generation, source, ctx)) return undefined;
     return snapshot;
   }
 

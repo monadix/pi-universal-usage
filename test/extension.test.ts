@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { normalizeConfig } from "../src/config.ts";
 import { COMMAND_NAME, REPORT_WIDGET_KEY, UniversalUsageHost } from "../src/extension.ts";
 import { UsageMonitor } from "../src/monitor.ts";
@@ -1366,5 +1366,270 @@ describe("pi extension wiring", () => {
     assert.match(text, /cpa\/chat/);
     assert.equal(calls.length, 1);
     host.shutdown(fake.ctx);
+  });
+});
+
+/**
+ * The five routing changes Pi can apply to a selected model without emitting
+ * `model_select`: its model equality check compares provider, model id, and
+ * type only. Each differs from the bound route in base URL, API, credential, or
+ * account routing, so none may publish or start a request after the fact.
+ */
+const SILENT_ROUTING_CHANGES: Record<string, (model: ReturnType<typeof fakeModel>) => ReturnType<typeof fakeModel>> = {
+  "base URL": (model) => ({ ...model, baseUrl: "https://b.example/v1" }),
+  API: (model) => ({ ...model, api: "openai-completions" }),
+  authorization: (model) => modelWithHeaders(model, { ...model.headers, Authorization: "Bearer synthetic-b" }),
+  "account header": (model) => modelWithHeaders(model, { ...model.headers, "ChatGPT-Account-Id": "b" }),
+  "null suppression": (model) => modelWithHeaders(model, { ...model.headers, Authorization: null }),
+};
+
+/** A model-routing header map that can carry an explicit `null` suppression. */
+function modelWithHeaders(
+  model: ReturnType<typeof fakeModel>,
+  headers: Record<string, string | null>,
+): ReturnType<typeof fakeModel> {
+  return { ...model, headers } as unknown as ReturnType<typeof fakeModel>;
+}
+
+/** The four asynchronous boundaries the host crosses between capture and publication. */
+const HELD_BOUNDARIES = [
+  { name: "active authentication", stage: "auth", active: true },
+  { name: "active GET", stage: "get", active: true },
+  { name: "peer authentication", stage: "auth", active: false },
+  { name: "peer GET", stage: "get", active: false },
+] as const;
+
+describe("host routing binding", () => {
+  for (const boundary of HELD_BOUNDARIES) {
+    for (const [route, change] of Object.entries(SILENT_ROUTING_CHANGES)) {
+      it(`stops a silent ${route} change made while ${boundary.name} is pending`, async () => {
+        const active = fakeModel({
+          provider: "cpa",
+          id: "chat",
+          baseUrl: "https://a.example/v1",
+          headers: { Authorization: "Bearer synthetic-a", "ChatGPT-Account-Id": "a" },
+        });
+        const peer = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
+        let release: (() => void) | undefined;
+        const gate = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        let armed = false;
+        let reached = false;
+        const auth = (model: ReturnType<typeof fakeModel>): FakeAuth => {
+          const hold = armed && boundary.stage === "auth" && model.provider === (boundary.active ? active.provider : peer.provider);
+          if (hold) reached = true;
+          return {
+            apiKey: "synthetic",
+            headers: model.headers,
+            baseUrl: model.baseUrl,
+            ...(hold ? { wait: gate } : {}),
+          };
+        };
+        const calls: string[] = [];
+        const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+          assert.equal(init?.method, "GET");
+          const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+          calls.push(url);
+          const hold = boundary.stage === "get" && url.includes(boundary.active ? "a.example" : "api.deepseek.com");
+          if (hold) {
+            reached = true;
+            await gate;
+          }
+          return url.includes("api.deepseek.com")
+            ? jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] })
+            : codexBody(42);
+        }) as typeof fetch;
+        const { pi, host, registry } = buildHost({
+          fetchImpl,
+          models: [active, peer],
+          timers: false,
+          auth,
+          config: normalizeConfig({ autoRefresh: false, providers: { deepseek: { enabled: true } } }),
+        });
+        const selection = { current: active };
+        const fake = fakeContext({ modelRef: selection, registry });
+        await host.activate(fake.ctx, active, { refresh: false });
+        armed = true;
+        const pending = host.report(fake.ctx as unknown as ExtensionCommandContext, "");
+        await waitFor(() => reached);
+        const before = { calls: calls.length, statuses: fake.statuses.length };
+
+        selection.current = change(active);
+        release?.();
+        await pending;
+
+        assert.equal(calls.length, before.calls, "the old route issues no follow-on request");
+        assert.equal(fake.statuses.length, before.statuses, "the old route paints no footer");
+        assert.equal(pi.entries.length + fake.widgets.length + fake.notifications.length, 0, "the old route publishes no report");
+        host.shutdown(fake.ctx);
+      });
+    }
+  }
+
+  it("drops a held activation success after a silent same-ID route replacement", async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let reached = false;
+    const auth = (): FakeAuth => {
+      reached = true;
+      return { apiKey: "key-a", source: "stored", wait: gate };
+    };
+    const { fetchImpl, calls } = sequenceFetch([codexBody(12)]);
+    const model = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://a.example.com/v1" });
+    const { host, registry } = buildHost({ fetchImpl, models: [model], auth, timers: false });
+    const selection = { current: model };
+    const fake = fakeContext({ modelRef: selection, registry });
+
+    const pending = host.activate(fake.ctx, model);
+    await waitFor(() => reached);
+    selection.current = { ...model, baseUrl: "http://b.example.com/v1" };
+    release?.();
+    await pending;
+
+    assert.equal(calls.length, 0);
+    assert.deepEqual(fake.statuses, ["cpa: checking usage..."]);
+    host.shutdown(fake.ctx);
+  });
+
+  it("drops a held activation failure after a silent same-ID route replacement", async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let reached = false;
+    const auth = (): FakeAuth => {
+      reached = true;
+      return { ok: false, error: "removed credential", wait: gate };
+    };
+    const { fetchImpl, calls } = sequenceFetch([codexBody(12)]);
+    const model = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://a.example.com/v1" });
+    const { host, registry } = buildHost({ fetchImpl, models: [model], auth, timers: false });
+    const selection = { current: model };
+    const fake = fakeContext({ modelRef: selection, registry });
+
+    const pending = host.activate(fake.ctx, model);
+    await waitFor(() => reached);
+    selection.current = { ...model, baseUrl: "http://b.example.com/v1" };
+    release?.();
+    await pending;
+
+    assert.equal(calls.length, 0);
+    // Neither the failure nor a follow-on request may describe the old route.
+    assert.deepEqual(fake.statuses, ["cpa: checking usage..."]);
+    host.shutdown(fake.ctx);
+  });
+
+  it("keeps the captured route and resolver input when the selected model is mutated in place", async () => {
+    const model = fakeModel({
+      provider: "cpa",
+      id: "chat",
+      baseUrl: "http://a.example.com/v1",
+      headers: { Authorization: "Bearer synthetic-a" },
+    });
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const beforeWait: string[] = [];
+    const afterWait: string[] = [];
+    const registry = {
+      async getApiKeyAndHeaders(input: typeof model) {
+        const seen = () => `${input.baseUrl} ${input.headers?.Authorization ?? "-"}`;
+        beforeWait.push(seen());
+        await gate;
+        // The resolver still reads the captured copy after the live object changed.
+        afterWait.push(seen());
+        return { ok: true as const, apiKey: "key-a", headers: input.headers, baseUrl: input.baseUrl };
+      },
+      getProviderAuthStatus: () => ({ configured: true, source: "stored" as const }),
+      isUsingOAuth: () => false,
+      getAvailable: () => [model],
+      getAll: () => [model],
+    } as unknown as ModelRegistry;
+    const { fetchImpl, calls } = sequenceFetch([codexBody(12)]);
+    const pi = fakePi();
+    const host = new UniversalUsageHost(pi.api, {
+      monitor: new UsageMonitor({ now: () => 1_768_000_000_000, fetchImpl, policy: { timeoutMs: 200 } }),
+      now: () => 1_768_000_000_000,
+      config: normalizeConfig({ refreshSeconds: 300 }),
+      timers: false,
+    });
+    const selection = { current: model };
+    const fake = fakeContext({ modelRef: selection, registry });
+
+    const pending = host.activate(fake.ctx, model);
+    await waitFor(() => beforeWait.length === 1);
+    // Pi can reconfigure the selected object instead of replacing it.
+    model.baseUrl = "http://b.example.com/v1";
+    model.headers = { Authorization: "Bearer synthetic-b" };
+    release?.();
+    await pending;
+
+    assert.deepEqual(beforeWait, ["http://a.example.com/v1 Bearer synthetic-a"]);
+    assert.deepEqual(afterWait, ["http://a.example.com/v1 Bearer synthetic-a"]);
+    assert.equal(calls.length, 0);
+    assert.deepEqual(fake.statuses, ["cpa: checking usage..."]);
+    host.shutdown(fake.ctx);
+  });
+
+  it("joins startup, interval, and /usage refreshes of one target into a single HTTP sequence", async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const calls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      calls.push(String(input));
+      await gate;
+      return jsonResponse({ is_available: true, balance_infos: [{ currency: "USD", total_balance: "4" }] });
+    }) as typeof fetch;
+    const model = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
+    const { pi, host, registry } = buildHost({ fetchImpl, models: [model] });
+    const fake = fakeContext({ model, registry });
+
+    await pi.emit("session_start", { type: "session_start" }, fake.ctx);
+    await waitFor(() => calls.length === 1);
+    // A periodic tick is the call the interval timer makes; the reconciliation
+    // it starts must not revoke the refresh it is about to join.
+    const interval = host.refreshActive(fake.ctx, { reason: "interval" });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    const usage = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    release?.();
+    await Promise.all([interval, usage]);
+
+    assert.equal(calls.length, 1, "one HTTP sequence for one target");
+    assert.equal(fake.widgets.length, 1, "one report publication");
+    const footer = String(fake.statuses[fake.statuses.length - 1]);
+    assert.match(footer, /USD \$4/);
+    assert.doesNotMatch(footer, /cancelled|error/);
+    host.shutdown(fake.ctx);
+  });
+
+  it("does not paint or fetch a credential that resolves after shutdown", async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const auth = (): FakeAuth => ({ apiKey: "key-a", source: "stored", wait: gate });
+    const { fetchImpl, calls } = sequenceFetch([codexBody(12)]);
+    const model = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
+    const { host, registry } = buildHost({ fetchImpl, models: [model], auth, timers: false });
+    const fake = fakeContext({ model, registry });
+
+    const pending = host.activate(fake.ctx, model);
+    await waitFor(() => fake.statuses.length > 0);
+    host.shutdown(fake.ctx);
+    const statusesAfterShutdown = fake.statuses.length;
+    release?.();
+    await pending;
+
+    assert.equal(fake.statuses.length, statusesAfterShutdown);
+    assert.equal(calls.length, 0);
   });
 });
