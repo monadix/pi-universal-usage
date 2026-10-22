@@ -204,12 +204,31 @@ export class UsageMonitor {
     return this.now() - snapshot.fetchedAt > config.refreshSeconds * 2000;
   }
 
-  /** Refresh one target. Concurrent calls for the same identity share one request sequence. */
+  /**
+   * Refresh one target. Concurrent calls for the same identity share one request
+   * sequence, and a joined account-scoped result is theirs too; a passive header
+   * measurement of another logical model is not.
+   */
   refresh(
     target: ResolvedTarget,
     provider: ProviderConfig | undefined,
     config: UsageConfig,
     options: { force?: boolean; signal?: AbortSignal } = {},
+  ): Promise<TargetSnapshot> {
+    return this.refreshEntry(target, provider, config, options, true);
+  }
+
+  /**
+   * The body of a refresh. `mayAskAgain` is true for the caller's own request; a
+   * request that re-enters after refusing another model's joined passive
+   * measurement must not join and refuse the same way a second time.
+   */
+  private refreshEntry(
+    target: ResolvedTarget,
+    provider: ProviderConfig | undefined,
+    config: UsageConfig,
+    options: { force?: boolean; signal?: AbortSignal },
+    mayAskAgain: boolean,
   ): Promise<TargetSnapshot> {
     if (this.closed) return Promise.resolve(emptySnapshot(target, "unknown", this.now(), "monitor is shut down"));
     const key = target.identity.key;
@@ -224,7 +243,18 @@ export class UsageMonitor {
       if (cached !== undefined) return Promise.resolve(cached);
       return Promise.resolve(emptySnapshot(target, "unknown", this.now(), "waiting before the next attempt"));
     }
-    if (current.run !== undefined) return current.run.promise;
+    if (current.run !== undefined) {
+      const joined = current.run.promise;
+      return joined.then((snapshot) => {
+        // Joining shares the run's account-scoped endpoint result. A passive
+        // header measurement instead belongs to the model whose inference
+        // produced it, so it is treated as absent for this model - as the cached
+        // path does - and the model is answered through the normal path.
+        if (!this.measuresOtherModel(snapshot, target)) return snapshot;
+        if (!mayAskAgain) return emptySnapshot(target, "unknown", this.now(), "waiting before the next attempt");
+        return this.refreshEntry(target, provider, config, options, false);
+      });
+    }
 
     // One record owns the request sequence and the controller that cancels it.
     // Install it before any work starts, so even a path that answers without a
@@ -621,8 +651,7 @@ export class UsageMonitor {
    */
   private retainPassiveSnapshot(target: ResolvedTarget, entry: Entry, notice: string): TargetSnapshot | undefined {
     const existing = entry.snapshot;
-    if (existing === undefined || existing.source !== "headers") return undefined;
-    if (existing.identity.modelId !== target.identity.modelId) return undefined;
+    if (existing === undefined || existing.source !== "headers" || this.measuresOtherModel(existing, target)) return undefined;
     const retained: TargetSnapshot = existing.notice === undefined ? { ...existing, notice } : existing;
     entry.snapshot = retained;
     entry.nextAttemptAt = this.now() + AUTH_FAILURE_BACKOFF_MS;
@@ -652,9 +681,17 @@ export class UsageMonitor {
    */
   private reusableSnapshot(entry: Entry, target: ResolvedTarget): TargetSnapshot | undefined {
     const snapshot = entry.snapshot;
-    if (snapshot === undefined) return undefined;
-    if (snapshot.source === "headers" && snapshot.identity.modelId !== target.identity.modelId) return undefined;
+    if (snapshot === undefined || this.measuresOtherModel(snapshot, target)) return undefined;
     return snapshot;
+  }
+
+  /**
+   * A passive header snapshot measures one logical model's inference response, so
+   * only that model may read it back: the cache key is account-level, but the
+   * measurement is not. Endpoint results belong to the account and are shared.
+   */
+  private measuresOtherModel(snapshot: TargetSnapshot, target: ResolvedTarget): boolean {
+    return snapshot.source === "headers" && snapshot.identity.modelId !== target.identity.modelId;
   }
 
   /**

@@ -383,6 +383,74 @@ describe("UsageMonitor", () => {
     assert.notEqual(forcedB.status, "ok");
   });
 
+  it("does not hand an in-flight join another model's passive measurement", async () => {
+    const modelA = fakeModel({ provider: "openai", id: "chat-a", baseUrl: "https://api.openai.com/v1" });
+    const modelB = fakeModel({ provider: "openai", id: "chat-b", baseUrl: "https://api.openai.com/v1" });
+    const registry = fakeRegistry({ apiKey: "test-key" }, [modelA, modelB]);
+    const resolvedA = await resolveTarget(registry, modelA, { allowInsecureHttp: true });
+    const resolvedB = await resolveTarget(registry, modelB, { allowInsecureHttp: true });
+    assert.equal(resolvedA.ok && resolvedB.ok, true);
+    if (!resolvedA.ok || !resolvedB.ok) return;
+    // Same provider, origin, and credential: one account-level entry.
+    assert.equal(resolvedA.target.identity.key, resolvedB.target.identity.key);
+
+    const { fetchImpl, calls } = sequenceFetch([textResponse("unused")]);
+    const monitor = monitorWith(fetchImpl);
+    const passiveA = monitor.applyPassiveHeaders(
+      resolvedA.target,
+      { "x-codex-secondary-used-percent": "90" },
+      200,
+      config,
+    );
+    assert.equal(passiveA?.metrics[0]?.usedPercent, 90);
+
+    // A no-endpoint run retains A's passive snapshot synchronously while its
+    // promise and cleanup are still pending, so B joins it without awaiting.
+    const forcedA = monitor.refresh(resolvedA.target, undefined, config, { force: true });
+    const forcedB = monitor.refresh(resolvedB.target, undefined, config, { force: true });
+    const [forA, forB] = await Promise.all([forcedA, forcedB]);
+
+    // The model that produced the measurement keeps it.
+    assert.equal(forA.source, "headers");
+    assert.equal(forA.metrics[0]?.usedPercent, 90);
+    // The joining model never inherits it.
+    assert.deepEqual(forB.metrics, []);
+    assert.notEqual(forB.status, "ok");
+    assert.notEqual(forB.source, "headers");
+    assert.equal(calls.length, 0);
+  });
+
+  it("shares an endpoint result with a joining model of the same account", async () => {
+    const modelA = fakeModel({ provider: "deepseek", id: "chat-a", baseUrl: "https://api.deepseek.com" });
+    const modelB = fakeModel({ provider: "deepseek", id: "chat-b", baseUrl: "https://api.deepseek.com" });
+    const registry = fakeRegistry({ apiKey: "test-key" }, [modelA, modelB]);
+    const resolvedA = await resolveTarget(registry, modelA, { allowInsecureHttp: true });
+    const resolvedB = await resolveTarget(registry, modelB, { allowInsecureHttp: true });
+    assert.equal(resolvedA.ok && resolvedB.ok, true);
+    if (!resolvedA.ok || !resolvedB.ok) return;
+    assert.equal(resolvedA.target.identity.key, resolvedB.target.identity.key);
+
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const calls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      calls.push(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+      await gate;
+      return jsonResponse({ is_available: true, balance_infos: [{ currency: "USD", total_balance: "4" }] });
+    }) as typeof fetch;
+    const monitor = monitorWith(fetchImpl);
+    const forA = monitor.refresh(resolvedA.target, undefined, config, { force: true });
+    const forB = monitor.refresh(resolvedB.target, undefined, config, { force: true });
+    release?.();
+    const [a, b] = await Promise.all([forA, forB]);
+    assert.equal(calls.length, 1);
+    assert.equal(b, a);
+    assert.equal(a.source, "http");
+    assert.equal(a.status, "ok");
+  });
+
   it("does not retain a passive measurement past an explicit disable", async () => {
     const target = await targetFor({ provider: "openai", baseUrl: "https://api.openai.com/v1" });
     const { fetchImpl, calls } = sequenceFetch([textResponse("unused")]);
