@@ -97,6 +97,12 @@ export class UniversalUsageHost {
   private lastSnapshot: TargetSnapshot | undefined;
   /** Increments on every activation and on shutdown; it is the lifetime in the stamp. */
   private generation = 0;
+  /** Orders overlapping credential resolutions for the active selection. */
+  private resolutionSequence = 0;
+  /** Latest resolution already adopted, rather than merely started. */
+  private adoptedResolutionSequence = 0;
+  /** Changes whenever a different effective identity is adopted. */
+  private identityRevision = 0;
   /** Stamp captured by the `turn_start` that opened the current turn; passive headers need this attribution. */
   private turnStamp: Stamp | undefined;
   private timer: ReturnType<typeof setInterval> | undefined;
@@ -195,10 +201,12 @@ export class UniversalUsageHost {
     this.turnStamp = undefined;
     this.paintText(ctx, `${model.provider}: checking usage...`);
 
+    const sequence = ++this.resolutionSequence;
     const resolution = await resolveTarget(ctx.modelRegistry, model, { allowInsecureHttp: true });
     // Resolution is asynchronous, and a silent same-ID replacement emits no
     // event: only the live stamp may decide whether this result is still owed.
-    if (!this.isCurrent(stamp, ctx)) return;
+    if (!this.isCurrent(stamp, ctx) || sequence < this.adoptedResolutionSequence) return;
+    this.adoptedResolutionSequence = sequence;
 
     if (!resolution.ok) {
       // Keep the selection so a later /usage or selection can retry resolution.
@@ -218,8 +226,8 @@ export class UniversalUsageHost {
   /**
    * Refresh the active target, re-resolving its effective auth and base URL
    * first. Every caller runs its own attempt: the monitor already deduplicates
-   * identical request sequences per identity, and the stamp check prevents a
-   * duplicate publication.
+   * identical request sequences per identity. Selection and identity checks
+   * prevent superseded results from publishing.
    */
   async refreshActive(
     ctx: ExtensionContext,
@@ -231,16 +239,31 @@ export class UniversalUsageHost {
     const stamp = stampOf(this.generation, model);
     this.lastAutoRefreshAt = this.now();
 
+    const sequence = ++this.resolutionSequence;
     const resolution = await resolveTarget(ctx.modelRegistry, model, { allowInsecureHttp: true });
     if (!this.isCurrent(stamp, ctx)) return undefined;
+    if (sequence < this.adoptedResolutionSequence) {
+      // A later resolution for the same identity is safe to share; a different
+      // identity (or failure) must not replace the newer binding.
+      if (!resolution.ok || resolution.target.identity.key !== this.active?.target?.identity.key) return undefined;
+    } else {
+      this.adoptedResolutionSequence = sequence;
+    }
     if (!resolution.ok) {
+      if (this.active?.target !== undefined) this.identityRevision++;
       this.active = { model };
       this.turnStamp = undefined;
       this.lastSnapshot = this.failureSnapshot(resolution);
       this.paint(ctx);
       return this.lastSnapshot;
     }
+    if (this.active?.target?.identity.key !== resolution.target.identity.key) {
+      this.identityRevision++;
+      this.turnStamp = undefined;
+      this.lastSnapshot = undefined;
+    }
     this.active = { model, target: resolution.target };
+    const identityRevision = this.identityRevision;
 
     const snapshot = await this.monitor.refresh(
       resolution.target,
@@ -248,9 +271,8 @@ export class UniversalUsageHost {
       this.config,
       { force: options.force === true },
     );
-    // A cancelled run, a replaced activation, or a live selection that moved
-    // without an event may not publish.
-    if (!this.isCurrent(stamp, ctx)) return undefined;
+    // A replaced activation, moved selection, or superseded identity may not publish.
+    if (!this.isCurrent(stamp, ctx) || identityRevision !== this.identityRevision) return undefined;
     this.lastSnapshot = snapshot;
     this.paint(ctx);
     return snapshot;
@@ -263,18 +285,23 @@ export class UniversalUsageHost {
    */
   private async reselectActive(ctx: ExtensionContext, model: Model<any>): Promise<void> {
     const stamp = stampOf(this.generation, model);
-    const previousKey = this.active?.target?.identity.key;
     this.monitor.cancel();
     this.turnStamp = undefined;
 
+    const sequence = ++this.resolutionSequence;
     const resolution = await resolveTarget(ctx.modelRegistry, model, { allowInsecureHttp: true });
-    if (!this.isCurrent(stamp, ctx)) return;
+    if (!this.isCurrent(stamp, ctx) || sequence < this.adoptedResolutionSequence) return;
+    this.adoptedResolutionSequence = sequence;
+    // Another refresh may have adopted an identity while resolution was pending.
+    const previousKey = this.active?.target?.identity.key;
     if (!resolution.ok) {
+      if (previousKey !== undefined) this.identityRevision++;
       this.active = { model };
       this.lastSnapshot = this.failureSnapshot(resolution);
       this.paint(ctx);
       return;
     }
+    if (previousKey !== resolution.target.identity.key) this.identityRevision++;
     this.active = { model, target: resolution.target };
     // A changed route must not repaint measurements from the old origin or auth.
     if (previousKey !== resolution.target.identity.key) this.lastSnapshot = undefined;
@@ -325,21 +352,43 @@ export class UniversalUsageHost {
     const stamp = this.reportStamp(ctx);
 
     const snapshots: TargetSnapshot[] = [];
+    let missingActive = false;
+    let activeSnapshotRevision: number | undefined;
     // The active target is always included; other providers only when the user
     // opted into them before the session (explicit config entries) or asked.
     for (const target of this.reportTargets(ctx, requested)) {
+      const isActive = target.kind === "model" && this.isCurrentModel(target.model);
       const snapshot =
         target.kind === "unresolved"
           ? this.unresolvedSnapshot(target.providerId)
-          : this.isCurrentModel(target.model)
+          : isActive
             ? await this.refreshActive(ctx, { force: true, model: target.model })
             : await this.snapshotForModel(ctx, target.model);
-      if (snapshot !== undefined) snapshots.push(snapshot);
+      if (snapshot !== undefined) {
+        snapshots.push(snapshot);
+        if (isActive) activeSnapshotRevision = this.identityRevision;
+      } else if (isActive) missingActive = true;
     }
     // One check before publishing: a report that spans a selection change or a
     // shutdown is discarded silently. Nothing awaits between this and the paint.
     if (!this.isCurrent(stamp, ctx)) return;
     const active = this.lastSnapshot;
+    // A report can wait on another provider after the active credential rotates.
+    // Never include a snapshot for the superseded active identity.
+    const activeProvider = this.active?.model.provider;
+    const activeKey = this.active?.target?.identity.key;
+    for (let index = snapshots.length - 1; index >= 0; index--) {
+      const snapshot = snapshots[index];
+      if (snapshot?.identity.providerId === activeProvider &&
+        ((activeKey !== undefined && snapshot.identity.key !== activeKey) ||
+          (activeSnapshotRevision !== undefined && activeSnapshotRevision !== this.identityRevision))) {
+        snapshots.splice(index, 1);
+        missingActive = true;
+      }
+    }
+    // A superseded active read is not an unresolved provider. If its replacement
+    // has not finished, leave the existing report alone rather than publish a lie.
+    if (missingActive && active === undefined) return;
     if (active !== undefined && !snapshots.some((snapshot) => snapshot.identity.key === active.identity.key)) {
       snapshots.unshift(active);
     }

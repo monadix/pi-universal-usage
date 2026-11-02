@@ -38,6 +38,29 @@ function monitorWith(fetchImpl: typeof fetch): UsageMonitor {
 const config = normalizeConfig({ refreshSeconds: 300 });
 
 describe("UsageMonitor", () => {
+  for (const scheme of ["auto", "kimi-json"] as const) {
+    it(`recognizes durationless Kimi quotas through the monitor in ${scheme} mode`, async () => {
+      const target = await targetFor({ provider: "kimi", baseUrl: "https://api.kimi.com" });
+      const { fetchImpl, calls } = sequenceFetch([jsonResponse({ limits: [{ detail: { limit: 5, used: 1 } }] })]);
+      const monitor = monitorWith(fetchImpl);
+      const snapshot = await monitor.refresh(target, { scheme }, config);
+      assert.equal(snapshot.status, "ok");
+      assert.equal(snapshot.scheme, "kimi-json");
+      assert.equal(snapshot.metrics[0]?.usedPercent, 20);
+      assert.equal(snapshot.metrics[0]?.durationSeconds, undefined);
+      assert.equal(snapshot.nextRetryAt, undefined);
+      assert.equal(calls.length, 1);
+    });
+
+    it(`rejects malformed durationless Kimi quotas in ${scheme} mode`, async () => {
+      const target = await targetFor({ provider: "kimi", baseUrl: "https://api.kimi.com" });
+      const { fetchImpl } = sequenceFetch([jsonResponse({ limits: [{ detail: { limit: 5, used: "invalid" } }] })]);
+      const snapshot = await monitorWith(fetchImpl).refresh(target, { scheme }, config);
+      assert.equal(snapshot.status, "unsupported");
+      assert.equal(snapshot.metrics.length, 0);
+    });
+  }
+
   it("fetches a known first-party endpoint once and serves the cached snapshot", async () => {
     const target = await targetFor({ provider: "deepseek", baseUrl: "https://api.deepseek.com" });
     const { fetchImpl, calls } = sequenceFetch([

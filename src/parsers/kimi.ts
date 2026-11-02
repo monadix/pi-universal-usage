@@ -105,15 +105,14 @@ export const kimiJsonParser: UsageParser = {
   detect(input: ParseInput): boolean {
     const root = objectValue(input.json);
     if (root === undefined) return false;
-    const usage = objectValue(root.usage);
-    if (usage !== undefined && (decimalValue(usage.limit) !== undefined || decimalValue(usage.used) !== undefined || decimalValue(usage.remaining) !== undefined)) {
-      return true;
-    }
+    if (readBucket(root.usage) !== undefined) return true;
     const limits = arrayValue(root.limits);
     if (limits === undefined) return false;
     return limits.some((entry) => {
       const item = objectValue(entry);
-      return item !== undefined && objectValue(item.detail) !== undefined && objectValue(item.window) !== undefined;
+      return item !== undefined &&
+        (objectValue(item.detail) !== undefined || objectValue(item.window) !== undefined) &&
+        readBucket(item.detail ?? item) !== undefined;
     });
   },
 

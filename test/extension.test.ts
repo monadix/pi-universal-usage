@@ -214,6 +214,232 @@ describe("pi extension wiring", () => {
     host.shutdown(fakeA.ctx);
   });
 
+  it("completes a report when a later same-identity resolution is still pending", async () => {
+    let releaseFirst!: () => void;
+    let releaseSecond!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const secondGate = new Promise<void>((resolve) => { releaseSecond = resolve; });
+    const { fetchImpl, calls: requests } = sequenceFetch([codexBody(22)]);
+    const model = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
+    const { pi, host, registry } = buildHost({ fetchImpl, models: [model] });
+    const fake = fakeContext({ model, registry, mode: "rpc" });
+    await pi.emit("model_select", { model }, fake.ctx);
+    let calls = 0;
+    const resolve = registry.getApiKeyAndHeaders.bind(registry);
+    registry.getApiKeyAndHeaders = async (selected) => {
+      const gate = ++calls === 1 ? firstGate : secondGate;
+      await gate;
+      return resolve(selected);
+    };
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    const report = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => calls >= 1);
+    const later = host.refreshActive(fake.ctx, { force: true });
+    await waitFor(() => calls >= 2);
+    releaseFirst();
+    await report;
+    assert.equal(requests.length, 1);
+    assert.match((fake.widgets.at(-1)?.lines ?? []).join("\n"), /cpa\/chat[\s\S]*22%/);
+    releaseSecond();
+    await later;
+    host.shutdown(fake.ctx);
+  });
+
+  it("keeps an in-flight report when reselection adopts the same rotated identity", async () => {
+    let releaseReport!: () => void;
+    let releaseReselect!: () => void;
+    let releaseFetch!: () => void;
+    const reportGate = new Promise<void>((resolve) => { releaseReport = resolve; });
+    const reselectGate = new Promise<void>((resolve) => { releaseReselect = resolve; });
+    const fetchGate = new Promise<void>((resolve) => { releaseFetch = resolve; });
+    let key = "key-a";
+    let fetchStarted = false;
+    const fetchImpl = (async (_input: string | URL | Request, init?: RequestInit) => {
+      assert.equal(new Headers(init?.headers).get("authorization"), "Bearer key-b");
+      fetchStarted = true;
+      await fetchGate;
+      return codexBody(22);
+    }) as typeof fetch;
+    const model = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
+    const { pi, host, registry } = buildHost({ fetchImpl, models: [model], auth: () => ({ apiKey: key }) });
+    const fake = fakeContext({ model, registry, mode: "rpc" });
+    await pi.emit("model_select", { model }, fake.ctx);
+    key = "key-b";
+    let resolutions = 0;
+    const resolve = registry.getApiKeyAndHeaders.bind(registry);
+    registry.getApiKeyAndHeaders = async (selected) => {
+      const gate = ++resolutions === 1 ? reportGate : reselectGate;
+      await gate;
+      return resolve(selected);
+    };
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    const report = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => resolutions === 1);
+    const reselect = pi.emit("model_select", { model }, fake.ctx);
+    await waitFor(() => resolutions === 2);
+    releaseReport();
+    await waitFor(() => fetchStarted);
+    releaseReselect();
+    await reselect;
+    releaseFetch();
+    await report;
+    assert.match((fake.widgets.at(-1)?.lines ?? []).join("\n"), /cpa\/chat[\s\S]*22%/);
+    assert.match(String(fake.statuses.at(-1)), /22%/);
+    host.shutdown(fake.ctx);
+  });
+
+  it("invalidates a newly adopted identity when a pending reselection fails", async () => {
+    let releaseReport!: () => void;
+    let releaseReselect!: () => void;
+    let releaseFetch!: () => void;
+    const reportGate = new Promise<void>((resolve) => { releaseReport = resolve; });
+    const reselectGate = new Promise<void>((resolve) => { releaseReselect = resolve; });
+    const fetchGate = new Promise<void>((resolve) => { releaseFetch = resolve; });
+    let key: string | undefined;
+    let fetchStarted = false;
+    const fetchImpl = (async () => {
+      fetchStarted = true;
+      await fetchGate;
+      return codexBody(22);
+    }) as typeof fetch;
+    const model = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
+    const { pi, host, registry } = buildHost({ fetchImpl, models: [model], auth: () => key === undefined ? {} : { apiKey: key } });
+    const fake = fakeContext({ model, registry, mode: "rpc" });
+    await pi.emit("model_select", { model }, fake.ctx);
+    key = "key-b";
+    let resolutions = 0;
+    const resolve = registry.getApiKeyAndHeaders.bind(registry);
+    registry.getApiKeyAndHeaders = async (selected) => {
+      if (++resolutions === 1) {
+        await reportGate;
+        return resolve(selected);
+      }
+      await reselectGate;
+      return { ok: false, error: "credential removed" };
+    };
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    const report = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => resolutions === 1);
+    const reselect = pi.emit("model_select", { model }, fake.ctx);
+    await waitFor(() => resolutions === 2);
+    releaseReport();
+    await waitFor(() => fetchStarted);
+    releaseReselect();
+    await reselect;
+    releaseFetch();
+    await report;
+    assert.match(String(fake.statuses.at(-1)), /no-credential/);
+    assert.doesNotMatch((fake.widgets.at(-1)?.lines ?? []).join("\n"), /22%/);
+    host.shutdown(fake.ctx);
+  });
+
+  it("ignores a delayed old credential resolution after a newer identity is adopted", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let key = "key-a";
+    let holding = false;
+    let started = false;
+    const auth = (): FakeAuth => {
+      if (holding) {
+        started = true;
+        return { apiKey: key, wait: gate };
+      }
+      return { apiKey: key };
+    };
+    const { fetchImpl, calls } = sequenceFetch([codexBody(22)]);
+    const model = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
+    const { pi, host, registry } = buildHost({ fetchImpl, models: [model], auth });
+    const fake = fakeContext({ model, registry, mode: "rpc" });
+    await pi.emit("model_select", { model }, fake.ctx);
+    holding = true;
+    const older = host.refreshActive(fake.ctx, { force: true });
+    await waitFor(() => started);
+    holding = false;
+    key = "key-b";
+    assert.equal((await host.refreshActive(fake.ctx, { force: true }))?.metrics[0]?.usedPercent, 22);
+    release();
+    assert.equal(await older, undefined);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.headers.authorization, "Bearer key-b");
+    assert.match(String(fake.statuses.at(-1)), /22%/);
+    host.shutdown(fake.ctx);
+  });
+
+  it("replaces an old account in a report waiting on another provider", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let peerStarted = false;
+    let key = "key-a";
+    const cpa = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
+    const peer = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("api.deepseek.com")) {
+        peerStarted = true;
+        await gate;
+        return jsonResponse({ balance_infos: [{ currency: "USD", total_balance: "3" }] });
+      }
+      return codexBody(new Headers(init?.headers).get("authorization") === "Bearer key-a" ? 11 : 22);
+    }) as typeof fetch;
+    const { pi, host, registry } = buildHost({
+      fetchImpl, models: [cpa, peer], auth: () => ({ apiKey: key }),
+      config: normalizeConfig({ providers: { deepseek: { enabled: true } } }),
+    });
+    const fake = fakeContext({ model: cpa, registry, mode: "rpc" });
+    await pi.emit("model_select", { model: cpa }, fake.ctx);
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    const report = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    await waitFor(() => peerStarted);
+    key = "key-b";
+    await host.refreshActive(fake.ctx, { force: true });
+    release();
+    await report;
+    const text = (fake.widgets.at(-1)?.lines ?? []).join("\n");
+    assert.match(text, /22%/);
+    assert.doesNotMatch(text, /11%/);
+    assert.match(text, /deepseek\/chat/);
+    host.shutdown(fake.ctx);
+  });
+
+  it("does not publish a delayed refresh after credentials rotate on the same selection", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let started = false;
+    let key = "key-a";
+    const fetchImpl = (async (_input: string | URL | Request, init?: RequestInit) => {
+      const authorization = new Headers(init?.headers).get("authorization");
+      if (authorization === "Bearer key-a") {
+        started = true;
+        await gate;
+        return codexBody(11);
+      }
+      assert.equal(authorization, "Bearer key-b");
+      return codexBody(22);
+    }) as typeof fetch;
+    const model = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
+    const { pi, host, registry } = buildHost({ fetchImpl, models: [model], auth: () => ({ apiKey: key }) });
+    const fake = fakeContext({ model, registry, mode: "rpc" });
+    await pi.emit("model_select", { model }, fake.ctx);
+    const pending = host.refreshActive(fake.ctx, { force: true });
+    await waitFor(() => started);
+    key = "key-b";
+    const newer = await host.refreshActive(fake.ctx, { force: true });
+    assert.equal(newer?.metrics[0]?.usedPercent, 22);
+    assert.match(String(fake.statuses.at(-1)), /22%/);
+    release();
+    assert.equal(await pending, undefined);
+    assert.match(String(fake.statuses.at(-1)), /22%/);
+    const command = pi.commands.get(COMMAND_NAME);
+    assert.ok(command);
+    await command.handler("", fake.ctx as unknown as ExtensionCommandContext);
+    assert.match((fake.widgets.at(-1)?.lines ?? []).join("\n"), /22%/);
+    host.shutdown(fake.ctx);
+  });
+
   it("applies passive response headers only while a turn is in flight", async () => {
     const { fetchImpl } = sequenceFetch([codexBody(5)]);
     const model = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
