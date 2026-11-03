@@ -17,6 +17,8 @@
     "extensions",
     "src",
     "scripts",
+    "docs",
+    "CONTRIBUTING.md",
     "README.md",
     "LICENSE"
   ],

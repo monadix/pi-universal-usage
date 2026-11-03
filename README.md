@@ -1,187 +1,100 @@
 # pi-universal-usage
 
-A small, read-only usage monitor for the [Pi coding agent](https://pi.dev). It
-shows subscription quota windows, request/token rate-limit budgets, key budgets,
-and account balances for the provider you are using, and can report on other
-providers you opt into.
+A read-only usage monitor for the [Pi coding agent](https://pi.dev). See your
+active provider's subscription usage, request/token budgets, or account balance
+in the footer, and run `/usage` for a detailed report.
 
-It is provider-ID independent: a pure parser registry recognises popular
-quota-compatibility wire formats, and endpoint selection is a separate, bounded
-step. Unknown stays unknown; nothing is reported as `0%` because a field was
-missing.
+- Supports ChatGPT/Codex, Anthropic subscriptions, DeepSeek, OpenRouter, Kimi
+  Coding, Z.ai, and compatible proxies.
+- Uses the credentials Pi already resolves; no separate login or secrets file.
+- Reports missing data as unknown, not as zero usage.
 
-## Guarantees
+## Install
 
-- **Read-only.** Only `GET` requests, no inference calls, no request-payload
-  rewriting, no model probes, no browser scraping, no management credentials.
-- **Credential-scoped.** Requests go to the origin Pi resolved for the model's
-  credential. Redirects are refused (the refused response body is closed), URLs
-  with userinfo are refused, body size and time are bounded, and custom
-  credentials never travel to a vendor's official host. The effective credential
-  and base URL are re-resolved on every refresh; only the endpoint path is
-  cached, never a credential-bearing request.
-- **No hidden network at load.** The extension factory only registers handlers
-  and reads configuration. Network reads start at session start, `/usage`, a
-  model switch, a turn end (throttled), or in TUI mode on a throttled timer.
-- **No secrets in configuration or output.** The config file has no credential
-  fields; reports show provider, scheme, endpoint path, percentages, amounts,
-  and reset times. Remotely supplied text is stripped of terminal escape and
-  control sequences before it reaches the footer or report.
+```sh
+pi install git:github.com/monadix/pi-universal-usage
+```
 
-## Load it
-
-Try it for one invocation without installing anything:
+Requires Node.js 22.19 or newer and a compatible Pi runtime. To try a local
+checkout for one invocation:
 
 ```sh
 pi -e /absolute/path/to/pi-universal-usage
 ```
 
-Or install the package as usual (`pi install ./pi-universal-usage`). The
-extension entry point is `extensions/index.ts`; Pi loads the TypeScript directly.
+## Use
 
-## Use it
+The footer shows a compact summary for the active provider, for example:
 
-- `/usage` — refresh the active provider and every provider listed in your
-  configuration, then show the detailed report. Accepts provider ids:
-  `/usage deepseek`, `/usage deepseek cpa`. Providers are reported sequentially
-  and all selected providers are included; there is no silent provider cap. A
-  requested or configured provider with no registered model is still listed as
-  `<provider>/no model` with `state: unknown` and a notice, and needs no
-  request.
-- The footer shows a compact line for the active provider, for example
-  `cpa: weekly 42% · reset 2d 3h` or `deepseek: USD $8.82`. An elapsed window is
-  qualified as `reset elapsed` on its own metric, the nearest future reset is
-  summarized, and a snapshot older than twice the refresh interval is marked
-  `stale`. A Codex `secondary` window is labeled `weekly` only when the payload
-  declares a seven-day duration; another declared duration is shown compactly
-  (`1d`), and an unstated one stays `secondary`.
-
-The detailed report shows state, scheme, endpoint path, freshness, one line per
-metric with scope and reset, plus any notice (for example CPA shadow quota mode)
-or error.
-
-`/usage` is the actual command name. If another extension already registered
-`/usage`, Pi reports the conflict; disable one of the two.
-
-## Supported schemes
-
-Parsing is a registry of pure functions over unknown JSON or response headers.
-`auto` (the default) checks structural signatures and numeric/date semantics.
-
-| Scheme id | Input | Contract |
-|---|---|---|
-| `codex-json` | Codex/WHAM body | `rate_limit.primary_window` / `secondary_window`, `used_percent` (a finite, non-negative percentage), `limit_window_seconds`, `reset_at` (Unix seconds) or `reset_after_seconds`, `allowed` / `limit_reached`, optional `credits`. A `null` or absent primary window is valid (weekly-only plans). A compatible proxy can report more than 100% once an allocation is over-consumed; that over-allocation is preserved, not rejected as malformed. |
-| `codex-headers` | Response headers | `x-codex-primary|secondary-used-percent` (the same finite, non-negative percentage rule), `-window-minutes`, `-reset-at`, `-reset-after-seconds`, `x-codex-credits-*`. |
-| `anthropic-json` | Anthropic usage body | `five_hour`, `seven_day`, and per-model `seven_day_<model>` windows with `utilization` (0..100) and `resets_at` (ISO-8601). Window names come from the payload keys only. |
-| `anthropic-headers` | Response headers | `anthropic-ratelimit-unified-5h|7d-utilization` (0..1 fraction, scaled once), `-reset` (Unix seconds), `-status` (`rejected`). |
-| `rate-limit-headers` | Response headers | `x-ratelimit-limit|remaining-requests`, `-tokens`, and their duration `reset` headers; bare `x-ratelimit-limit|remaining|reset` (its reset is an absolute Unix timestamp; a value that cannot be one is ignored, never reinterpreted as a duration); `RateLimit-Limit|Remaining|Reset` with `RateLimit-Policy` (reset is delta-seconds). Request and token budgets stay distinct from subscription windows. `Retry-After` is only a retry delay, never a quota percentage. Independent header dimensions may coexist. |
-| `openrouter-json` | `/api/v1/key`, `/api/v1/credits` | Key budget (`limit`, `limit_remaining`, `limit_reset`), key spend when the cap is `null`, and account credits (`total_credits` − `total_usage`). Scopes stay separate; a working key response never needs the credits response. When the credits body has `total_credits` but no usable `total_usage`, the purchased total is shown as a breakdown and the remaining balance stays unknown. |
-| `deepseek-balance` | `/user/balance` | `is_available` and `balance_infos[]` with `currency`, `total_balance`, `granted_balance`, `topped_up_balance` as decimal strings. One metric per currency; zero and negative amounts are preserved. |
-| `kimi-json` | Kimi Coding `/usages` | Plan `usage` bucket and `limits[]` with `window.duration`/`window.timeUnit` and `detail.limit|used|remaining|resetTime` (numbers or numeric strings). A bucket whose `used`/`remaining` is present but not numeric is dropped. |
-| `zai-json` | Z.ai quota limit | `data.limits[]` with `type` (`TOKENS_LIMIT`, `CREDIT_LIMIT`, `TIME_LIMIT`), `(unit, number)` window, `percentage` (consumed percent), `usage` (the limit), `currentValue` (consumed), `remaining`, `nextResetTime` (epoch milliseconds). The inverted naming is respected; `(unit, number)` pairs are shown verbatim rather than renamed. A response envelope with `success: false` or a non-200 `code` is rejected even if it carries limits, so an API error is never reported as usage. |
-
-Percent scaling is explicit per scheme. Malformed or partial siblings are
-skipped and reported as a notice, never turned into a full or zero value.
-A finite non-negative percentage above 100 is over-allocation, not a malformed
-value: the measurement keeps its reported percentage and the detailed report
-notes that usage is above 100%, while the footer and compact percentages are
-drawn capped at 100%. Elapsed resets are shown as `reset elapsed`, not silently
-replenished.
-
-## Endpoint selection
-
-1. **Explicit configuration** — `providers.<id>.path` (plus `pathMode`) always
-   wins and stays on the credential's origin. When the configured URL is exactly
-   a documented first-party quota endpoint for that provider and origin, its
-   required headers are retained (Z.ai raw key, Anthropic OAuth beta headers,
-   ChatGPT account id); an arbitrary path never inherits them.
-2. **First-party hints** — bound to a known provider id *and* that provider's
-   exact official origin:
-
-   | Provider ids | Official origin | Request |
-   |---|---|---|
-   | `openai-codex` | `https://chatgpt.com` | `GET <base>/wham/usage` |
-   | `anthropic` (OAuth only) | `https://api.anthropic.com` | `GET /api/oauth/usage` (`anthropic-version`, OAuth `anthropic-beta`) |
-   | `deepseek` | `https://api.deepseek.com` | `GET /user/balance` |
-   | `openrouter` | `https://openrouter.ai` | `GET /api/v1/key` (+ optional `/api/v1/credits`) |
-   | `kimi`, `kimi-coding`, `moonshot`, … | `https://api.kimi.com` | `GET /coding/v1/usages` (`Authorization: Bearer <coding credential>`) |
-   | `zai`, `glm`, `zhipu`, … | `https://api.z.ai` | `GET /api/monitor/usage/quota/limit` (raw key in `Authorization`, no `Bearer`) |
-
-   API-key credentials for `anthropic` or `openai` have no quota interface here
-   and are reported as unsupported without a request (passive response headers
-   still update the footer). An Anthropic subscription token supplied through
-   `ANTHROPIC_AUTH_TOKEN` arrives as a header-only bearer credential and is
-   still recognized by its `sk-ant-oat` prefix, so it uses the subscription
-   endpoint with the header Pi resolved. Pi's native `openai` OAuth flow obtains an
-   API-audience token, which is not an established legacy ChatGPT/WHAM
-   credential; `https://api.openai.com` is therefore reported as unsupported
-   rather than sending that token to `chatgpt.com`. Only the legacy
-   `openai-codex` provider keeps the ChatGPT host mapping. A provider registered
-   as `openai` at a custom origin still uses same-origin discovery. The Z.ai
-   raw-key form and the Anthropic OAuth beta header apply only on those exact
-   official origins; custom origins keep the credentials and headers Pi
-   resolved. Header normalization always acts on the effective authorization
-   credential Pi resolved: a separately returned API key is never substituted.
-   Kimi's quota endpoint requires a bearer token, so the `x-api-key` credential
-   Pi's Anthropic transport resolved for an ordinary Kimi API key is normalized
-   to `Authorization: Bearer`; an explicit Authorization header is kept and a
-   suppressed one stays absent.
-   An explicit `ChatGPT-Account-Id` routing header is preserved, a
-   null-suppressed one stays absent, and token attribution is added only when
-   neither applies. Transport defaults are synthesized per header name, so an
-   auxiliary `x-api-key` does not suppress the OpenAI-compatible `Authorization`
-   default; a null or empty value for that default still does.
-3. **Same-origin discovery** — for an unknown provider id (for example the
-   runtime-registered `cpa`) or a custom reverse-proxy origin, a bounded list of
-   conservative same-origin paths is tried: `/wham/usage`,
-   `/backend-api/wham/usage`, `/api/codex/usage`, `/user/balance`, `/api/v1/key`,
-   `/coding/v1/usages`, `/api/monitor/usage/quota/limit`. The list is ordered by
-   provider-id hints, deduplicated, and capped by `maxDiscoveryRequests`
-   (default 4). The successful endpoint URL is cached per effective identity
-   (provider, origin, base path, auth source, and an opaque in-memory digest of
-   the resolved auth/routing headers plus their suppression metadata). Request
-   headers are rebuilt on every refresh, so a rotated credential, changed
-   routing header, or newly suppressed default is never replayed from the cache.
-
-An explicit `providers.<id>.scheme` is strict: when the response does not match
-that scheme, the refresh reports `unsupported` instead of trying another parser.
-A headers-only scheme cannot be requested from a path and is reported without a
-request.
-
-Reverse-proxy base paths are preserved: with `pathMode: "base"` a path is joined
-to the effective base path, with `"origin"` it starts at the origin root.
-
-### CPA (CLIProxyAPI) example
-
-Zero configuration is usually enough: a `cpa` provider at
-`http://localhost:8317/v1` is discovered through same-origin probing, because
-CLIProxyAPI serves `/backend-api/wham/usage`, `/wham/usage`, and
-`/api/codex/usage` at the origin root. To skip discovery and pin the endpoint:
-
-```json
-{
-  "providers": {
-    "cpa": {
-      "scheme": "auto",
-      "path": "/backend-api/wham/usage",
-      "pathMode": "origin"
-    }
-  }
-}
+```text
+cpa: weekly 42% · reset 2d 3h
+deepseek: USD $8.82
 ```
 
-CPA's Codex status body is weekly-only (`primary_window: null`,
-`secondary_window` populated) and reports `plan_type: "unknown"` with
-`quota_mode: "shadow"` or `"enforce"`. Shadow mode is preserved as a notice:
-the report says the quota is advisory and not enforced. HTTP 503 with
-`status_unavailable` is reported as unavailable, not as 0%.
+Run:
+
+```text
+/usage
+/usage deepseek
+/usage deepseek cpa
+```
+
+With no arguments, `/usage` refreshes the active provider and enabled providers
+listed in your configuration. Arguments select providers to refresh instead of
+that default list; the report can also include the active provider's last
+measurement. Disabled non-active providers are skipped.
+
+The detailed report shows freshness, usage or balance, reset times, source,
+and any errors or provider notices. A requested provider with no registered
+model is listed as unknown rather than silently omitted.
+
+### Reading the results
+
+- Usage percentages describe the provider's reported consumption. Values above
+  100% remain visible in the detailed report; compact percentages cap at 100%.
+- A reset time in the past is shown as `reset elapsed`, not assumed replenished.
+- Measurements older than twice the refresh interval are marked `stale`.
+- Codex windows are labeled by their declared duration; an unspecified duration
+  stays `primary` or `secondary`, rather than being guessed.
+- Request/token rate limits, subscription quotas, key budgets, and balances are
+  distinct measurements—not interchangeable estimates.
+- When no quota endpoint is available, supported response headers can supply the
+  last measurement for the same model. `/usage` retains its original timestamp.
+
+Automatic refresh runs only in TUI mode: at startup and model selection, after
+agent activity when throttling permits, and on a timer (five minutes by default).
+Use `/usage` to request a refresh manually. Concurrent reads for the same account
+share an in-flight request.
+
+## Supported providers
+
+| Provider | What can be shown |
+|---|---|
+| `openai-codex` | ChatGPT subscription windows and optional credits |
+| `anthropic` with OAuth/subscription credentials | Subscription and per-model windows |
+| `deepseek` | Account balance by currency |
+| `openrouter` | Key budget or spend, plus optional account credits |
+| Kimi Coding | Plan usage and quota windows, including durationless buckets |
+| Z.ai | Token, credit, and time-limit quotas |
+| Compatible custom providers/proxies, including CPA | Recognized usage formats through same-origin endpoint discovery |
+
+The official `openai` API origin is not a ChatGPT subscription usage endpoint.
+Use `openai-codex` for that subscription. OpenAI and Anthropic API-key usage
+can be shown from supported response headers, but no subscription endpoint is
+queried for those credentials.
+
+See [Compatibility](docs/compatibility.md) for scheme IDs, wire formats,
+official endpoints, and custom-provider authentication rules.
 
 ## Configuration
 
-Global file only: `<agent dir>/pi-universal-usage.json`, where the agent dir is
-Pi's `PI_CODING_AGENT_DIR` (default `~/.pi/agent`). A project-local file is
-deliberately ignored: a repository must not be able to redirect credentialed
-requests. The file contains no secrets; every field is optional.
+No configuration is required for supported first-party providers. Optional
+settings go in `~/.pi/agent/pi-universal-usage.json`, or under
+`PI_CODING_AGENT_DIR` when you use a custom agent directory. Project-local
+configuration is deliberately ignored.
+
+Every field is optional; this example shows the global defaults and adds
+DeepSeek to the default report:
 
 ```json
 {
@@ -192,126 +105,81 @@ requests. The file contains no secrets; every field is optional.
   "maxDiscoveryRequests": 4,
   "autoRefresh": true,
   "providers": {
-    "cpa": { "path": "/backend-api/wham/usage", "pathMode": "origin" },
-    "deepseek": { "enabled": true },
-    "openrouter": { "scheme": "auto" }
+    "deepseek": { "enabled": true }
   }
 }
 ```
 
-Per provider: `enabled` (default `true`), `scheme`
-(`auto` or a scheme id), `path` (absolute same-origin path), `pathMode`
-(`base` | `origin`, default `base`). `path` must be a plain path such as
-`/wham/usage`: a network-path (`//host/...`), backslash, scheme, or userinfo
-form is rejected. Invalid entries are ignored with a note in the report; they
-never cause a crash or a different origin. `timeoutMs` and
-`maxBodyBytes` are validated and applied to every request (the live smoke uses
-the same configuration). Timer-backed values are bounded by Node's maximum
-timer delay: `refreshSeconds` and `minRefreshSeconds` are at most
-2147483 seconds, and `timeoutMs` is at most 2147483647 milliseconds. A larger
-value falls back to its default with a configuration problem instead of
-creating a 1 ms timer.
+| Setting | Purpose |
+|---|---|
+| `refreshSeconds` | Background timer interval and successful-result cache lifetime |
+| `minRefreshSeconds` | Minimum interval between activity-triggered refresh attempts; the timer also respects this minimum |
+| `timeoutMs` | Timeout for each HTTP request |
+| `maxBodyBytes` | Maximum response body size |
+| `maxDiscoveryRequests` | Maximum endpoint candidates tried for a custom provider |
+| `autoRefresh` | Set to `false` for manual endpoint refresh only; response-header measurements can still update |
+| `providers` | Provider IDs to include in the default report, with optional overrides |
 
-## Behaviour details
+Per-provider options are `enabled` (default `true`), `scheme` (default
+`auto`), `path`, and `pathMode` (default `base`). A disabled provider makes
+no quota requests and produces no passive-header updates.
 
-- Endpoint success is cached; failures are cached with backoff (60 s for a
-  transient error, 5 min for a rate limit or unavailable service, 30 min for
-  rejected credentials or an unsupported provider). `Retry-After` is honored up
-  to one hour. An optional sibling endpoint (for example OpenRouter account
-  credits) keeps its own retry deadline after a 429 or 503, so it is not
-  re-requested early while the required result keeps refreshing. `/usage` forces
-  a refresh.
-- Concurrent refreshes for the same identity share one request sequence. The
-  active provider is re-resolved before each refresh, so rotated credentials and
-  changed auth base URLs take effect without a restart.
-- `after_provider_response` headers paint the footer only while Pi is busy, only
-  when a `turn_start` bound the current turn to the active target, and only when
-  the headers carry a quota dimension. The parsed value is transient: it is not
-  cached and `/usage` never reports it, so the next scheduled or manual refresh
-  replaces it.
-- Every asynchronous path captures one coarse stamp - activation generation plus
-  the selection's provider, model id, API, and base URL - and publishes only
-  while the live selection still stamps the same. A model switch clears the
-  previous provider's snapshot, and a late answer cannot paint the new provider.
-  A cancelled run never writes its snapshot or retry deadline into the cache a
-  replacement refresh now owns.
-- A `/usage` report reads providers one at a time and makes one stamp check
-  before publishing. A report that spans a model switch, a shutdown, or a route
-  change is discarded silently and publishes nothing.
-- Shutdown (quit, reload, session replacement) aborts requests, clears the
-  timer, removes the footer entry, and is idempotent.
-- Background refresh never runs outside TUI mode.
+An explicit path must stay on the credential's origin. Use `pathMode: "base"`
+to append it to the resolved base path, or `"origin"` to start at the origin
+root. For example, pin a CPA endpoint without discovery:
 
-## Development
-
-```sh
-npm install          # devDependencies only (host packages are peer deps)
-npm test             # node --test, sanitized fixtures, no network
-npm run typecheck    # tsc --noEmit
-npm run check        # typecheck + tests
-npm run pack:dry-run # npm pack --dry-run
-npm run load-check   # load the extension with the installed Pi runtime, no session
-npm run live-smoke   # opt-in, GET-only, uses your real Pi providers
+```json
+{
+  "providers": {
+    "cpa": {
+      "path": "/backend-api/wham/usage",
+      "pathMode": "origin"
+    }
+  }
+}
 ```
 
-Live smoke examples:
+Leave `scheme` at `auto` unless you need strict format selection. Invalid
+provider settings are ignored or fall back to defaults, with configuration
+problems shown in the report. Reload the extension after changing the file.
 
-```sh
-npm run live-smoke                                   # openai, deepseek, cpa
-npm run live-smoke -- --provider deepseek            # one provider (unresolvable = failure)
-npm run live-smoke -- --provider openai --json       # sanitized JSON
-```
+## Troubleshooting and limitations
 
-The live smoke uses the installed Pi package (`PI_PACKAGE_DIR` or
-`PI_UNIVERSAL_USAGE_PI_PACKAGE`, falling back to a resolved
-`@earendil-works/pi-coding-agent`), and loads the same settings, credentials,
-models, packages, and configured extensions through the public SDK service
-factory (`createAgentSessionServices`). No session starts and no inference runs.
-It performs one bounded GET sequence per provider and prints only provider id,
-status, scheme, endpoint path, and metric kinds/scalars. Any extension-loading or
-provider-registration error reported by the SDK stops the run with a sanitized
-category before provider validation, so a surviving built-in provider is never
-reported as validation of a failed configured replacement. Every requested
-provider is required: a provider with no registered model (for example a missing
-CPA extension), no usable credential, or no recognized quota answer fails the
-run.
+- **Unsupported or no quota data:** check the credential type and provider table.
+  A custom proxy may need an explicit `path`; discovery is bounded and cannot
+  find every endpoint.
+- **Old or unavailable data:** errors trigger retry backoff: normally one minute
+  for transient failures, five minutes for rate limits/unavailability, and
+  thirty minutes for rejected credentials or unsupported endpoints.
+  `Retry-After` is honored up to one hour. `/usage` bypasses the main backoff;
+  optional endpoints can retain their own retry deadline.
+- **No footer in non-TUI use:** background refresh and the footer are TUI
+  features; use `/usage` for a report.
+- **Command conflict:** if another extension registers `/usage`, disable one.
+- **No report after switching models:** reports that span a selection change
+  are discarded to avoid showing data under the wrong selection.
+- **Header measurements differ from endpoint data:** a response header can
+  temporarily replace the footer with coarser data until the next refresh.
+- **Routing changes:** credentials and base URLs are re-resolved on refresh.
+  A routing-header-only change without a selection event can leave the old
+  footer visible until the next refresh.
 
-## Known limitations
+## Privacy and request safety
 
-- Passive response headers are kept in memory as the last measurement of the
-  model whose inference produced them, so `/usage` reports that value for the
-  same model when no endpoint is requestable. The next passive measurement or a
-  fresh endpoint read replaces it, and it is never reported for another model. A
-  provider with a fresh endpoint snapshot may still have its footer briefly
-  replaced by a coarser header value until the next refresh.
-- A same-model selection change that only alters a model-level routing header is
-  not detected: the stamp covers provider, model id, API, and base URL. The
-  previous route's footer value stays until the next selection event or refresh.
-- A `/usage` run that spans a selection change is discarded without explanation.
-  Its remaining provider reads still run, but nothing is published.
-- Concurrent refreshes of one identity share HTTP sequences inside the monitor,
-  but a duplicate refresh call is not joined across callers: it may issue its own
-  sequence. A request that was already in flight can still publish its
-  measurement after a later refresh reported a failure for the same selection.
-- No quota interface is claimed for providers without one. OpenAI API-key and
-  Anthropic API-key credentials expose no subscription endpoint; only passive
-  response headers are shown.
-- Pi's native `openai` OAuth token is API-audience, not a legacy ChatGPT/WHAM
-  credential. The official `api.openai.com` origin is reported as unsupported
-  with passive headers only; legacy ChatGPT usage is covered by
-  `openai-codex`. A custom-origin `openai` registration uses same-origin
-  discovery.
-- Anthropic per-model windows are shown under the key name the payload uses;
-  no duration is invented for them.
-- Z.ai reset times are read as epoch milliseconds only, matching its published
-  contract; other numeric magnitudes are treated as malformed rather than
-  reinterpreted.
-- Discovery is bounded and same-origin. An exotic proxy with a different usage
-  path needs `providers.<id>.path`.
-- Live validation of a third-party provider extension (for example CPA) uses the
-  extension registration the SDK loader sees. If that proxy does not serve one
-  of the documented quota paths, the smoke reports the failure; pin the path with
-  `providers.<id>.path` when the proxy exposes a different one.
+The monitor makes GET requests only—no inference calls, model probes, browser
+scraping, or management credentials. Custom credentials stay on their resolved
+origin; redirects and URLs containing userinfo are refused. Requests have time
+and body-size limits.
+
+Configuration contains no secrets. Reports omit credentials and sanitize remote
+text before displaying it. Loading the extension registers handlers without
+starting network requests; usage reads begin through session activity or
+`/usage`.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for offline checks, package inspection,
+and opt-in live provider tests.
 
 ## Sources and provenance
 
