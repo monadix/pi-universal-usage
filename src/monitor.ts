@@ -87,8 +87,16 @@ function mergeNotice(...values: Array<string | undefined>): string | undefined {
   return parts.length > 0 ? parts.join("; ") : undefined;
 }
 
+const cancelled = Symbol("cancelled refresh");
+
+/** Cancellation is distinct from an actual provider failure, regardless of its message. */
+export function isCancelledSnapshot(snapshot: TargetSnapshot): boolean {
+  return cancelled in snapshot;
+}
+
 function cancelledSnapshot(target: ResolvedTarget, now: number): TargetSnapshot {
-  return {
+  const snapshot: TargetSnapshot & { [cancelled]: true } = {
+    [cancelled]: true,
     identity: target.identity,
     status: "error",
     metrics: [],
@@ -96,6 +104,7 @@ function cancelledSnapshot(target: ResolvedTarget, now: number): TargetSnapshot 
     fetchedAt: now,
     source: "cache",
   };
+  return snapshot;
 }
 
 function endpointLabel(url: URL): string {
@@ -269,7 +278,7 @@ export class UsageMonitor {
     if (config.providers.get(target.identity.providerId)?.enabled === false) return undefined;
     const now = this.now();
     const results = parseHeaderPayload(headers, status, now);
-    if (results.length === 0) return undefined;
+    if (results.length === 0 && status !== 429) return undefined;
     const metrics: UsageMetric[] = [];
     for (const result of results) {
       for (const metric of result.metrics) metrics.push(metric);

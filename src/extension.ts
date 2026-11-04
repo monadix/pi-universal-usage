@@ -10,6 +10,7 @@
  * the wrong provider.
  */
 
+import { writeSync } from "node:fs";
 import type { Model } from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
@@ -18,10 +19,12 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { resolveTarget, type ResolvedTarget, type TargetResolution } from "./auth.ts";
 import { loadConfig, STATUS_KEY, type UsageConfig } from "./config.ts";
-import { formatCompact, formatReport } from "./format.ts";
+import { formatCompact, formatCompactRateLimit, formatReport } from "./format.ts";
 import { plainText } from "./text.ts";
-import { UsageMonitor } from "./monitor.ts";
+import { isCancelledSnapshot, UsageMonitor } from "./monitor.ts";
 import type { TargetSnapshot } from "./types.ts";
+import { UsageWarnings } from "./warnings.ts";
+import { UsageView } from "./usage-view.ts";
 
 export const COMMAND_NAME = "usage";
 export const REPORT_WIDGET_KEY = "universal-usage-report";
@@ -91,6 +94,7 @@ export class UniversalUsageHost {
   private readonly readConfig: () => UsageConfig;
   private readonly now: () => number;
   private readonly timersEnabled: boolean;
+  private readonly warnings = new UsageWarnings();
 
   private config: UsageConfig;
   private active: ActiveTarget | undefined;
@@ -110,6 +114,8 @@ export class UniversalUsageHost {
   private timerContext: ExtensionContext | undefined;
   private lastAutoRefreshAt = 0;
   private disposed = false;
+  private view: UsageView | undefined;
+  private viewOpening = false;
 
   constructor(pi: ExtensionAPI, options: HostOptions = {}) {
     this.pi = pi;
@@ -126,7 +132,8 @@ export class UniversalUsageHost {
     this.pi.registerCommand(COMMAND_NAME, {
       description: "Show read-only provider usage, quota windows, and balances",
       handler: async (args, ctx) => {
-        await this.report(ctx, args);
+        if (ctx.mode === "tui" && typeof ctx.ui.custom === "function") await this.openView(ctx, args);
+        else await this.report(ctx, args);
       },
     });
 
@@ -194,6 +201,7 @@ export class UniversalUsageHost {
   /** Resolve and, when asked, refresh the given model as the active target. */
   async activate(ctx: ExtensionContext, model: Model<any>, options: { refresh?: boolean } = {}): Promise<void> {
     if (this.disposed) return;
+    this.view?.close();
     const stamp = stampOf(++this.generation, model);
     this.monitor.cancel();
     this.active = undefined;
@@ -250,7 +258,10 @@ export class UniversalUsageHost {
       this.adoptedResolutionSequence = sequence;
     }
     if (!resolution.ok) {
-      if (this.active?.target !== undefined) this.identityRevision++;
+      if (this.active?.target !== undefined) {
+        this.identityRevision++;
+        this.view?.clear();
+      }
       this.active = { model };
       this.turnStamp = undefined;
       this.lastSnapshot = this.failureSnapshot(resolution);
@@ -259,6 +270,7 @@ export class UniversalUsageHost {
     }
     if (this.active?.target?.identity.key !== resolution.target.identity.key) {
       this.identityRevision++;
+      this.view?.clear();
       this.turnStamp = undefined;
       this.lastSnapshot = undefined;
     }
@@ -271,9 +283,10 @@ export class UniversalUsageHost {
       this.config,
       { force: options.force === true },
     );
-    // A replaced activation, moved selection, or superseded identity may not publish.
-    if (!this.isCurrent(stamp, ctx) || identityRevision !== this.identityRevision) return undefined;
+    // A cancelled run, replaced activation, moved selection, or superseded identity may not publish.
+    if (isCancelledSnapshot(snapshot) || !this.isCurrent(stamp, ctx) || identityRevision !== this.identityRevision) return undefined;
     this.lastSnapshot = snapshot;
+    this.warn(ctx, snapshot);
     this.paint(ctx);
     return snapshot;
   }
@@ -295,13 +308,19 @@ export class UniversalUsageHost {
     // Another refresh may have adopted an identity while resolution was pending.
     const previousKey = this.active?.target?.identity.key;
     if (!resolution.ok) {
-      if (previousKey !== undefined) this.identityRevision++;
+      if (previousKey !== undefined) {
+        this.identityRevision++;
+        this.view?.clear();
+      }
       this.active = { model };
       this.lastSnapshot = this.failureSnapshot(resolution);
       this.paint(ctx);
       return;
     }
-    if (previousKey !== resolution.target.identity.key) this.identityRevision++;
+    if (previousKey !== resolution.target.identity.key) {
+      this.identityRevision++;
+      this.view?.clear();
+    }
     this.active = { model, target: resolution.target };
     // A changed route must not repaint measurements from the old origin or auth.
     if (previousKey !== resolution.target.identity.key) this.lastSnapshot = undefined;
@@ -315,10 +334,10 @@ export class UniversalUsageHost {
   }
 
   /**
-   * Passive update from an inference response: parse the headers and paint the
-   * footer directly. The monitor keeps the parsed value as the last measurement
-   * of this model, so `/usage` can report it when no endpoint is requestable; the
-   * next measurement or endpoint read replaces it. Attribution holds only while
+   * Passive update from an inference response. The monitor keeps the parsed value
+   * for passive-only reports. A current endpoint quota remains distinct from
+   * generic request/token limits; an actual rejection still takes precedence.
+   * Attribution holds only while
    * Pi is busy with the target that started the current turn: a response event
    * carries no model identity, so a switch inside the turn makes it ambiguous.
    */
@@ -333,6 +352,17 @@ export class UniversalUsageHost {
     }
     const snapshot = this.monitor.passiveSnapshot(active.target, headers, status, this.config);
     if (snapshot === undefined) return;
+    this.warn(ctx, snapshot);
+    const endpoint = this.lastSnapshot;
+    const genericOnly = snapshot.metrics.length > 0 && snapshot.metrics.every((metric) => metric.source === "rate-limit-headers");
+    if (snapshot.status === "ok" && genericOnly && endpoint?.source === "http" && endpoint.status === "ok" &&
+      endpoint.identity.key === active.target.identity.key &&
+      !this.monitor.isStale(endpoint, this.config) &&
+      endpoint.metrics.some((metric) => metric.kind === "subscription-window" || metric.kind === "balance" || metric.kind === "budget")) {
+      const rate = formatCompactRateLimit(snapshot.metrics[0]!, this.now());
+      this.paintText(ctx, `${formatCompact(endpoint, this.now(), this.config)} · ${rate}`);
+      return;
+    }
     this.paintText(ctx, formatCompact(snapshot, this.now(), this.config));
   }
 
@@ -343,31 +373,87 @@ export class UniversalUsageHost {
     this.turnStamp = stamp !== undefined && this.isCurrent(stamp, ctx) ? stamp : undefined;
   }
 
+  private async openView(ctx: ExtensionCommandContext, args: string): Promise<void> {
+    if (this.disposed || this.viewOpening) return;
+    this.viewOpening = true;
+    try {
+      await ctx.ui.custom<void>((tui, _theme, _keys, done) => {
+        const view = new UsageView(tui, done, () => this.collectReport(ctx, args), () => this.config, this.now);
+        this.view = view;
+        view.refresh();
+        return view;
+      });
+    } finally {
+      this.view?.dispose();
+      this.view = undefined;
+      this.viewOpening = false;
+    }
+  }
+
   /** `/usage [provider ...]`: detailed report for the active and configured providers. */
   async report(ctx: ExtensionCommandContext, args: string): Promise<void> {
+    const snapshots = await this.collectReport(ctx, args);
+    if (snapshots === undefined) return;
+    const lines = formatReport(snapshots, this.config, this.now());
+    if (ctx.mode === "print") {
+      this.pi.appendEntry("universal-usage-report", { lines });
+      // Pi 1.2 print mode has no extension command output API and redirects stdout writes.
+      try { writeSync(1, `${lines.join("\n")}\n`); } catch { /* Output may already be closed. */ }
+    } else if (ctx.hasUI) {
+      ctx.ui.setWidget(REPORT_WIDGET_KEY, lines);
+      ctx.ui.notify("pi-universal-usage: report updated", "info");
+    } else {
+      this.pi.appendEntry("universal-usage-report", { lines });
+    }
+  }
+
+  private async collectReport(ctx: ExtensionCommandContext, args: string): Promise<TargetSnapshot[] | undefined> {
     const requested = args
       .split(/\s+/u)
       .map((part) => part.trim())
       .filter((part) => part !== "");
     const stamp = this.reportStamp(ctx);
 
+    const targets = this.reportTargets(ctx, requested).map((target) => ({
+      target,
+      isActive: target.kind === "model" && this.isCurrentModel(target.model),
+    }));
+    const results: Array<{ snapshot?: TargetSnapshot; isActive: boolean; revision?: number } | undefined> = new Array(targets.length);
+    let next = 0;
+    const worker = async () => {
+      while (next < targets.length && this.isCurrent(stamp, ctx)) {
+        const index = next++;
+        const { target, isActive } = targets[index]!;
+        let snapshot: TargetSnapshot | undefined;
+        const startingRevision = this.identityRevision;
+        const startingIdentity = isActive ? this.active?.target?.identity : undefined;
+        try {
+          snapshot = target.kind === "unresolved"
+            ? this.unresolvedSnapshot(target.providerId)
+            : isActive
+              ? await this.refreshActive(ctx, { force: true, model: target.model })
+              : await this.snapshotForModel(ctx, target.model);
+        } catch {
+          // Do not expose arbitrary exception text, which can contain credentials.
+          const providerId = target.kind === "model" ? target.model.provider : target.providerId;
+          const fallback = this.unresolvedSnapshot(providerId);
+          if (!isActive || startingRevision === this.identityRevision) {
+            snapshot = { ...fallback, identity: startingIdentity ?? fallback.identity,
+              status: "error", notice: undefined, error: "provider refresh failed" };
+          }
+        }
+        results[index] = { snapshot, isActive, ...(isActive ? { revision: this.identityRevision } : {}) };
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(this.config.reportConcurrency, targets.length) }, () => worker()));
     const snapshots: TargetSnapshot[] = [];
     let missingActive = false;
     let activeSnapshotRevision: number | undefined;
-    // The active target is always included; other providers only when the user
-    // opted into them before the session (explicit config entries) or asked.
-    for (const target of this.reportTargets(ctx, requested)) {
-      const isActive = target.kind === "model" && this.isCurrentModel(target.model);
-      const snapshot =
-        target.kind === "unresolved"
-          ? this.unresolvedSnapshot(target.providerId)
-          : isActive
-            ? await this.refreshActive(ctx, { force: true, model: target.model })
-            : await this.snapshotForModel(ctx, target.model);
-      if (snapshot !== undefined) {
-        snapshots.push(snapshot);
-        if (isActive) activeSnapshotRevision = this.identityRevision;
-      } else if (isActive) missingActive = true;
+    for (const result of results) {
+      if (result?.snapshot !== undefined) {
+        snapshots.push(result.snapshot);
+        if (result.isActive) activeSnapshotRevision = result.revision;
+      } else if (result?.isActive) missingActive = true;
     }
     // One check before publishing: a report that spans a selection change or a
     // shutdown is discarded silently. Nothing awaits between this and the paint.
@@ -392,13 +478,8 @@ export class UniversalUsageHost {
     if (active !== undefined && !snapshots.some((snapshot) => snapshot.identity.key === active.identity.key)) {
       snapshots.unshift(active);
     }
-    const lines = formatReport(snapshots, this.config, this.now());
-    if (ctx.hasUI) {
-      ctx.ui.setWidget(REPORT_WIDGET_KEY, lines);
-      ctx.ui.notify("pi-universal-usage: report updated", "info");
-    } else {
-      this.pi.appendEntry("universal-usage-report", { lines });
-    }
+    for (const snapshot of snapshots) this.warn(ctx, snapshot);
+    return snapshots;
   }
 
   /** The stamp this report captured before it started any work. */
@@ -422,10 +503,12 @@ export class UniversalUsageHost {
   shutdown(ctx?: ExtensionContext): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.view?.close();
     this.generation++;
     this.active = undefined;
     this.turnStamp = undefined;
     this.stopTimer();
+    this.warnings.clear();
     this.monitor.dispose();
     try {
       ctx?.ui.setStatus(STATUS_KEY, undefined);
@@ -457,9 +540,8 @@ export class UniversalUsageHost {
   }
 
   /**
-   * Every selected provider is included; the report processes them one at a
-   * time, so the bound is the finite user registry and configuration, not a
-   * silent provider cap. A provider with no registered model becomes an
+   * Every selected provider is included without a silent provider cap.
+   * A provider with no registered model becomes an
    * unresolved entry instead of disappearing from the selection.
    */
   private reportTargets(ctx: ExtensionCommandContext, requested: readonly string[]): ReportTarget[] {
@@ -513,12 +595,24 @@ export class UniversalUsageHost {
   private async snapshotForModel(ctx: ExtensionCommandContext, model: Model<any>): Promise<TargetSnapshot | undefined> {
     const resolution = await resolveTarget(ctx.modelRegistry, model, { allowInsecureHttp: true });
     if (!resolution.ok) return this.failureSnapshot(resolution);
-    return await this.monitor.refresh(
+    const snapshot = await this.monitor.refresh(
       resolution.target,
       this.config.providers.get(resolution.target.identity.providerId),
       this.config,
       { force: true },
     );
+    return isCancelledSnapshot(snapshot) ? undefined : snapshot;
+  }
+
+  private warn(ctx: ExtensionContext, snapshot: TargetSnapshot): void {
+    if (!ctx.hasUI) return;
+    for (const message of this.warnings.observe(snapshot, this.config, this.now())) {
+      try {
+        ctx.ui.notify(message, "warning");
+      } catch {
+        // The UI may already be torn down.
+      }
+    }
   }
 
   private paint(ctx: ExtensionContext): void {

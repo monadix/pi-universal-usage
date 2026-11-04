@@ -25,6 +25,20 @@ describe("configuration", () => {
     assert.deepEqual(missing.problems, []);
   });
 
+  it("validates report concurrency and reports invalid values", () => {
+    assert.equal(normalizeConfig({}).reportConcurrency, 3);
+    for (const value of [1, 3, 8]) {
+      const config = normalizeConfig({ reportConcurrency: value });
+      assert.equal(config.reportConcurrency, value);
+      assert.deepEqual(config.problems, []);
+    }
+    for (const value of [0, 9, 1.5, "3", null, true, Infinity]) {
+      const config = normalizeConfig({ reportConcurrency: value });
+      assert.equal(config.reportConcurrency, 3);
+      assert.match(config.problems.join(" "), /reportConcurrency must be an integer from 1 to 8/);
+    }
+  });
+
   it("reports invalid JSON without throwing", () => {
     const config = loadConfig({ readFile: () => "{ not json" });
     assert.match(config.problems.join(" "), /not valid JSON/);

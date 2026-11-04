@@ -25,6 +25,7 @@ export const DEFAULT_MIN_REFRESH_SECONDS = 60;
 export const DEFAULT_TIMEOUT_MS = 8000;
 export const DEFAULT_MAX_BODY_BYTES = 256 * 1024;
 export const DEFAULT_MAX_DISCOVERY_REQUESTS = 4;
+export const DEFAULT_REPORT_CONCURRENCY = 3;
 
 /** Node reduces timer delays above this value to 1 ms instead of scheduling them. */
 export const MAX_TIMER_DELAY_MS = 2_147_483_647;
@@ -46,7 +47,10 @@ export interface UsageConfig {
   timeoutMs: number;
   maxBodyBytes: number;
   maxDiscoveryRequests: number;
+  reportConcurrency: number;
   autoRefresh: boolean;
+  warnings: boolean;
+  warningThresholds: number[];
   providers: Map<string, ProviderConfig>;
   /** Human-readable problems found while reading the configuration file. */
   problems: string[];
@@ -148,7 +152,10 @@ export function normalizeConfig(raw: unknown): UsageConfig {
     timeoutMs: DEFAULT_TIMEOUT_MS,
     maxBodyBytes: DEFAULT_MAX_BODY_BYTES,
     maxDiscoveryRequests: DEFAULT_MAX_DISCOVERY_REQUESTS,
+    reportConcurrency: DEFAULT_REPORT_CONCURRENCY,
     autoRefresh: true,
+    warnings: true,
+    warningThresholds: [90, 100],
     providers,
     problems,
   };
@@ -186,7 +193,26 @@ export function normalizeConfig(raw: unknown): UsageConfig {
   );
   config.maxBodyBytes = positiveNumber(root.maxBodyBytes, DEFAULT_MAX_BODY_BYTES, 1024);
   config.maxDiscoveryRequests = Math.floor(positiveNumber(root.maxDiscoveryRequests, DEFAULT_MAX_DISCOVERY_REQUESTS, 1));
+  if (root.reportConcurrency !== undefined) {
+    if (typeof root.reportConcurrency === "number" && Number.isInteger(root.reportConcurrency) && root.reportConcurrency >= 1 && root.reportConcurrency <= 8) {
+      config.reportConcurrency = root.reportConcurrency;
+    } else {
+      problems.push(`reportConcurrency must be an integer from 1 to 8; using ${DEFAULT_REPORT_CONCURRENCY}`);
+    }
+  }
   if (typeof root.autoRefresh === "boolean") config.autoRefresh = root.autoRefresh;
+  if (root.warnings !== undefined) {
+    if (typeof root.warnings === "boolean") config.warnings = root.warnings;
+    else problems.push("warnings must be a boolean; using true");
+  }
+  if (root.warningThresholds !== undefined) {
+    if (Array.isArray(root.warningThresholds) && root.warningThresholds.length > 0 &&
+      root.warningThresholds.every((value: unknown) => typeof value === "number" && Number.isFinite(value) && value > 0 && value <= 100)) {
+      config.warningThresholds = [...new Set(root.warningThresholds as number[])].sort((a, b) => a - b);
+    } else {
+      problems.push("warningThresholds must be a non-empty array of finite percentages greater than 0 and at most 100; using [90, 100]");
+    }
+  }
 
   const providersRaw = objectValue(root.providers);
   if (providersRaw !== undefined) {

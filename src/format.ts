@@ -182,6 +182,11 @@ function compactResetSuffix(metrics: readonly UsageMetric[], now: number): strin
   return upcoming === undefined ? "" : ` · reset ${formatDuration(upcoming)}`;
 }
 
+/** One bounded passive rate-limit dimension, with its own reset. */
+export function formatCompactRateLimit(metric: UsageMetric, now: number): string {
+  return `rate limit: ${shortMetric(metric, now)}${compactResetSuffix([metric], now)}`;
+}
+
 /** One-line footer text for the active provider. */
 export function formatCompact(snapshot: TargetSnapshot, now: number, config: UsageConfig): string {
   const prefix = plainText(snapshot.identity.providerId);
@@ -194,9 +199,13 @@ export function formatCompact(snapshot: TargetSnapshot, now: number, config: Usa
   const metrics = snapshot.metrics.filter((metric) => metric.status !== "unlimited");
   if (metrics.length === 0) return plainText(`${prefix}: no quota data${staleSuffix}`);
   const displayed = metrics.slice(0, 3);
-  const parts = displayed.map((metric) => shortMetric(metric, now));
+  const onlyRates = displayed.every((metric) => metric.source === "rate-limit-headers");
+  const parts = displayed.map((metric) =>
+    `${!onlyRates && metric.source === "rate-limit-headers" ? "rate " : ""}${shortMetric(metric, now)}`,
+  );
   if (metrics.length > 3) parts.push(`+${metrics.length - 3}`);
-  return plainText(`${prefix}: ${parts.join(" · ")}${compactResetSuffix(displayed, now)}${staleSuffix}`);
+  const rateLabel = onlyRates ? "rate limit: " : "";
+  return plainText(`${prefix}: ${rateLabel}${parts.join(" · ")}${compactResetSuffix(displayed, now)}${staleSuffix}`);
 }
 
 /** Detailed report lines for `/usage`. */
@@ -222,7 +231,8 @@ export function formatReport(
     lines.push(`  age: ${formatDuration(ageSeconds)}${stale ? " (stale)" : ""}`);
     for (const metric of snapshot.metrics) {
       const scope = metric.scope === undefined ? "" : ` [${metric.scope}]`;
-      lines.push(`  - ${formatMetric(metric, now)}${scope}`);
+      const source = snapshot.source === "http" && metric.source === "rate-limit-headers" ? " [rate-limit headers]" : "";
+      lines.push(`  - ${formatMetric(metric, now)}${scope}${source}`);
       if (metric.breakdown !== undefined) {
         const parts = metric.breakdown.map((part) => `${part.label} ${amountText(part.value, metric.unit)}`);
         lines.push(`      ${parts.join(", ")}`);

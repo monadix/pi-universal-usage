@@ -48,6 +48,13 @@ The detailed report shows freshness, usage or balance, reset times, source,
 and any errors or provider notices. A requested provider with no registered
 model is listed as unknown rather than silently omitted.
 
+In the TUI, `/usage` opens a scrollable view: use Up/Down, Page Up/Down, Home
+or End to navigate, `r` to refresh, and Esc to close. Reset countdowns update
+without making new requests. In print mode the report is printed as text; in
+JSON mode it is recorded as a session entry rather than printed as text. RPC
+clients with UI support receive a report widget and notification; without UI,
+the report is recorded as a session entry.
+
 ### Reading the results
 
 - Usage percentages describe the provider's reported consumption. Values above
@@ -103,7 +110,10 @@ DeepSeek to the default report:
   "timeoutMs": 8000,
   "maxBodyBytes": 262144,
   "maxDiscoveryRequests": 4,
+  "reportConcurrency": 3,
   "autoRefresh": true,
+  "warnings": true,
+  "warningThresholds": [90, 100],
   "providers": {
     "deepseek": { "enabled": true }
   }
@@ -117,8 +127,18 @@ DeepSeek to the default report:
 | `timeoutMs` | Timeout for each HTTP request |
 | `maxBodyBytes` | Maximum response body size |
 | `maxDiscoveryRequests` | Maximum endpoint candidates tried for a custom provider |
+| `reportConcurrency` | Maximum provider refreshes per report (integer 1–8, default 3); all selected providers are included |
 | `autoRefresh` | Set to `false` for manual endpoint refresh only; response-header measurements can still update |
+| `warnings` | Set to `false` to disable subscription-window notifications (default `true`) |
+| `warningThresholds` | Non-empty array of finite consumed percentages greater than 0 and at most 100 (default `[90, 100]`); invalid values fall back to the default with a configuration problem |
 | `providers` | Provider IDs to include in the default report, with optional overrides |
+
+Warnings are emitted once per threshold, account, normalized metric dimension,
+and known future reset window, including an initial measurement already above a
+threshold. Stale or unknown windows, elapsed resets, and non-subscription limits
+do not trigger warnings. Notifications
+require a Pi UI (TUI or a supporting RPC client); they are not printed in non-UI modes.
+Invalid `warnings` values fall back to `true` with a configuration problem.
 
 Per-provider options are `enabled` (default `true`), `scheme` (default
 `auto`), `path`, and `pathMode` (default `base`). A disabled provider makes
@@ -158,8 +178,11 @@ problems shown in the report. Reload the extension after changing the file.
 - **Command conflict:** if another extension registers `/usage`, disable one.
 - **No report after switching models:** reports that span a selection change
   are discarded to avoid showing data under the wrong selection.
-- **Header measurements differ from endpoint data:** a response header can
-  temporarily replace the footer with coarser data until the next refresh.
+- **Header measurements differ from endpoint data:** generic request/token
+  limits are distinct from subscription quotas and balances. A fresh endpoint
+  quota or balance remains in the footer alongside generic limits; a provider
+  rejection such as HTTP 429 takes precedence. Other header measurements can
+  replace the footer until the next refresh.
 - **Routing changes:** credentials and base URLs are re-resolved on refresh.
   A routing-header-only change without a selection event can leave the old
   footer visible until the next refresh.

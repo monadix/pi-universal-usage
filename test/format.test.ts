@@ -188,6 +188,17 @@ describe("formatting", () => {
     assert.match(text, /reset 2d/);
   });
 
+  it("labels generic rate limits from endpoint response headers separately", () => {
+    const parsed = rateLimitHeadersParser.parse({
+      now: NOW,
+      headers: { "x-ratelimit-limit-tokens": "100", "x-ratelimit-remaining-tokens": "10", "x-ratelimit-reset-tokens": "30s" },
+    });
+    assert.ok(parsed);
+    const report = formatReport([snapshot({ metrics: [...snapshot().metrics, ...parsed.metrics] })], config, NOW).join("\n");
+    assert.match(report, /balance \(USD\)/);
+    assert.match(report, /tokens 90%.*resets in 30s.*\[rate-limit headers\]/);
+  });
+
   it("shows a limit-only measurement as an explicitly unknown-usage cap", () => {
     const parsed = rateLimitHeadersParser.parse({
       now: NOW,

@@ -150,6 +150,99 @@ function buildHost(options: {
 }
 
 describe("pi extension wiring", () => {
+  it("opens one TUI modal, refreshes on r, and closes safely during a refresh", async () => {
+    let calls = 0;
+    let release!: (response: Response) => void;
+    const model = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
+    const { pi, host, registry } = buildHost({ models: [model], timers: false, fetchImpl: (async () => {
+      calls++;
+      if (calls === 1) return codexBody(42);
+      return await new Promise<Response>((resolve) => { release = resolve; });
+    }) as typeof fetch });
+    const fake = fakeContext({ model, registry });
+    await host.activate(fake.ctx, model, { refresh: false });
+    let component!: import("../src/usage-view.ts").UsageView;
+    let opens = 0, renders = 0;
+    (fake.ctx.ui as any).custom = (factory: any) => new Promise<void>((resolve) => {
+      opens++;
+      component = factory({ terminal: { rows: 12 }, requestRender: () => { renders++; } }, {}, {}, resolve);
+    });
+    const command = pi.commands.get(COMMAND_NAME)!;
+    const first = command.handler("", fake.ctx as ExtensionCommandContext);
+    await waitFor(() => component.render(32).join("\n").includes("42%"));
+    await command.handler("", fake.ctx as ExtensionCommandContext);
+    assert.equal(opens, 1);
+    assert.equal(fake.widgets.length, 0);
+    component.handleInput("r");
+    await waitFor(() => calls === 2);
+    assert.match(component.render(32).join("\n"), /Loading/);
+    component.handleInput("\u001b");
+    await first;
+    const afterClose = renders;
+    release(codexBody(5));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(renders, afterClose);
+    host.shutdown(fake.ctx);
+  });
+
+  it("closes an open modal on shutdown and ignores the pending result", async () => {
+    let release!: (response: Response) => void;
+    const model = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
+    const { pi, host, registry } = buildHost({ models: [model], timers: false, fetchImpl: (async () =>
+      await new Promise<Response>((resolve) => { release = resolve; })) as typeof fetch });
+    const fake = fakeContext({ model, registry });
+    await host.activate(fake.ctx, model, { refresh: false });
+    let renders = 0;
+    (fake.ctx.ui as any).custom = (factory: any) => new Promise<void>((resolve) => {
+      factory({ terminal: { rows: 12 }, requestRender: () => { renders++; } }, {}, {}, resolve);
+    });
+    const pending = pi.commands.get(COMMAND_NAME)!.handler("", fake.ctx as ExtensionCommandContext);
+    await waitFor(() => release !== undefined);
+    host.shutdown(fake.ctx);
+    await pending;
+    const afterShutdown = renders;
+    release(codexBody(42));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(renders, afterShutdown);
+  });
+
+  it("deduplicates joined endpoint warnings and supports RPC notifications without UI-less output", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const fetchImpl = (async () => { await gate; return codexBody(100); }) as typeof fetch;
+    const model = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://example.com/v1" });
+    const { host, registry } = buildHost({ fetchImpl, models: [model], timers: false });
+    const fake = fakeContext({ model, registry, mode: "rpc", hasUI: true });
+    await host.activate(fake.ctx, model, { refresh: false });
+    const first = host.refreshActive(fake.ctx, { force: true });
+    const second = host.refreshActive(fake.ctx, { force: true });
+    release();
+    await Promise.all([first, second]);
+    assert.equal(fake.notifications.filter((message) => message.includes("consumed")).length, 2);
+    host.shutdown(fake.ctx);
+
+    const silent = buildHost({ fetchImpl: (async () => codexBody(100)) as typeof fetch, models: [model], timers: false });
+    const noUI = fakeContext({ model, registry: silent.registry, mode: "rpc", hasUI: false });
+    await silent.host.activate(noUI.ctx, model, { refresh: true });
+    assert.deepEqual(noUI.notifications, []);
+    silent.host.shutdown(noUI.ctx);
+  });
+
+  it("warns from attributed passive subscription headers but not generic limits or throttle", async () => {
+    const model = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://example.com/v1" });
+    const { pi, host, registry } = buildHost({ fetchImpl: (async () => codexBody(10)) as typeof fetch, models: [model], timers: false });
+    const fake = fakeContext({ model, registry, idle: false });
+    await host.activate(fake.ctx, model, { refresh: false });
+    await pi.emit("turn_start", {}, fake.ctx);
+    const headers = { "x-codex-primary-used-percent": "100", "x-codex-primary-reset-at": "1768000600" };
+    host.afterProviderResponse(200, headers, fake.ctx);
+    host.afterProviderResponse(200, headers, fake.ctx);
+    assert.equal(fake.notifications.length, 2);
+    host.afterProviderResponse(429, {}, fake.ctx);
+    assert.equal(fake.notifications.length, 2);
+    assert.match(String(fake.statuses.at(-1)), /rate.limit/i);
+    host.shutdown(fake.ctx);
+  });
   it("registers the command and lifecycle handlers without opening a connection", () => {
     const { fetchImpl, calls } = sequenceFetch([jsonResponse({})]);
     const { pi } = buildHost({
@@ -465,6 +558,50 @@ describe("pi extension wiring", () => {
     host.shutdown(idle.ctx);
   });
 
+  it("keeps a current endpoint quota distinct from passive rate limits and shows throttling", async () => {
+    const { fetchImpl, calls } = sequenceFetch([codexBody(42)]);
+    const model = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
+    const { pi, host, registry, advance } = buildHost({ fetchImpl, models: [model] });
+    const fake = fakeContext({ model, registry, idle: false });
+    await pi.emit("model_select", { model }, fake.ctx);
+    await pi.emit("turn_start", {}, fake.ctx);
+    const headers = { "x-ratelimit-limit-tokens": "100", "x-ratelimit-remaining-tokens": "10", "x-ratelimit-reset-tokens": "30s" };
+    await pi.emit("after_provider_response", { status: 200, headers }, fake.ctx);
+    assert.match(String(fake.statuses.at(-1)), /weekly 42%.*rate limit: tok 90%.*reset 30s/);
+    assert.equal(calls.length, 1, "passive presentation makes no request");
+    await pi.emit("after_provider_response", { status: 429, headers: {} }, fake.ctx);
+    assert.match(String(fake.statuses.at(-1)), /rate-limited/);
+    advance(601_000);
+    await pi.emit("after_provider_response", { status: 200, headers }, fake.ctx);
+    assert.doesNotMatch(String(fake.statuses.at(-1)), /weekly 42%/);
+    assert.match(String(fake.statuses.at(-1)), /rate limit: tok 90%/);
+    assert.equal(calls.length, 1);
+    host.shutdown(fake.ctx);
+  });
+
+  it("retains an account-shared endpoint quota after switching models and receiving rate headers", async () => {
+    const { fetchImpl, calls } = sequenceFetch([codexBody(42)]);
+    const a = fakeModel({ provider: "cpa", id: "chat-a", baseUrl: "http://localhost:8317/v1" });
+    const b = fakeModel({ provider: "cpa", id: "chat-b", baseUrl: a.baseUrl });
+    const { pi, host, registry } = buildHost({ fetchImpl, models: [a, b] });
+    const modelRef = { current: a };
+    const fake = fakeContext({ modelRef, registry, idle: false });
+    await pi.emit("model_select", { model: a }, fake.ctx);
+    assert.match(String(fake.statuses.at(-1)), /weekly 42%/);
+    modelRef.current = b;
+    await pi.emit("model_select", { model: b }, fake.ctx);
+    assert.match(String(fake.statuses.at(-1)), /weekly 42%/);
+    assert.equal(calls.length, 1, "the second model shares the cached account endpoint");
+    await pi.emit("turn_start", {}, fake.ctx);
+    await pi.emit("after_provider_response", {
+      status: 200,
+      headers: { "x-ratelimit-limit-tokens": "100", "x-ratelimit-remaining-tokens": "10" },
+    }, fake.ctx);
+    assert.match(String(fake.statuses.at(-1)), /weekly 42%.*rate limit: tok 90%/);
+    assert.equal(calls.length, 1, "passive headers do not fetch");
+    host.shutdown(fake.ctx);
+  });
+
   it("reports a passive-only measurement from /usage when no endpoint is requestable", async () => {
     const { fetchImpl, calls } = sequenceFetch([textResponse("unexpected request")]);
     const model = fakeModel({ provider: "openai", id: "chat", baseUrl: "https://api.openai.com/v1" });
@@ -520,7 +657,7 @@ describe("pi extension wiring", () => {
       timers: false,
     });
     host.register();
-    const fake = fakeContext({ model: cpa, registry });
+    const fake = fakeContext({ model: cpa, registry, mode: "rpc" });
     await pi.emit("model_select", { type: "model_select", model: cpa, previousModel: undefined, source: "set" }, fake.ctx);
     const command = pi.commands.get(COMMAND_NAME);
     assert.ok(command);
@@ -542,7 +679,7 @@ describe("pi extension wiring", () => {
     // Simulate a path that reached planning despite configuration validation.
     config.providers.set("cpa", { path: "//%", pathMode: "origin" });
     const { pi, host, registry } = buildHost({ fetchImpl, models: [model], config });
-    const fake = fakeContext({ model, registry });
+    const fake = fakeContext({ model, registry, mode: "rpc" });
     const command = pi.commands.get(COMMAND_NAME);
     assert.ok(command);
     await command.handler("", fake.ctx as unknown as ExtensionCommandContext);
@@ -551,6 +688,58 @@ describe("pi extension wiring", () => {
     assert.match(text, /state: unsupported/);
     assert.match(text, /could not be resolved to a valid URL/);
     assert.equal(calls.length, 0);
+    host.shutdown(fake.ctx);
+  });
+
+  it("bounds concurrent report work, isolates failures, and preserves target order", async () => {
+    const models = ["prov1", "prov2", "prov3", "prov4", "prov5"].map((provider) =>
+      fakeModel({ provider, id: "chat", baseUrl: `https://${provider}.example.com/v1` }),
+    );
+    const pi = fakePi();
+    const registry = fakeRegistry((model) => statusOf(model as ReturnType<typeof fakeModel>), models);
+    const releases = new Map<string, () => void>();
+    const started: string[] = [];
+    let running = 0;
+    let maximum = 0;
+    const monitor = new UsageMonitor({ fetchImpl: (async () => codexBody(20)) as typeof fetch });
+    const refresh = monitor.refresh.bind(monitor);
+    monitor.refresh = async (target, provider, config, options) => {
+      const id = target.identity.providerId;
+      started.push(id);
+      running++;
+      maximum = Math.max(maximum, running);
+      try {
+        await new Promise<void>((resolve) => releases.set(id, resolve));
+        if (id === "prov2") throw new Error("secret should not appear");
+        return await refresh(target, provider, config, options);
+      } finally {
+        running--;
+      }
+    };
+    const host = new UniversalUsageHost(pi.api, { monitor, config: normalizeConfig({ reportConcurrency: 2 }), timers: false });
+    const fake = fakeContext({ registry, hasUI: false });
+    const pending = host.report(fake.ctx as ExtensionCommandContext, models.map((model) => model.provider).join(" "));
+    await waitFor(() => started.length === 2);
+    assert.deepEqual(started, ["prov1", "prov2"]);
+    releases.get("prov2")!();
+    await waitFor(() => started.length === 3);
+    releases.get("prov3")!();
+    await waitFor(() => started.length === 4);
+    releases.get("prov4")!();
+    await waitFor(() => started.length === 5);
+    releases.get("prov5")!();
+    releases.get("prov1")!();
+    await pending;
+    assert.equal(maximum, 2);
+    const text = ((pi.entries[0]?.data as { lines: string[] }).lines).join("\n");
+    let previous = -1;
+    for (const model of models) {
+      const index = text.indexOf(`${model.provider}/`);
+      assert.ok(index > previous, `${model.provider} appears in target order`);
+      previous = index;
+    }
+    assert.match(text, /provider refresh failed/);
+    assert.doesNotMatch(text, /secret should not appear/);
     host.shutdown(fake.ctx);
   });
 
@@ -1108,6 +1297,101 @@ describe("pi extension wiring", () => {
     host.shutdown(tui.ctx);
   });
 
+  for (const mode of ["late-response", "late-rejection", "immediate-rejection"] as const) {
+    it(`does not publish a cancelled report refresh with ${mode}`, async () => {
+      let releaseOld!: () => void;
+      let releaseReplacement!: () => void;
+      const oldGate = new Promise<void>((resolve) => { releaseOld = resolve; });
+      const replacementGate = new Promise<void>((resolve) => { releaseReplacement = resolve; });
+      let calls = 0;
+      const fetchImpl = (async (_input: unknown, init?: RequestInit) => {
+        if (++calls === 1) {
+          if (mode === "late-response") {
+            await oldGate;
+            return codexBody(11);
+          }
+          return await new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => {
+              if (mode === "immediate-rejection") reject(new Error("aborted"));
+              else void oldGate.then(() => reject(new Error("aborted")));
+            }, { once: true });
+          });
+        }
+        await replacementGate;
+        return codexBody(42);
+      }) as typeof fetch;
+      const model = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
+      const { pi, host, registry } = buildHost({ fetchImpl, models: [model] });
+      const fake = fakeContext({ model, registry });
+      await host.activate(fake.ctx, model, { refresh: false });
+      const report = host.report(fake.ctx as unknown as ExtensionCommandContext, "");
+      await waitFor(() => calls === 1);
+      const selection = pi.emit("model_select", { model }, fake.ctx);
+      await waitFor(() => calls === 2);
+      if (mode === "immediate-rejection") {
+        await report;
+        assert.equal(fake.widgets.length, 0, "no report before replacement finishes");
+      }
+      assert.ok(fake.statuses.every((status) => !/error|cancelled|11%/.test(String(status))));
+      assert.ok(fake.widgets.every((widget) => !/error|cancelled|11%/.test((widget.lines ?? []).join("\n"))));
+      releaseReplacement();
+      await selection;
+      assert.match(String(fake.statuses.at(-1)), /42%/);
+      releaseOld();
+      await report;
+      assert.match(String(fake.statuses.at(-1)), /42%/);
+      assert.ok(fake.statuses.every((status) => !/error|cancelled|11%/.test(String(status))));
+      if (mode !== "immediate-rejection") {
+        assert.equal(fake.widgets.length, 1);
+        assert.match((fake.widgets[0]?.lines ?? []).join("\n"), /42%/);
+      } else {
+        assert.equal(fake.widgets.length, 0);
+      }
+      assert.ok(fake.widgets.every((widget) => !/error|cancelled|11%/.test((widget.lines ?? []).join("\n"))));
+      host.shutdown(fake.ctx);
+    });
+  }
+
+  it("omits a cancelled non-active provider from a report", async () => {
+    let peerStarted = false;
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      if (!String(input).includes("peer.example.com")) return codexBody(42);
+      peerStarted = true;
+      return await new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      });
+    }) as typeof fetch;
+    const model = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
+    const peer = fakeModel({ provider: "peer", id: "chat", baseUrl: "https://peer.example.com/v1" });
+    const { pi, host, registry } = buildHost({
+      fetchImpl, models: [model, peer], timers: false,
+      config: normalizeConfig({ providers: { peer: { enabled: true } } }),
+    });
+    const fake = fakeContext({ model, registry });
+    await host.activate(fake.ctx, model, { refresh: false });
+    const report = host.report(fake.ctx as unknown as ExtensionCommandContext, "");
+    await waitFor(() => peerStarted);
+    await pi.emit("model_select", { model }, fake.ctx);
+    await report;
+    assert.match(String(fake.statuses.at(-1)), /42%/);
+    const text = (fake.widgets.at(-1)?.lines ?? []).join("\n");
+    assert.match(text, /42%/);
+    assert.doesNotMatch(text, /peer\/chat|cancelled/);
+    host.shutdown(fake.ctx);
+  });
+
+  it("still publishes genuine provider failures", async () => {
+    const { fetchImpl } = sequenceFetch([textResponse("unauthorized", { status: 401 })]);
+    const model = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
+    const { host, registry } = buildHost({ fetchImpl, models: [model], timers: false });
+    const fake = fakeContext({ model, registry });
+    await host.activate(fake.ctx, model, { refresh: false });
+    await host.report(fake.ctx as unknown as ExtensionCommandContext, "");
+    assert.match(String(fake.statuses.at(-1)), /rejected/i);
+    assert.match((fake.widgets.at(-1)?.lines ?? []).join("\n"), /auth|401/i);
+    host.shutdown(fake.ctx);
+  });
+
   it("ignores an older same-ID routing resolution after a newer one", async () => {
     const { fetchImpl, calls } = sequenceFetch([codexBody(12)]);
     const modelA = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
@@ -1379,8 +1663,9 @@ describe("pi extension wiring", () => {
     assert.ok(command);
     holdPeerAuth = true;
     const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
-    await waitFor(() => peerAuthReached);
-    assert.equal(activeCalls.length, 1);
+    await waitFor(() => peerAuthReached && activeCalls.length === 1);
+    // The peer now starts concurrently; let the active request settle first.
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
     // Activation adopts a sanitized failure for the same route the report
     // captured, so the pending report still owns its authority.
@@ -1517,7 +1802,7 @@ describe("pi extension wiring", () => {
     assert.ok(command);
     holdPeerAuth = true;
     const pending = command.handler("", fake.ctx as unknown as ExtensionCommandContext);
-    await waitFor(() => peerAuthReached);
+    await waitFor(() => peerAuthReached && String(fake.statuses.at(-1)).includes("11%"));
 
     // An ordinary refresh of the same credential is not a source change.
     await host.refreshActive(fake.ctx, { force: true });
