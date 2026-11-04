@@ -101,6 +101,15 @@ export const FIRST_PARTY_HINTS: readonly FirstPartyHint[] = [
     bearerAuthorization: true,
   },
   {
+    // OpenCode Go models may use Pi's Anthropic transport, which resolves an
+    // API key as `x-api-key`; its quota endpoint requires a bearer credential.
+    providerIds: ["opencode-go"],
+    officialOrigins: ["https://opencode.ai"],
+    scheme: "opencode-go-json",
+    sameOrigin: [{ path: "/zen/go/v1/usage", mode: "origin", label: "opencode go usage" }],
+    bearerAuthorization: true,
+  },
+  {
     providerIds: ["zai", "z-ai", "zai-coding-plan", "glm", "zhipu", "zhipuai"],
     officialOrigins: ["https://api.z.ai"],
     scheme: "zai-json",
@@ -228,11 +237,11 @@ function sameOriginHeaders(target: ResolvedTarget, hint: FirstPartyHint | undefi
 }
 
 /**
- * Kimi's coding quota endpoint takes the plan credential as a bearer token,
- * but Pi's `anthropic-messages` transport resolves an ordinary Kimi API key as
- * `x-api-key`. Normalize that effective credential into the required header.
- * An explicit Authorization is the credential Pi already sends and wins; a
- * suppressed one stays absent.
+ * Some first-party quota endpoints (Kimi Coding, OpenCode Go) take the plan
+ * credential as a bearer token, but Pi's `anthropic-messages` transport
+ * resolves an ordinary API key as `x-api-key`. Normalize that effective
+ * credential into the required header. An explicit Authorization is the
+ * credential Pi already sends and wins; a suppressed one stays absent.
  */
 function applyBearerAuthorization(
   headers: Record<string, string>,

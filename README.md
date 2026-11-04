@@ -5,7 +5,7 @@ active provider's subscription usage, request/token budgets, or account balance
 in the footer, and run `/usage` for a detailed report.
 
 - Supports ChatGPT/Codex, Anthropic subscriptions, DeepSeek, OpenRouter, Kimi
-  Coding, Z.ai, and compatible proxies.
+  Coding, Z.ai, OpenCode Go, and compatible proxies.
 - Uses the credentials Pi already resolves; no separate login or secrets file.
 - Reports missing data as unknown, not as zero usage.
 
@@ -80,6 +80,7 @@ share an in-flight request.
 | `openrouter` | Key budget or spend, plus optional account credits |
 | Kimi Coding | Plan usage and quota windows, including durationless buckets |
 | Z.ai | Token, credit, and time-limit quotas |
+| OpenCode Go | Rolling, weekly, and monthly subscription windows |
 | Compatible custom providers/proxies, including CPA | Recognized usage formats through same-origin endpoint discovery |
 
 The official `openai` API origin is not a ChatGPT subscription usage endpoint.

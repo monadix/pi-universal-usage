@@ -21,6 +21,7 @@ Parsing is a registry of pure functions over unknown JSON or response headers.
 | `openrouter-json` | `/api/v1/key`, `/api/v1/credits` | Key budget (`limit`, `limit_remaining`, `limit_reset`), key spend when the cap is `null`, and account credits (`total_credits` − `total_usage`). Scopes stay separate; a working key response never needs the credits response. When the credits body has `total_credits` but no usable `total_usage`, the purchased total is shown as a breakdown and the remaining balance stays unknown. |
 | `deepseek-balance` | `/user/balance` | `is_available` and `balance_infos[]` with `currency`, `total_balance`, `granted_balance`, `topped_up_balance` as decimal strings. One metric per currency; zero and negative amounts are preserved. |
 | `kimi-json` | Kimi Coding `/usages` | Plan `usage` bucket and `limits[]` with `detail.limit|used|remaining|resetTime` (numbers or numeric strings). Optional `window.duration`/`window.timeUnit` declares the duration; a usable bucket without a window is retained without inventing one. A bucket whose `used`/`remaining` is present but not numeric is dropped. |
+| `opencode-go-json` | OpenCode Go `/zen/go/v1/usage` | `usage.rolling`, `usage.weekly`, and `usage.monthly` meters with `status`, `percent`, and `resetsAt` (ISO-8601). `percent` is consumed usage in percentage units, so `0.5` means 0.5%, not a 50% share. A missing or malformed sibling is skipped; a `rate-limited` window is reported as `limit-reached`; a finite percentage above 100 is preserved as over-allocation. No window duration is inferred. |
 | `zai-json` | Z.ai quota limit | `data.limits[]` with `type` (`TOKENS_LIMIT`, `CREDIT_LIMIT`, `TIME_LIMIT`), `(unit, number)` window, `percentage` (consumed percent), `usage` (the limit), `currentValue` (consumed), `remaining`, `nextResetTime` (epoch milliseconds). The inverted naming is respected; `(unit, number)` pairs are shown verbatim rather than renamed. A response envelope with `success: false` or a non-200 `code` is rejected even if it carries limits, so an API error is never reported as usage. |
 
 Percent scaling is explicit per scheme. Malformed or partial siblings are
@@ -48,6 +49,7 @@ replenished.
    | `deepseek` | `https://api.deepseek.com` | `GET /user/balance` |
    | `openrouter` | `https://openrouter.ai` | `GET /api/v1/key` (+ optional `/api/v1/credits`) |
    | `kimi`, `kimi-coding`, `moonshot`, … | `https://api.kimi.com` | `GET /coding/v1/usages` (`Authorization: Bearer <coding credential>`) |
+   | `opencode-go` | `https://opencode.ai` | `GET /zen/go/v1/usage` (origin root; `Authorization: Bearer`) |
    | `zai`, `glm`, `zhipu`, … | `https://api.z.ai` | `GET /api/monitor/usage/quota/limit` (raw key in `Authorization`, no `Bearer`) |
 
    API-key credentials for `anthropic` or `openai` have no quota interface here
@@ -68,7 +70,10 @@ replenished.
    Kimi's quota endpoint requires a bearer token, so the `x-api-key` credential
    Pi's Anthropic transport resolved for an ordinary Kimi API key is normalized
    to `Authorization: Bearer`; an explicit Authorization header is kept and a
-   suppressed one stays absent.
+   suppressed one stays absent. OpenCode Go's quota endpoint has the same
+   bearer requirement, so its hint applies the same normalization on its exact
+   official origin; a custom origin keeps the credential and header form Pi
+   resolved.
    An explicit `ChatGPT-Account-Id` routing header is preserved, a
    null-suppressed one stays absent, and token attribution is added only when
    neither applies. Transport defaults are synthesized per header name, so an

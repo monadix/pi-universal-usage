@@ -335,6 +335,100 @@ describe("endpoints", () => {
     }
   });
 
+  it("uses the OpenCode Go first-party hint only for opencode-go on its exact origin", async () => {
+    const target = await targetFor({ provider: "opencode-go", baseUrl: "https://opencode.ai/inference/go/v1" });
+    const result = plan(target);
+    assert.equal(result.kind, "requests");
+    if (result.kind !== "requests") return;
+    assert.equal(result.discovery, false);
+    assert.equal(result.requests.length, 1);
+    assert.equal(result.requests[0]?.url.href, "https://opencode.ai/zen/go/v1/usage");
+    assert.deepEqual(result.requests[0]?.allowedOrigins, ["https://opencode.ai"]);
+    assert.equal(result.requests[0]?.headers.authorization, "Bearer test-key");
+    assert.equal(result.requests[0]?.scheme, "opencode-go-json");
+
+    // The OpenCode Zen provider id is not the Go provider id.
+    const zen = await targetFor({ provider: "opencode", baseUrl: "https://opencode.ai/zen/v1" });
+    const zenPlan = plan(zen);
+    assert.equal(zenPlan.kind, "requests");
+    if (zenPlan.kind !== "requests") return;
+    assert.equal(zenPlan.discovery, true);
+    assert.equal(zenPlan.requests.some((request) => request.url.pathname === "/zen/go/v1/usage"), false);
+
+    // A custom origin stays on same-origin discovery instead of the official hint.
+    const custom = await targetFor({ provider: "opencode-go", baseUrl: "https://go-proxy.example.com/inference/go/v1" });
+    const customPlan = plan(custom, { max: 6 });
+    assert.equal(customPlan.kind, "requests");
+    if (customPlan.kind !== "requests") return;
+    assert.equal(customPlan.discovery, true);
+    assert.equal(customPlan.requests.some((request) => request.url.pathname === "/zen/go/v1/usage"), false);
+    for (const request of customPlan.requests) assert.equal(request.url.origin, "https://go-proxy.example.com");
+  });
+
+  it("normalizes the Anthropic-transport OpenCode Go key into the quota bearer", async () => {
+    const target = await targetFor({
+      provider: "opencode-go",
+      baseUrl: "https://opencode.ai/inference/go/v1",
+      apiKey: "go-key",
+      api: "anthropic-messages",
+    });
+    assert.equal(target.originHeaders["x-api-key"], "go-key");
+    assert.equal(target.originHeaders.authorization, undefined);
+    for (const result of [plan(target), plan(target, { path: "/zen/go/v1/usage", pathMode: "origin" })]) {
+      assert.equal(result.kind, "requests");
+      if (result.kind !== "requests") return;
+      assert.equal(result.requests[0]?.url.href, "https://opencode.ai/zen/go/v1/usage");
+      const headers = new Headers(result.requests[0]?.headers);
+      assert.equal(headers.get("authorization"), "Bearer go-key");
+      assert.equal(headers.get("x-api-key"), "go-key");
+    }
+  });
+
+  it("keeps a suppressed OpenCode Go authorization absent instead of synthesizing one", async () => {
+    const target = await targetFor({
+      provider: "opencode-go",
+      baseUrl: "https://opencode.ai/inference/go/v1",
+      apiKey: "go-key",
+      headers: { Authorization: null },
+      api: "anthropic-messages",
+    });
+    assert.deepEqual(target.suppressedHeaders, ["authorization"]);
+    const result = plan(target);
+    assert.equal(result.kind, "requests");
+    if (result.kind !== "requests") return;
+    const headers = new Headers(result.requests[0]?.headers);
+    assert.equal(headers.get("authorization"), null);
+    assert.equal(headers.get("x-api-key"), "go-key");
+  });
+
+  it("does not synthesize an OpenCode Go bearer for an arbitrary path or custom origin", async () => {
+    const official = await targetFor({
+      provider: "opencode-go",
+      baseUrl: "https://opencode.ai/inference/go/v1",
+      apiKey: "go-key",
+      api: "anthropic-messages",
+    });
+    const arbitrary = plan(official, { path: "/custom/usage", pathMode: "origin" });
+    assert.equal(arbitrary.kind, "requests");
+    if (arbitrary.kind !== "requests") return;
+    assert.equal(new Headers(arbitrary.requests[0]?.headers).get("authorization"), null);
+
+    const custom = await targetFor({
+      provider: "opencode-go",
+      baseUrl: "https://go-proxy.example.com/inference/go/v1",
+      apiKey: "go-key",
+      api: "anthropic-messages",
+    });
+    const discovered = plan(custom, { max: 2 });
+    assert.equal(discovered.kind, "requests");
+    if (discovered.kind !== "requests") return;
+    for (const request of discovered.requests) {
+      assert.equal(request.url.origin, "https://go-proxy.example.com");
+      assert.equal(new Headers(request.headers).get("authorization"), null);
+      assert.equal(new Headers(request.headers).get("x-api-key"), "go-key");
+    }
+  });
+
   it("replaces protocol headers case-insensitively", async () => {
     const target = await targetFor({
       provider: "anthropic",

@@ -13,7 +13,8 @@ export type SchemeId =
   | "openrouter-json"
   | "deepseek-balance"
   | "kimi-json"
-  | "zai-json";
+  | "zai-json"
+  | "opencode-go-json";
 
 export type MetricKind =
   | "subscription-window"

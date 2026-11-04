@@ -8,6 +8,7 @@ import { codexHeadersParser } from "./parsers/codex-headers.ts";
 import { codexJsonParser } from "./parsers/codex-json.ts";
 import { deepseekBalanceParser } from "./parsers/deepseek.ts";
 import { kimiJsonParser } from "./parsers/kimi.ts";
+import { opencodeGoJsonParser } from "./parsers/opencode-go.ts";
 import { openrouterJsonParser } from "./parsers/openrouter.ts";
 import { rateLimitHeadersParser } from "./parsers/rate-limit-headers.ts";
 import { zaiJsonParser } from "./parsers/zai.ts";
@@ -19,6 +20,7 @@ const JSON_PARSERS: readonly UsageParser[] = [
   openrouterJsonParser,
   deepseekBalanceParser,
   kimiJsonParser,
+  opencodeGoJsonParser,
   zaiJsonParser,
 ];
 

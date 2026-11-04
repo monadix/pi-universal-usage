@@ -73,6 +73,20 @@ describe("configuration", () => {
     assert.equal(config.providers.get("off")?.enabled, false);
   });
 
+  it("accepts the OpenCode Go scheme and its origin-root path", () => {
+    const config = normalizeConfig({
+      providers: {
+        "opencode-go": { scheme: "opencode-go-json", path: "/zen/go/v1/usage", pathMode: "origin" },
+      },
+    });
+    assert.deepEqual(config.providers.get("opencode-go"), {
+      scheme: "opencode-go-json",
+      path: "/zen/go/v1/usage",
+      pathMode: "origin",
+    });
+    assert.deepEqual(config.problems, []);
+  });
+
   it("clamps unusably small values to the defaults instead of accepting them", () => {
     const config = normalizeConfig({ refreshSeconds: 1, timeoutMs: 10, maxBodyBytes: 2 });
     assert.equal(config.refreshSeconds, 300);

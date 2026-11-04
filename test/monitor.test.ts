@@ -236,6 +236,76 @@ describe("UsageMonitor", () => {
     assert.equal(calls[0]?.headers.authorization, "Bearer test-key");
   });
 
+  it("fetches OpenCode Go usage through its origin-root hint with a bearer credential", async () => {
+    const target = await targetFor({
+      provider: "opencode-go",
+      baseUrl: "https://opencode.ai/inference/go/v1",
+      api: "anthropic-messages",
+    });
+    const { fetchImpl, calls } = sequenceFetch([
+      jsonResponse({
+        usage: {
+          rolling: { status: "ok", percent: 0, resetsAt: "2026-11-04T22:02:10.000Z" },
+          weekly: { status: "ok", percent: 12.5, resetsAt: "2026-11-09T00:00:00.000Z" },
+          monthly: { status: "ok", percent: 100, resetsAt: "2026-12-04T16:42:05.000Z" },
+        },
+      }),
+    ]);
+    const snapshot = await monitorWith(fetchImpl).refresh(target, undefined, config);
+    assert.equal(snapshot.status, "ok");
+    assert.equal(snapshot.scheme, "opencode-go-json");
+    assert.equal(snapshot.endpoint, "https://opencode.ai/zen/go/v1/usage");
+    assert.deepEqual(snapshot.metrics.map((metric) => metric.usedPercent), [0, 12.5, 100]);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.url, "https://opencode.ai/zen/go/v1/usage");
+    assert.equal(calls[0]?.headers.authorization, "Bearer test-key");
+  });
+
+  it("keeps valid OpenCode Go windows while skipping malformed siblings", async () => {
+    const target = await targetFor({ provider: "opencode-go", baseUrl: "https://opencode.ai/inference/go/v1" });
+    const { fetchImpl } = sequenceFetch([
+      jsonResponse({
+        usage: {
+          rolling: { status: "ok", percent: 10, resetsAt: "2026-11-04T22:02:10.000Z" },
+          weekly: { status: "ok", percent: "many" },
+        },
+      }),
+    ]);
+    const snapshot = await monitorWith(fetchImpl).refresh(target, undefined, config);
+    assert.equal(snapshot.status, "ok");
+    assert.deepEqual(snapshot.metrics.map((metric) => metric.id), ["opencode-go.rolling"]);
+    assert.equal(snapshot.metrics[0]?.usedPercent, 10);
+    assert.match(snapshot.notice ?? "", /weekly window reports no usable consumed percentage/);
+  });
+
+  it("reports an OpenCode Go rate-limited window without discarding its measurement", async () => {
+    const target = await targetFor({ provider: "opencode-go", baseUrl: "https://opencode.ai/inference/go/v1" });
+    const { fetchImpl } = sequenceFetch([
+      jsonResponse({
+        usage: {
+          rolling: { status: "rate-limited", percent: 100, resetsAt: "2026-11-04T22:02:10.000Z" },
+          weekly: { status: "ok", percent: 10, resetsAt: "2026-11-09T00:00:00.000Z" },
+        },
+      }),
+    ]);
+    const snapshot = await monitorWith(fetchImpl).refresh(target, undefined, config);
+    assert.equal(snapshot.status, "ok");
+    assert.equal(snapshot.metrics[0]?.status, "limit-reached");
+    assert.equal(snapshot.metrics[0]?.usedPercent, 100);
+  });
+
+  it("honors an HTTP 429 from the OpenCode Go endpoint without probing again", async () => {
+    const target = await targetFor({ provider: "opencode-go", baseUrl: "https://opencode.ai/inference/go/v1" });
+    const { fetchImpl, calls } = sequenceFetch([
+      textResponse("slow down", { status: 429, headers: { "retry-after": "30" } }),
+    ]);
+    const snapshot = await monitorWith(fetchImpl).refresh(target, undefined, config);
+    assert.equal(snapshot.status, "rate-limited");
+    assert.equal(snapshot.nextRetryAt, NOW + 30_000);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.url, "https://opencode.ai/zen/go/v1/usage");
+  });
+
   it("does not accept a Z.ai error envelope as a successful snapshot", async () => {
     const target = await targetFor({ provider: "zai", baseUrl: "https://api.z.ai/api/paas/v4", apiKey: "zai-key" });
     const { fetchImpl, calls } = sequenceFetch([

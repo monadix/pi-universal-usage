@@ -13,6 +13,7 @@ describe("parser registry", () => {
       "codex-json",
       "deepseek-balance",
       "kimi-json",
+      "opencode-go-json",
       "openrouter-json",
       "rate-limit-headers",
       "zai-json",
@@ -28,6 +29,8 @@ describe("parser registry", () => {
     assert.equal(codex?.scheme, "codex-json");
     const deepseek = parseJsonPayload({ now: NOW, json: { balance_infos: [{ currency: "USD", total_balance: "1" }] } });
     assert.equal(deepseek?.scheme, "deepseek-balance");
+    const opencodeGo = parseJsonPayload({ now: NOW, json: { usage: { rolling: { percent: 0, status: "ok" } } } });
+    assert.equal(opencodeGo?.scheme, "opencode-go-json");
     assert.equal(parseJsonPayload({ now: NOW, json: { hello: "world" } }), undefined);
   });
 
