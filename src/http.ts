@@ -152,7 +152,6 @@ export async function httpGet(
     timedOut = true;
     controller.abort();
   }, policy.timeoutMs);
-  timer.unref?.();
 
   try {
     const response = await fetchImpl(url, {
