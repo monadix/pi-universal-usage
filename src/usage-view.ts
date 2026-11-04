@@ -1,89 +1,116 @@
-import { Key, matchesKey, wrapTextWithAnsi, type TUI } from "@earendil-works/pi-tui";
-import type { UsageConfig } from "./config.ts";
-import { formatReport } from "./format.ts";
+import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type TUI } from "@earendil-works/pi-tui";
+import { formatMetric, isDisplayableMetric, isUsableMetric, unavailableReason, unavailableText } from "./format.ts";
 import { plainText } from "./text.ts";
-import type { TargetSnapshot } from "./types.ts";
+import type { TargetSnapshot, UsageMetric } from "./types.ts";
 
-/** One interaction: rendering and countdown ticks never initiate a refresh. */
+/** One interaction: only an explicit refresh initiates collection. */
 export class UsageView {
   private snapshots: TargetSnapshot[] | undefined;
   private loading = false;
-  private failed = false;
   private closed = false;
   private sequence = 0;
   private offset = 0;
   private pageSize = 1;
-  private readonly timer: ReturnType<typeof setInterval>;
+
   private readonly tui: Pick<TUI, "requestRender" | "terminal">;
   private readonly done: () => void;
   private readonly collect: () => Promise<TargetSnapshot[] | undefined>;
-  private readonly config: () => UsageConfig;
   private readonly now: () => number;
+  private readonly unavailable: (message: string) => void;
 
   constructor(
     tui: Pick<TUI, "requestRender" | "terminal">,
     done: () => void,
     collect: () => Promise<TargetSnapshot[] | undefined>,
-    config: () => UsageConfig,
     now: () => number,
+    unavailable: (message: string) => void,
   ) {
     this.tui = tui;
     this.done = done;
     this.collect = collect;
-    this.config = config;
     this.now = now;
-    this.timer = setInterval(() => { if (!this.closed) this.tui.requestRender(); }, 1000);
-    this.timer.unref?.();
+    this.unavailable = unavailable;
   }
 
   refresh(): void {
-    if (this.closed) return;
+    if (this.closed || this.loading) return;
     const sequence = ++this.sequence;
     this.loading = true;
-    this.failed = false;
     this.tui.requestRender();
-    void this.collect().then((snapshots) => {
+    // Also handle a synchronous collection failure without exposing exception text.
+    void Promise.resolve().then(() => this.closed ? undefined : this.collect()).then((snapshots) => {
       if (this.closed || sequence !== this.sequence) return;
-      if (snapshots !== undefined) this.snapshots = snapshots;
       this.loading = false;
+      // Undefined denotes cancellation or invalidation, not provider failure.
+      if (snapshots === undefined) return this.close();
+      if (!snapshots.some((snapshot) => snapshot.metrics.some(isUsableMetric))) {
+        const reasons = [...new Set(snapshots.map(unavailableReason))].join("; ") || "no provider could be resolved";
+        this.close();
+        this.unavailable(truncateToWidth(`Usage unavailable: ${reasons}`, 72));
+        return;
+      }
+      this.snapshots = snapshots;
       this.tui.requestRender();
     }, () => {
       if (this.closed || sequence !== this.sequence) return;
-      this.loading = false;
-      this.failed = true;
-      this.tui.requestRender();
+      this.close();
+      this.unavailable("Usage unavailable: provider refresh failed");
     });
   }
 
   render(width: number): string[] {
     const w = Math.max(1, width);
+    const inner = Math.max(1, w - 4);
     const body: string[] = [];
-    if (this.snapshots !== undefined) {
-      for (const snapshot of this.snapshots) {
-        const lines = formatReport([snapshot], { ...this.config(), problems: [] }, this.now());
-        body.push(...lines);
-        for (const metric of snapshot.metrics) {
-          const percent = metric.usedPercent ?? (metric.limit !== undefined && metric.limit > 0 && metric.remaining !== undefined
-            ? 100 * metric.remaining / metric.limit : undefined);
-          if (percent === undefined || !Number.isFinite(percent)) continue;
-          const filled = Math.round(Math.max(0, Math.min(100, percent)) / 10);
-          body.push(`  ${plainText(metric.label)}: [${"#".repeat(filled)}${"-".repeat(10 - filled)}]${metric.usedPercent === undefined ? " remaining" : " used"}`);
-        }
+    for (const snapshot of this.snapshots ?? []) {
+      const metrics = snapshot.metrics.filter(isDisplayableMetric);
+      if (metrics.length === 0) {
+        body.push(unavailableText(snapshot));
+        continue;
       }
-      for (const problem of this.config().problems) body.push(`config: ${plainText(problem)}`);
-      if (this.snapshots.length === 0) body.push(...formatReport([], this.config(), this.now()));
+      body.push(plainText(snapshot.identity.providerId));
+      for (const metric of metrics) {
+        const scope = metric.scope === undefined ? "" : ` [${metric.scope}]`;
+        body.push(`  ${formatMetric(metric, this.now())}${plainText(scope)}`);
+        if (metric.usedPercent !== undefined && metric.usedPercent > 100) body.push("  Reported usage is above 100%");
+        const bar = this.bar(metric);
+        if (bar !== undefined) body.push(`  ${bar}`);
+      }
     }
     if (this.loading) body.unshift("Loading usage...");
-    if (this.failed) body.unshift("Refresh failed");
-    const wrapped = body.flatMap((line) => wrapTextWithAnsi(line, w));
-    this.pageSize = Math.max(1, this.tui.terminal.rows - 6);
+    const wrapped = body.flatMap((line) => wrapTextWithAnsi(line, inner));
+    // Match the overlay's one-row terminal margins; reserve borders and controls.
+    const maxHeight = Math.max(5, this.tui.terminal.rows - 2);
+    const scrolling = wrapped.length > maxHeight - 3;
+    this.pageSize = Math.max(1, maxHeight - 3 - (scrolling ? 1 : 0));
     this.offset = Math.max(0, Math.min(this.offset, Math.max(0, wrapped.length - this.pageSize)));
-    const header = wrapTextWithAnsi("Usage  r refresh  Esc close", w)[0] ?? "";
-    const footer = wrapTextWithAnsi(`Up/Down scroll  ${Math.min(this.offset + 1, wrapped.length)}-${Math.min(this.offset + this.pageSize, wrapped.length)}/${wrapped.length}`, w)[0] ?? "";
-    return [header, ...wrapped.slice(this.offset, this.offset + this.pageSize), footer];
+    const lines = [...wrapped.slice(this.offset, this.offset + this.pageSize)];
+    if (scrolling) lines.push(`↑↓ scroll ${this.offset + 1}-${Math.min(this.offset + this.pageSize, wrapped.length)}/${wrapped.length}`);
+    lines.push("r refresh · Esc close");
+    const frame = (line: string) => {
+      const text = truncateToWidth(line, inner);
+      return `│ ${text}${" ".repeat(Math.max(0, inner - visibleWidth(text)))} │`;
+    };
+    const title = truncateToWidth(" Usage ", Math.max(1, w - 2));
+    return [
+      `╭${title}${"─".repeat(Math.max(0, w - 2 - visibleWidth(title)))}╮`,
+      ...lines.map(frame),
+      `╰${"─".repeat(Math.max(0, w - 2))}╯`,
+    ].map((line) => truncateToWidth(line, w));
+  }
+
+  private bar(metric: UsageMetric): string | undefined {
+    const percent = metric.usedPercent ?? (metric.limit !== undefined && metric.limit > 0
+      ? metric.used !== undefined ? 100 * metric.used / metric.limit
+        : metric.remaining !== undefined ? 100 * (1 - metric.remaining / metric.limit) : undefined
+      : metric.remainingPercent !== undefined ? 100 - metric.remainingPercent : undefined);
+    if (percent === undefined || !Number.isFinite(percent)) return undefined;
+    const filled = Math.round(Math.max(0, Math.min(100, percent)) / 10);
+    return `[${"#".repeat(filled)}${"-".repeat(10 - filled)}] used`;
   }
 
   handleInput(data: string): void {
+    if (this.closed) return;
     if (matchesKey(data, Key.escape)) return this.close();
     if (data === "r") return this.refresh();
     if (matchesKey(data, Key.up)) this.offset--;
@@ -111,6 +138,5 @@ export class UsageView {
     if (this.closed) return;
     this.closed = true;
     this.sequence++;
-    clearInterval(this.timer);
   }
 }

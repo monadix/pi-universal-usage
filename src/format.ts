@@ -63,11 +63,40 @@ function showsStatusWithMeasurement(status: UsageMetric["status"]): boolean {
   return status !== undefined && status !== "allowed";
 }
 
+/** Real quota information, including zero values and explicit provider states. */
+export function isUsableMetric(metric: UsageMetric): boolean {
+  return [metric.usedPercent, metric.remainingPercent, metric.used, metric.remaining, metric.limit, metric.resetAtSeconds]
+    .some((value) => value !== undefined && Number.isFinite(value)) ||
+    (metric.status !== undefined && metric.status !== "unavailable");
+}
+
+/** An unavailable state qualifies data without making a report usable by itself. */
+export function isDisplayableMetric(metric: UsageMetric): boolean {
+  return isUsableMetric(metric) || metric.status === "unavailable";
+}
+
+/** Fixed public reasons: arbitrary exception or endpoint text is not a UI message. */
+export function unavailableReason(snapshot: TargetSnapshot): string {
+  return snapshot.status === "ok" ? "no quota data"
+    : snapshot.status === "unsupported" ? "no quota interface"
+    : snapshot.status === "no-credential" ? "no credential"
+    : snapshot.status === "unknown" ? "no provider data"
+    : snapshot.status === "error" ? "refresh failed"
+    : snapshot.status === "unavailable" ? "provider unavailable" : snapshot.status;
+}
+
+export function unavailableText(snapshot: TargetSnapshot): string {
+  return plainText(`${snapshot.identity.providerId}: unavailable (${unavailableReason(snapshot)})`);
+}
+
 export function formatMetric(metric: UsageMetric, now: number): string {
   const parts: string[] = [];
   let hasMeasurement = false;
   if (metric.usedPercent !== undefined) {
     parts.push(formatPercent(metric.usedPercent));
+    hasMeasurement = true;
+  } else if (metric.remainingPercent !== undefined) {
+    parts.push(`${formatPercent(metric.remainingPercent)} remaining`);
     hasMeasurement = true;
   } else if (metric.limit !== undefined && metric.remaining !== undefined) {
     parts.push(amountText(metric.remaining, metric.unit));
@@ -152,6 +181,9 @@ function shortMetric(metric: UsageMetric, now: number): string {
   if (metric.usedPercent !== undefined) {
     text = `${label} ${formatPercent(metric.usedPercent)}`;
     hasMeasurement = true;
+  } else if (metric.remainingPercent !== undefined) {
+    text = `${label} ${formatPercent(metric.remainingPercent)} remaining`;
+    hasMeasurement = true;
   } else if (metric.remaining !== undefined) {
     text = `${label} ${amountText(metric.remaining, metric.unit)}`;
     hasMeasurement = true;
@@ -188,16 +220,14 @@ export function formatCompactRateLimit(metric: UsageMetric, now: number): string
 }
 
 /** One-line footer text for the active provider. */
-export function formatCompact(snapshot: TargetSnapshot, now: number, config: UsageConfig): string {
+export function formatCompact(snapshot: TargetSnapshot, now: number, _config: UsageConfig): string {
   const prefix = plainText(snapshot.identity.providerId);
-  const ageMs = Math.max(0, now - snapshot.fetchedAt);
-  const staleSuffix = ageMs > config.refreshSeconds * 2000 ? " · stale" : "";
   if (snapshot.status !== "ok") {
     const detail = snapshot.status === "unsupported" ? "no quota interface" : snapshot.status;
-    return plainText(`${prefix}: ${detail}${staleSuffix}`);
+    return plainText(`${prefix}: ${detail}`);
   }
-  const metrics = snapshot.metrics.filter((metric) => metric.status !== "unlimited");
-  if (metrics.length === 0) return plainText(`${prefix}: no quota data${staleSuffix}`);
+  const metrics = snapshot.metrics.filter(isDisplayableMetric);
+  if (metrics.length === 0) return plainText(`${prefix}: no quota data`);
   const displayed = metrics.slice(0, 3);
   const onlyRates = displayed.every((metric) => metric.source === "rate-limit-headers");
   const parts = displayed.map((metric) =>
@@ -205,7 +235,7 @@ export function formatCompact(snapshot: TargetSnapshot, now: number, config: Usa
   );
   if (metrics.length > 3) parts.push(`+${metrics.length - 3}`);
   const rateLabel = onlyRates ? "rate limit: " : "";
-  return plainText(`${prefix}: ${rateLabel}${parts.join(" · ")}${compactResetSuffix(displayed, now)}${staleSuffix}`);
+  return plainText(`${prefix}: ${rateLabel}${parts.join(" · ")}${compactResetSuffix(displayed, now)}`);
 }
 
 /** Detailed report lines for `/usage`. */
@@ -213,7 +243,6 @@ export function formatReport(
   snapshots: readonly TargetSnapshot[],
   config: UsageConfig,
   now: number,
-  options: { staleLimitSeconds?: number } = {},
 ): string[] {
   const lines: string[] = [];
   if (snapshots.length === 0) {
@@ -226,9 +255,6 @@ export function formatReport(
     const endpoint = snapshot.endpoint === undefined ? "" : ` via ${endpointPath(snapshot.endpoint)}`;
     const scheme = snapshot.scheme === undefined ? "" : ` [${snapshot.scheme}]`;
     lines.push(`  state: ${snapshot.status}${scheme}${endpoint} (source: ${snapshot.source})`);
-    const ageSeconds = Math.max(0, Math.round((now - snapshot.fetchedAt) / 1000));
-    const stale = ageSeconds > (options.staleLimitSeconds ?? config.refreshSeconds * 2);
-    lines.push(`  age: ${formatDuration(ageSeconds)}${stale ? " (stale)" : ""}`);
     for (const metric of snapshot.metrics) {
       const scope = metric.scope === undefined ? "" : ` [${metric.scope}]`;
       const source = snapshot.source === "http" && metric.source === "rate-limit-headers" ? " [rate-limit headers]" : "";

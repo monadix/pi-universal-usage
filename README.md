@@ -44,13 +44,11 @@ listed in your configuration. Arguments select providers to refresh instead of
 that default list; the report can also include the active provider's last
 measurement. Disabled non-active providers are skipped.
 
-The detailed report shows freshness, usage or balance, reset times, source,
-and any errors or provider notices. A requested provider with no registered
-model is listed as unknown rather than silently omitted.
-
-In the TUI, `/usage` opens a scrollable view: use Up/Down, Page Up/Down, Home
-or End to navigate, `r` to refresh, and Esc to close. Reset countdowns update
-without making new requests. In print mode the report is printed as text; in
+In the TUI, `/usage` opens a centered overlay with usage, balances, and quota
+reset times. Press `r` to refresh and Esc to close; when needed, scroll with
+Up/Down, Page Up/Down, Home or End. Unavailable providers are noted alongside
+available results. If no usage data is available, the overlay closes with a
+brief notification. In print mode the report is printed as text; in
 JSON mode it is recorded as a session entry rather than printed as text. RPC
 clients with UI support receive a report widget and notification; without UI,
 the report is recorded as a session entry.
@@ -60,13 +58,12 @@ the report is recorded as a session entry.
 - Usage percentages describe the provider's reported consumption. Values above
   100% remain visible in the detailed report; compact percentages cap at 100%.
 - A reset time in the past is shown as `reset elapsed`, not assumed replenished.
-- Measurements older than twice the refresh interval are marked `stale`.
 - Codex windows are labeled by their declared duration; an unspecified duration
   stays `primary` or `secondary`, rather than being guessed.
 - Request/token rate limits, subscription quotas, key budgets, and balances are
   distinct measurements—not interchangeable estimates.
 - When no quota endpoint is available, supported response headers can supply the
-  last measurement for the same model. `/usage` retains its original timestamp.
+  last measurement for the same model.
 
 Automatic refresh runs only in TUI mode: at startup and model selection, after
 agent activity when throttling permits, and on a timer (five minutes by default).

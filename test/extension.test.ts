@@ -163,7 +163,8 @@ describe("pi extension wiring", () => {
     await host.activate(fake.ctx, model, { refresh: false });
     let component!: import("../src/usage-view.ts").UsageView;
     let opens = 0, renders = 0;
-    (fake.ctx.ui as any).custom = (factory: any) => new Promise<void>((resolve) => {
+    (fake.ctx.ui as any).custom = (factory: any, options: unknown) => new Promise<void>((resolve) => {
+      assert.deepEqual(options, { overlay: true, overlayOptions: { anchor: "center", width: 64, maxHeight: "100%", margin: 1 } });
       opens++;
       component = factory({ terminal: { rows: 12 }, requestRender: () => { renders++; } }, {}, {}, resolve);
     });
@@ -182,6 +183,7 @@ describe("pi extension wiring", () => {
     release(codexBody(5));
     await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal(renders, afterClose);
+    assert.deepEqual(fake.notifications, []);
     host.shutdown(fake.ctx);
   });
 
@@ -204,6 +206,88 @@ describe("pi extension wiring", () => {
     release(codexBody(42));
     await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal(renders, afterShutdown);
+    assert.deepEqual(fake.notifications, []);
+  });
+
+  for (const initial of [true, false]) {
+    it(`closes an all-unavailable ${initial ? "initial" : "manual"} report with one safe notification`, async () => {
+      let calls = 0;
+      const model = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
+      const { pi, host, registry } = buildHost({ models: [model], timers: false,
+        config: normalizeConfig({ providers: { cpa: { path: "/quota" } } }),
+        fetchImpl: (async () => {
+          calls++;
+          if (!initial && calls === 1) return codexBody(0);
+          return textResponse("SECRET", { status: 503 });
+        }) as typeof fetch });
+      const fake = fakeContext({ model, registry });
+      await host.activate(fake.ctx, model, { refresh: false });
+      let component!: import("../src/usage-view.ts").UsageView;
+      (fake.ctx.ui as any).custom = (factory: any) => new Promise<void>((resolve) => {
+        component = factory({ terminal: { rows: 24 }, requestRender() {} }, {}, {}, resolve);
+      });
+      const pending = pi.commands.get(COMMAND_NAME)!.handler("", fake.ctx as ExtensionCommandContext);
+      if (!initial) {
+        await waitFor(() => component.render(64).join("\n").includes("0%"));
+        component.handleInput("r"); component.handleInput("r");
+      }
+      await pending;
+      assert.equal(calls, initial ? 1 : 2);
+      assert.equal(fake.notifications.length, 1);
+      assert.equal(fake.notifications[0], "Usage unavailable: provider unavailable");
+      assert.doesNotMatch(fake.notifications[0]!, /SECRET/);
+      assert.equal(fake.widgets.length, 0);
+      host.shutdown(fake.ctx);
+    });
+  }
+
+  it("keeps zero usage and unlimited credits alongside unavailable providers", async () => {
+    const model = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
+    const { pi, host, registry } = buildHost({ models: [model], timers: false, fetchImpl: (async () => jsonResponse({
+      credits: { unlimited: true }, rate_limit: { secondary_window: { used_percent: 0 } },
+    })) as typeof fetch });
+    const fake = fakeContext({ model, registry });
+    await host.activate(fake.ctx, model, { refresh: false });
+    let component!: import("../src/usage-view.ts").UsageView;
+    (fake.ctx.ui as any).custom = (factory: any) => new Promise<void>((resolve) => {
+      component = factory({ terminal: { rows: 24 }, requestRender() {} }, {}, {}, resolve);
+    });
+    const pending = pi.commands.get(COMMAND_NAME)!.handler("cpa missing", fake.ctx as ExtensionCommandContext);
+    await waitFor(() => component.render(64).join("\n").includes("unlimited"));
+    const text = component.render(64).join("\n");
+    assert.match(text, /0%/); assert.match(text, /missing: unavailable/);
+    assert.deepEqual(fake.notifications, []);
+    component.close(); await pending; host.shutdown(fake.ctx);
+  });
+
+  it("closes on same-model selection invalidation and cannot alert over a newer overlay", async () => {
+    let calls = 0, release!: (response: Response) => void;
+    const model = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
+    const { pi, host, registry } = buildHost({ models: [model], timers: false,
+      config: normalizeConfig({ providers: { cpa: { path: "/quota" } }, autoRefresh: false }),
+      fetchImpl: (async () => {
+        calls++;
+        if (calls === 1) return await new Promise<Response>((resolve) => { release = resolve; });
+        return codexBody(42);
+      }) as typeof fetch });
+    const fake = fakeContext({ model, registry });
+    await host.activate(fake.ctx, model, { refresh: false });
+    let component!: import("../src/usage-view.ts").UsageView;
+    (fake.ctx.ui as any).custom = (factory: any) => new Promise<void>((resolve) => {
+      component = factory({ terminal: { rows: 24 }, requestRender() {} }, {}, {}, resolve);
+    });
+    const command = pi.commands.get(COMMAND_NAME)!;
+    const first = command.handler("", fake.ctx as ExtensionCommandContext);
+    await waitFor(() => release !== undefined);
+    await pi.emit("model_select", { model }, fake.ctx);
+    await first;
+    const second = command.handler("", fake.ctx as ExtensionCommandContext);
+    await waitFor(() => component.render(64).join("\n").includes("42%"));
+    release(textResponse("SECRET", { status: 503 }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.deepEqual(fake.notifications, []);
+    assert.match(component.render(64).join("\n"), /42%/);
+    component.close(); await second; host.shutdown(fake.ctx);
   });
 
   it("deduplicates joined endpoint warnings and supports RPC notifications without UI-less output", async () => {
@@ -630,8 +714,8 @@ describe("pi extension wiring", () => {
     assert.match(text, /openai\/chat/);
     assert.match(text, /state: ok \[rate-limit-headers\] \(source: headers\)/);
     assert.match(text, /requests 75%/);
-    // The original measurement timestamp is preserved, not reset by the command.
-    assert.match(text, /age: 2m/);
+    // Measurement age is internal, not a report field.
+    assert.doesNotMatch(text, /age:|stale|freshness/i);
     host.shutdown(fake.ctx);
   });
 
@@ -850,7 +934,7 @@ describe("pi extension wiring", () => {
     assert.equal(fake.notifications.length, 0);
   });
 
-  it("repaints stale footer qualifications from cache without another request", async () => {
+  it("repaints elapsed resets from cache without visible stale labels or another request", async () => {
     const { fetchImpl, calls } = sequenceFetch([codexBody(42)]);
     const model = fakeModel({ provider: "cpa", id: "chat", baseUrl: "http://localhost:8317/v1" });
     const { pi, host, registry, advance } = buildHost({ fetchImpl, models: [model] });
@@ -867,7 +951,7 @@ describe("pi extension wiring", () => {
     assert.equal(calls.length, 1);
     const footer = String(fake.statuses[fake.statuses.length - 1]);
     assert.match(footer, /reset elapsed/);
-    assert.match(footer, /stale/);
+    assert.doesNotMatch(footer, /age:|stale|freshness/i);
     host.shutdown(fake.ctx);
   });
 

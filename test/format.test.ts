@@ -90,9 +90,9 @@ describe("formatting", () => {
     assert.equal(text.includes("fragment"), false);
   });
 
-  it("marks a stale snapshot and shows the next attempt", () => {
+  it("omits measurement age and freshness labels but shows the next attempt", () => {
     const text = formatReport([snapshot({ fetchedAt: NOW - 900_000 })], config, NOW).join("\n");
-    assert.match(text, /stale/);
+    assert.doesNotMatch(text, /age:|stale|freshness/i);
     const retry = formatReport([snapshot({ nextRetryAt: NOW + 60_000, status: "rate-limited", error: "the provider reported a rate limit" })], config, NOW).join("\n");
     assert.match(retry, /next attempt: in 1m/);
     assert.match(retry, /error: the provider reported a rate limit/);
@@ -316,7 +316,7 @@ describe("formatting", () => {
     assert.match(footer, /USD/);
   });
 
-  it("marks an elapsed footer reset and a stale snapshot", () => {
+  it("marks an elapsed footer reset without measurement age or stale labels", () => {
     const text = formatCompact(
       snapshot({
         identity: { ...identity, providerId: "cpa" },
@@ -338,7 +338,33 @@ describe("formatting", () => {
     );
     assert.match(text, /weekly 88%/);
     assert.match(text, /reset elapsed/);
-    assert.match(text, /stale/);
+    assert.doesNotMatch(text, /age:|stale|freshness/i);
+  });
+
+  for (const total of ["8.82", "0"]) {
+    it(`retains parsed balance unavailability alongside $${total} in footer and report`, () => {
+      const parsed = deepseekBalanceParser.parse({
+        now: NOW, json: { is_available: false, balance_infos: [{ currency: "USD", total_balance: total }] },
+      });
+      assert.ok(parsed);
+      const value = snapshot({ metrics: parsed.metrics });
+      const footer = formatCompact(value, NOW, config);
+      const report = formatReport([value], config, NOW).join("\n");
+      assert.match(footer, /balance unavailable/);
+      assert.ok(footer.includes(`USD $${total}`));
+      assert.match(report, /balance availability unavailable/);
+      assert.ok(report.includes(`balance (USD) $${total}`));
+    });
+  }
+
+  it("shows parsed unavailable-only balance state without inventing money", () => {
+    const parsed = deepseekBalanceParser.parse({ now: NOW, json: { is_available: false, balance_infos: [] } });
+    assert.ok(parsed);
+    const value = snapshot({ metrics: parsed.metrics });
+    assert.equal(formatCompact(value, NOW, config), "deepseek: balance unavailable");
+    const report = formatReport([value], config, NOW).join("\n");
+    assert.match(report, /balance availability unavailable/);
+    assert.doesNotMatch(report, /\$/);
   });
 
   it("does not imply a quota for an unsupported provider", () => {

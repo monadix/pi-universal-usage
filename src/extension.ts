@@ -19,7 +19,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { resolveTarget, type ResolvedTarget, type TargetResolution } from "./auth.ts";
 import { loadConfig, STATUS_KEY, type UsageConfig } from "./config.ts";
-import { formatCompact, formatCompactRateLimit, formatReport } from "./format.ts";
+import { formatCompact, formatCompactRateLimit, formatReport, isUsableMetric } from "./format.ts";
 import { plainText } from "./text.ts";
 import { isCancelledSnapshot, UsageMonitor } from "./monitor.ts";
 import type { TargetSnapshot } from "./types.ts";
@@ -169,6 +169,7 @@ export class UniversalUsageHost {
       ) {
         return;
       }
+      this.view?.close();
       if (this.isCurrentModel(event.model)) {
         // Re-selecting the active logical model is still a chance to pick up
         // rotated credentials or a changed base URL. Adoption must happen even
@@ -376,13 +377,16 @@ export class UniversalUsageHost {
   private async openView(ctx: ExtensionCommandContext, args: string): Promise<void> {
     if (this.disposed || this.viewOpening) return;
     this.viewOpening = true;
+    const stamp = this.reportStamp(ctx);
     try {
       await ctx.ui.custom<void>((tui, _theme, _keys, done) => {
-        const view = new UsageView(tui, done, () => this.collectReport(ctx, args), () => this.config, this.now);
+        const view = new UsageView(tui, done, () => this.collectReport(ctx, args), this.now, (message) => {
+          if (this.view === view && this.isCurrent(stamp, ctx)) ctx.ui.notify(message, "warning");
+        });
         this.view = view;
         view.refresh();
         return view;
-      });
+      }, { overlay: true, overlayOptions: { anchor: "center", width: 64, maxHeight: "100%", margin: 1 } });
     } finally {
       this.view?.dispose();
       this.view = undefined;
@@ -478,6 +482,10 @@ export class UniversalUsageHost {
     if (active !== undefined && !snapshots.some((snapshot) => snapshot.identity.key === active.identity.key)) {
       snapshots.unshift(active);
     }
+    // A cancelled provider is not an unavailable provider. Keep useful siblings,
+    // but do not turn a wholly invalidated report into an unavailable alert.
+    if (results.some((result) => result !== undefined && result.snapshot === undefined) &&
+      !snapshots.some((snapshot) => snapshot.metrics.some(isUsableMetric))) return;
     for (const snapshot of snapshots) this.warn(ctx, snapshot);
     return snapshots;
   }
