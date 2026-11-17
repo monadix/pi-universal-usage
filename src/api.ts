@@ -342,6 +342,19 @@ function freshEnough(snapshot: TargetSnapshot, now: number, ttlMs: number): bool
   return now - snapshot.fetchedAt <= ttlMs;
 }
 
+/**
+ * Finalize measured freshness against the report timestamp. Provider work can
+ * finish before another selected provider, so the per-target decision made
+ * during collection is not authoritative for the aggregate report.
+ */
+function finalizeFreshness(result: UsageResult, generatedAt: number, ttlMs: number): UsageResult {
+  if (result.source === undefined) return result;
+  const observedAt = finite(result.observedAt);
+  if (observedAt === undefined) return result;
+  const freshness: UsageResult["freshness"] = generatedAt - observedAt <= ttlMs ? "fresh" : "stale";
+  return freshness === result.freshness ? result : { ...result, freshness };
+}
+
 function errorForStatus(status: TargetStatus | "disabled"): UsageError | undefined {
   if (status === "ok" || status === "unknown" || status === "disabled") return undefined;
   return { code: status, message: STATUS_MESSAGES[status] };
@@ -527,14 +540,19 @@ class HeadlessUsageClient implements UsageClient {
     };
     const workers = Math.min(Math.max(1, this.config.reportConcurrency), Math.max(targets.length, 1));
     await Promise.all(Array.from({ length: workers }, () => worker()));
+    const generatedAt = this.now();
+    const ttlMs = this.config.refreshSeconds * 1000;
     const sanitizeProblems = sanitizerFor(redactions);
     return {
       schemaVersion: 1,
-      generatedAt: this.now(),
-      results: targets.map((target, index) => results[index] ?? placeholderResult(target, "unknown", {
-        sanitize: sanitizerFor(redactions),
-        notice: "usage data is not available",
-      })),
+      generatedAt,
+      results: targets.map((target, index) => {
+        const result = results[index] ?? placeholderResult(target, "unknown", {
+          sanitize: sanitizerFor(redactions),
+          notice: "usage data is not available",
+        });
+        return finalizeFreshness(result, generatedAt, ttlMs);
+      }),
       configProblems: this.config.problems.map((problem) => sanitizeConfigProblem(problem, sanitizeProblems)),
     };
   }

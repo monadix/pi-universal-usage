@@ -2,8 +2,9 @@
 
 ## Local checks
 
-Requires Node.js 22.19 or newer. Pi loads the TypeScript entry point directly;
-there is no build step.
+Requires Node.js 22.19 or newer. Pi loads the TypeScript entry point directly.
+npm lifecycle scripts build the public API artifact into `dist/`; no manual
+build step is required.
 
 ```sh
 npm install
