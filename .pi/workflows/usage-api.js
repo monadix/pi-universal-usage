@@ -8,6 +8,7 @@ Read applicable instructions, README.md, CONTRIBUTING.md and relevant existing c
 All current changes/commits on this feature branch are authorized work for this task.
 Do not stage, commit, switch branches, spawn agents or run tests/checks yourself.
 A host gate runs npm run check, npm run pack:dry-run and npm run load-check AFTER your turn ends, then commits that iteration (including failing iterations).
+Acceptance reports evaluate YOUR assigned stage. Evidence sufficient for an independent acceptance review means a truthful change/coverage/handoff report; it does not require you to run forbidden checks or complete a future review. Distinguish pending host checks and intentionally failing regression tests from an incomplete authoring assignment; never claim checks were run by you.
 If blocked or unable to complete, contact the supervisor and stop; do not claim success or silently redefine scope.
 Use early progress checkpoints and stop with a precise handoff before context exhaustion.
 `;
@@ -24,7 +25,16 @@ const contract = `Implement the approved design, not additional features:
 - V1 scope: DTOs, headless service, tools, existing command integration and pure formatter. No subscriptions, config-writing tools, per-provider tools, arbitrary endpoints, standalone runtime loader or CLI. Keep code/docs proportional and avoid redundant abstractions.
 `;
 const docs = `For Pi-specific work inspect installed Pi SDK/types and docs. Main docs: /nix/store/nbksxnv9wk62h5pvds9nd96kcfai0m81-pi-coding-agent-1.5.0/lib/node_modules/pi-monorepo; relevant docs/extensions.md, docs/sdk.md, docs/packages.md and relevant examples/extensions, following relevant cross-references. Repository peer dev versions are 1.2.0, so do not assume the latest docs' runtime-only additions are required or present. Existing runtime load-check must remain passing.`;
-let specification = await runs.run('specification', {
+// Recovery is supplied only after supervisor inspection of committed stage evidence.
+if (args.recovery && (!args.recovery.evidence || !args.recovery.feedback ||
+    !Number.isInteger(args.recovery.implementationPasses) || !Number.isInteger(args.recovery.reviewPasses))) {
+  return { status: 'invalid-recovery-needs-supervisor' };
+}
+let specification = args.recovery ? {
+  ok: true, structuredOutput: args.recovery.evidence,
+  output: 'Read prior specification report: ' + args.recovery.specificationReport,
+  outputReference: args.recovery.specificationReport,
+} : await runs.run('specification', {
   label: 'Specify API and independent tests', agent: 'usage-spec-tests-sol', cwd,
   model: 'openai-codex/gpt-6.1-sol',
   task: common + contract + docs + `\nAuthor the durable, developer-facing specification at ${specPath} and deterministic behavioral tests under test/. Do not modify production files/package/workflow/agent definitions. This is the initial test-first pass: missing exports may fail until implemented. Specify precise defaults, unknown/disabled/unresolved statuses, freshness/cache/backoff, JSON serialization, duplicate selection and cancellation semantics, public type/import compatibility and tool result shapes. Tests must cover actual externally observable behavior rather than demand a particular class decomposition. Reuse test conventions and fixtures. Cover credential/routing changes, shared cancellation, passive header reuse, single-cache /usage integration, no UI/output side effects, schema validation, per-provider failures, concurrency limits, disposal and unknown != zero. Read the full baseline test helpers before authoring replacements/mocks. Report requirement-to-test mapping, any untested requirements and decisions; no executing tests or typecheck.`,
@@ -32,11 +42,12 @@ let specification = await runs.run('specification', {
   gate: { command: 'node .pi/workflows/usage-api-gate.cjs spec 0', output: 'json', timeoutMs: 600000 },
 });
 if (!specification.ok || !specification.structuredOutput) return { status: 'blocked-specification', result: specification };
-emit({ stage: 'specification', evidence: specification.structuredOutput });
+emit({ stage: args.recovery ? 'recovered-checkpoint' : 'specification', evidence: specification.structuredOutput });
 let evidence = specification.structuredOutput;
-let feedback = 'Implement the complete specification and satisfy the independently authored tests. Read ' + specPath + ' and all feature tests.';
-let implementationPasses = 0;
-let reviewPasses = 0;
+let feedback = args.recovery ? args.recovery.feedback :
+  'Implement the complete specification and satisfy the independently authored tests. Read ' + specPath + ' and all feature tests.';
+let implementationPasses = args.recovery ? args.recovery.implementationPasses : 0;
+let reviewPasses = args.recovery ? args.recovery.reviewPasses : 0;
 const reviewSchema = {
   type: 'object', additionalProperties: false,
   properties: {
