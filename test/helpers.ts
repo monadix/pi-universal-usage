@@ -66,6 +66,30 @@ export function fakeRegistry(
   } as unknown as ModelRegistry;
 }
 
+/** Valid quota payloads echoing short, resolved private values in public text dimensions. */
+export function shortRoutingPrivacyCases() {
+  return ["8", "42"].flatMap((privateValue) =>
+    ["ChatGPT-Account-Id", "x-routing-account"].flatMap((headerName) =>
+      (["codex-json", "anthropic-json"] as const).map((scheme) => {
+        const echoes = [`plan-account-${privateValue}`, `mode-route-${privateValue}`, `tenant-${privateValue}`];
+        const usedPercent = Number(privateValue);
+        const resetAtSeconds = 1_768_003_600;
+        return {
+          name: `${privateValue.length}-character ${headerName} in ${scheme}`,
+          privateValue, headerName, scheme, echoes, usedPercent, resetAtSeconds,
+          model: fakeModel({ provider: "custom", id: "chat", baseUrl: "https://quota.example/v1" }),
+          config: { providers: { custom: { scheme, path: "/usage" } } },
+          auth: { apiKey: "SYNTHETIC_PRIVATE_CREDENTIAL", headers: { [headerName]: privateValue } },
+          body: scheme === "codex-json" ? {
+            plan_type: echoes[0], quota_mode: echoes[1],
+            rate_limit: { secondary_window: { used_percent: usedPercent, reset_at: resetAtSeconds } },
+          } : {
+            [`seven_day_${echoes[2]}`]: { utilization: usedPercent, resets_at: resetAtSeconds },
+          },
+        };
+      })));
+}
+
 export function jsonResponse(body: unknown, init: { status?: number; headers?: Record<string, string> } = {}): Response {
   return new Response(JSON.stringify(body), {
     status: init.status ?? 200,

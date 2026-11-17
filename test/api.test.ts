@@ -4,7 +4,7 @@ import { describe, it } from "node:test";
 import { createUsageClient, formatUsageReport } from "pi-universal-usage/api";
 import type { UsageReport, UsageResult } from "pi-universal-usage/api";
 import { normalizeConfig } from "../src/config.ts";
-import { fakeModel, fakeRegistry, jsonResponse, sequenceFetch, textResponse, type FakeAuth } from "./helpers.ts";
+import { fakeModel, fakeRegistry, jsonResponse, sequenceFetch, shortRoutingPrivacyCases, textResponse, type FakeAuth } from "./helpers.ts";
 
 const NOW = 1_768_000_000_000;
 const deepseek = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
@@ -447,6 +447,39 @@ describe("public headless usage API", { timeout: 5000 }, () => {
       assert.doesNotMatch(JSON.stringify(report), /SYNTHETIC_PRIVATE_|\\u001b|\\u202e/i);
     } finally { d.client.dispose(); }
   });
+
+  for (const fixture of shortRoutingPrivacyCases()) {
+    it(`redacts ${fixture.name} without altering numeric measurements`, async () => {
+      const recorded = sequenceFetch([() => jsonResponse(fixture.body)]);
+      const f = setup({ models: [fixture.model], auth: fixture.auth, rawConfig: fixture.config, fetchImpl: recorded.fetchImpl });
+      try {
+        for (const refresh of ["if-needed", "cached"] as const) {
+          const report = await f.client.read({ refresh });
+          const result = only(report);
+          assert.equal(result.status, "ok"); assert.equal(result.source, "http");
+          assert.equal(result.cacheHit, refresh === "cached");
+          assert.equal(result.metrics.length, 1, "privacy must not discard usable quota data");
+          assert.equal(result.metrics[0]?.usedPercent, fixture.usedPercent);
+          assert.equal(result.metrics[0]?.resetAtSeconds, fixture.resetAtSeconds);
+          if (fixture.scheme === "codex-json") {
+            assert.match(result.notice ?? "", /plan=/); assert.match(result.notice ?? "", /quota_mode=/);
+          } else {
+            assert.match(result.metrics[0]?.scope ?? "", /^model:/);
+          }
+          // Numbers may legitimately equal the private identifier. Only public
+          // strings must redact it, including IDs, labels, scopes and notices.
+          const strings = JSON.stringify(report, (_key, value: unknown) => typeof value === "number" ? undefined : value);
+          assert.equal(strings.includes(fixture.privateValue), false, "no resolved private value may survive in DTO strings");
+          const text = formatUsageReport(report);
+          for (const echo of fixture.echoes) assert.equal(text.includes(echo), false, "formatting must not restore a private echo");
+          assert.match(text, new RegExp(`${fixture.usedPercent}%`), "formatting preserves the numeric measurement");
+          publicShape(report);
+        }
+        assert.equal(recorded.calls.length, 1);
+        assert.equal(recorded.calls[0]?.headers[fixture.headerName.toLowerCase()], fixture.privateValue);
+      } finally { f.client.dispose(); }
+    });
+  }
 
   it("omits arbitrary invalid scheme values without relying on resolved credentials or quote boundaries", async () => {
     for (const invalidScheme of [

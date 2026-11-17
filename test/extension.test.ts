@@ -8,7 +8,7 @@ import type { UsageReport } from "pi-universal-usage/api";
 import { normalizeConfig } from "../src/config.ts";
 import { COMMAND_NAME, REPORT_WIDGET_KEY, UniversalUsageHost } from "../src/extension.ts";
 import { UsageMonitor } from "../src/monitor.ts";
-import { fakeModel, fakeRegistry, jsonResponse, sequenceFetch, textResponse, type FakeAuth } from "./helpers.ts";
+import { fakeModel, fakeRegistry, jsonResponse, sequenceFetch, shortRoutingPrivacyCases, textResponse, type FakeAuth } from "./helpers.ts";
 
 type Handler = (event: any, ctx: any) => unknown;
 
@@ -2450,6 +2450,44 @@ describe("usage agent tool contracts", { timeout: 5000 }, () => {
         } finally { release(); host.shutdown(fake.ctx); }
       });
     }
+  }
+
+  for (const fixture of shortRoutingPrivacyCases()) {
+    it(`keeps ${fixture.name} private across fresh and cached tool output`, async () => {
+      const { fetchImpl, calls } = sequenceFetch([() => jsonResponse(fixture.body)]);
+      const { pi, host, registry } = buildHost({ fetchImpl, models: [fixture.model], timers: false,
+        config: normalizeConfig(fixture.config), auth: () => fixture.auth });
+      const fake = fakeContext({ model: fixture.model, registry });
+      try {
+        for (const refresh of ["if-needed", "cached"] as const) {
+          const output = await executeUsageTool(pi, fake.ctx, { refresh });
+          const report = toolReport(output);
+          const result = report.results[0]!;
+          assert.equal(result.status, "ok"); assert.equal(result.source, "http");
+          assert.equal(result.cacheHit, refresh === "cached");
+          assert.equal(result.metrics.length, 1, "redaction preserves usable quota data");
+          assert.equal(result.metrics[0]?.usedPercent, fixture.usedPercent);
+          assert.equal(result.metrics[0]?.resetAtSeconds, fixture.resetAtSeconds);
+          if (fixture.scheme === "codex-json") {
+            assert.match(result.notice ?? "", /plan=/); assert.match(result.notice ?? "", /quota_mode=/);
+          } else {
+            assert.match(result.metrics[0]?.scope ?? "", /^model:/);
+          }
+          for (const payload of [report, output.structuredContent].filter((value) => value !== undefined)) {
+            const strings = JSON.stringify(payload, (_key, value: unknown) => typeof value === "number" ? undefined : value);
+            assert.equal(strings.includes(fixture.privateValue), false, "structured strings redact even one-character private values");
+          }
+          // Text may contain the same digits as a real percentage, but never
+          // the provider's labeled private echoes. Include every tool surface.
+          for (const echo of fixture.echoes) assert.equal(JSON.stringify(output).includes(echo), false);
+          const text = output.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+          assert.match(text, new RegExp(`${fixture.usedPercent}%`));
+        }
+        assert.equal(calls.length, 1);
+        assert.equal(calls[0]?.headers[fixture.headerName.toLowerCase()], fixture.privateValue);
+        assert.equal(fake.statuses.length + fake.widgets.length + fake.notifications.length + pi.entries.length, 0);
+      } finally { host.shutdown(fake.ctx); }
+    });
   }
 
   it("keeps arbitrary invalid scheme values private in unresolved-provider tool output", async () => {
