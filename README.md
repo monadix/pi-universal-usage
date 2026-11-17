@@ -70,6 +70,19 @@ agent activity when throttling permits, and on a timer (five minutes by default)
 Use `/usage` to request a refresh manually. Concurrent reads for the same account
 share an in-flight request.
 
+### Agent tools
+
+Two read-only tools are registered for Pi agents:
+
+- `usage_providers` lists registered, configured, and active provider IDs without
+  resolving credentials or claiming that a provider is usable.
+- `usage_read` reads the active provider by default, or only the provider IDs
+  passed in `providers`. It accepts `cached`, `if-needed`, and `force` refresh
+  modes.
+
+Tool reads share the same account cache and request limits as `/usage`, make no
+inference calls, and do not change configuration or open the report overlay.
+
 ## Supported providers
 
 | Provider | What can be shown |
@@ -193,9 +206,17 @@ origin; redirects and URLs containing userinfo are refused. Requests have time
 and body-size limits.
 
 Configuration contains no secrets. Reports omit credentials and sanitize remote
-text before displaying it. Loading the extension registers handlers without
-starting network requests; usage reads begin through session activity or
-`/usage`.
+text before displaying it. Loading the extension registers handlers and tools
+without starting network requests; usage reads begin through session activity,
+`/usage`, or a usage tool call.
+
+## Programmatic API
+
+`pi-universal-usage/api` exports `createUsageClient`, `formatUsageReport`, and
+the public report types. It needs an already configured Pi `ModelRegistry` and
+performs the same read-only authenticated GETs without starting a session or
+printing anything. See [Usage API v1](docs/api-specification.md) for the
+contract.
 
 ## Contributing
 

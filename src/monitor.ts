@@ -47,6 +47,12 @@ interface OptionalDeferral {
 interface Run {
   readonly controller: AbortController;
   /**
+   * A caller outside the host lifecycle, such as the headless API. Host-level
+   * activation cancels its own pending reads but must not cancel work a caller
+   * still waits for and owns.
+   */
+  readonly external: boolean;
+  /**
    * The sequence's result. Assigned in the same synchronous frame that installs
    * the run; the record is installed first, so a path that answers without a
    * network await already owns its entry.
@@ -218,6 +224,19 @@ export class UsageMonitor {
     return this.entries.get(key)?.snapshot;
   }
 
+  /**
+   * The existing measurement or failure state for a target without requesting
+   * anything. A passive measurement belongs to the model whose inference
+   * produced it, so another model of the same account cannot consume it here.
+   */
+  knownSnapshot(target: ResolvedTarget): TargetSnapshot | undefined {
+    const entry = this.entries.get(target.identity.key);
+    if (entry === undefined) return undefined;
+    if (entry.snapshot !== undefined) return entry.snapshot;
+    const passive = entry.lastPassive;
+    return passive !== undefined && passive.modelId === target.identity.modelId ? passive.snapshot : undefined;
+  }
+
   isStale(snapshot: TargetSnapshot, config: UsageConfig): boolean {
     return this.now() - snapshot.fetchedAt > config.refreshSeconds * 2000;
   }
@@ -230,7 +249,7 @@ export class UsageMonitor {
     target: ResolvedTarget,
     provider: ProviderConfig | undefined,
     config: UsageConfig,
-    options: { force?: boolean; signal?: AbortSignal } = {},
+    options: { force?: boolean; signal?: AbortSignal; external?: boolean } = {},
   ): Promise<TargetSnapshot> {
     if (this.closed) return Promise.resolve(emptySnapshot(target, "unknown", this.now(), "monitor is shut down"));
     const key = target.identity.key;
@@ -251,7 +270,7 @@ export class UsageMonitor {
     // Install it before any work starts, so even a path that answers without a
     // network await is joinable and cancellable through its entry; its promise
     // is attached immediately below.
-    const run: Run = { controller: new AbortController() } as Run;
+    const run = { controller: new AbortController(), external: options.external === true } as Run;
     current.run = run;
     run.promise = this.executeRun(target, provider, config, current, run, options.signal).finally(() => {
       // A cancelled entry may already have installed a replacement run.
@@ -302,11 +321,20 @@ export class UsageMonitor {
   }
 
   /**
-   * Abort every in-flight run and detach it from its entry, so a replacement
-   * refresh starts new work instead of joining the cancelled run. Each run is
-   * reachable through the entry that owns it.
+   * Abort host-owned in-flight runs and detach them from their entries, so a
+   * replacement refresh starts new work instead of joining the cancelled run.
+   * Work started by an external caller (the headless API) stays joinable for its
+   * owner; shutdown still aborts it.
    */
   cancel(): void {
+    for (const entry of this.entries.values()) {
+      const run = entry.run;
+      if (run !== undefined && !run.external) this.detach(entry, run);
+    }
+  }
+
+  /** Abort every in-flight run, including externally owned work. */
+  private cancelAll(): void {
     for (const entry of this.entries.values()) {
       const run = entry.run;
       if (run !== undefined) this.detach(entry, run);
@@ -326,7 +354,7 @@ export class UsageMonitor {
   /** Idempotent shutdown: abort in-flight requests, forget cached state, refuse new work. */
   dispose(): void {
     if (this.closed) return;
-    this.cancel();
+    this.cancelAll();
     this.entries.clear();
     this.closed = true;
   }
