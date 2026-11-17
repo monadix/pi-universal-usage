@@ -18,6 +18,7 @@
     "extensions",
     "src",
     "scripts",
+    "types",
     "docs",
     "CONTRIBUTING.md",
     "README.md",
@@ -30,7 +31,7 @@
   },
   "exports": {
     "./api": {
-      "types": "./src/api.ts",
+      "types": "./types/api.d.ts",
       "default": "./dist/api.js"
     }
   },
