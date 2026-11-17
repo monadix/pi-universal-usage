@@ -27,7 +27,7 @@ const files = [...new Set([
 ].filter(Boolean))];
 for (const file of files) {
   const permitted = phase === 'implementation'
-    ? /^(src\/|extensions\/|docs\/(?!api-specification\.md$)|README\.md$|package(?:-lock)?\.json$|tsconfig(?:\.build)?\.json$|\.gitignore$)/.test(file)
+    ? /^(src\/|extensions\/|docs\/(?!api-specification\.md$)|(?:README|CONTRIBUTING)\.md$|package(?:-lock)?\.json$|tsconfig(?:\.build)?\.json$|\.gitignore$)/.test(file)
     : /^(test\/|docs\/api-specification\.md$)/.test(file);
   if (!permitted) throw new Error(`Out-of-scope ${phase} edit: ${file}`);
 }
