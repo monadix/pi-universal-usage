@@ -269,7 +269,9 @@ function addIdentityRedactions(values: Set<string>, identity: TargetIdentity): v
 
 /**
  * Values a provider echoed back must never turn into public text. The set is
- * derived only from the credential/routing state Pi actually resolved.
+ * derived only from the credential/routing state Pi actually resolved. A valid
+ * account/routing identifier has no minimum length, so short values must be
+ * redacted like long ones rather than silently dropped.
  */
 function redactionsFor(target: ResolvedTarget): string[] {
   const values = new Set<string>();
@@ -287,9 +289,9 @@ function redactionsFor(target: ResolvedTarget): string[] {
   for (const value of Object.values(target.originHeaders)) {
     add(value);
     const token = plainText(value).trim().split(/\s+/u).at(-1);
-    if (token !== undefined && token.length >= 3) add(token);
+    if (token !== undefined) add(token);
   }
-  return [...values].filter((value) => value.length >= 3).sort((left, right) => right.length - left.length);
+  return [...values].sort((left, right) => right.length - left.length);
 }
 
 function sanitizerFor(redactions: Iterable<string>): (value: string) => string {
@@ -297,7 +299,7 @@ function sanitizerFor(redactions: Iterable<string>): (value: string) => string {
   const seen = new Set<string>();
   for (const redaction of redactions) {
     const clean = plainText(redaction);
-    if (clean.length < 3 || seen.has(clean.toLowerCase())) continue;
+    if (clean === "" || seen.has(clean.toLowerCase())) continue;
     seen.add(clean.toLowerCase());
     patterns.push(new RegExp(escapeRegExp(clean), "giu"));
   }

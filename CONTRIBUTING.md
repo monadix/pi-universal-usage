@@ -3,8 +3,12 @@
 ## Local checks
 
 Requires Node.js 22.19 or newer. Pi loads the TypeScript entry point directly.
-npm lifecycle scripts build the public API artifact into `dist/`; no manual
-build step is required.
+`npm install`, `npm pack`, and the local checks run the dependency-free build
+script (`src/build-api.ts`), which emits the public API artifact into `dist/`
+with Node's built-in type stripping. That keeps the subpath importable from an
+installed package, including Pi's production-only dependency install, without a
+manual build step or a compiler dependency. The package's `types` export points
+at the TypeScript sources, so declarations stay in sync without that compiler.
 
 ```sh
 npm install
