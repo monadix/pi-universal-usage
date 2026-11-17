@@ -6,7 +6,7 @@ import { delimiter, join, relative, sep } from "node:path";
 import { it } from "node:test";
 import { fileURLToPath } from "node:url";
 
-it("serves the public API to an installed plain-Node consumer without a loader or Pi bootstrap", { timeout: 90_000 }, () => {
+it("serves the installed public API to plain Node and independently configured TypeScript consumers", { timeout: 90_000 }, () => {
   const root = mkdtempSync(join(tmpdir(), "usage-api-consumer-"));
   try {
     const artifacts = join(root, "artifacts");
@@ -41,6 +41,7 @@ it("serves the public API to an installed plain-Node consumer without a loader o
     assert.equal(lstatSync(installed).isSymbolicLink(), false);
     assert.equal(realpathSync(installed), join(realpathSync(consumer), "node_modules", "pi-universal-usage"));
     assertPlainNodeConsumer(consumer, env, agentDir);
+    assertTypeScriptConsumer(consumer, env);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -88,6 +89,70 @@ for (const productionOnly of [false, true]) {
         rmSync(root, { recursive: true, force: true });
       }
     });
+}
+
+function assertTypeScriptConsumer(consumer: string, env: NodeJS.ProcessEnv) {
+  const dependencies = fileURLToPath(new URL("../node_modules/", import.meta.url));
+  // Supply only the declared Pi peers and Node typings from the offline host.
+  // The package under test remains the real tarball install, not a source link.
+  for (const name of ["@earendil-works/pi-ai", "@earendil-works/pi-coding-agent", "@types/node"]) {
+    const [scope] = name.split("/");
+    mkdirSync(join(consumer, "node_modules", scope!), { recursive: true });
+    symlinkSync(realpathSync(join(dependencies, name)), join(consumer, "node_modules", name), "junction");
+  }
+  // Do not extend the producer's tsconfig: its allowImportingTsExtensions flag
+  // would mask a public type entry that requires implementation-specific flags.
+  writeFileSync(join(consumer, "tsconfig.json"), JSON.stringify({
+    compilerOptions: {
+      target: "ES2023", lib: ["ES2023"], module: "NodeNext", moduleResolution: "NodeNext",
+      strict: true, skipLibCheck: true, noEmit: true, types: ["node"],
+    },
+    files: ["consumer.ts"],
+  }));
+  writeFileSync(join(consumer, "consumer.ts"), `
+    import type { ModelRegistry } from '@earendil-works/pi-coding-agent';
+    import { createUsageClient, formatUsageReport } from 'pi-universal-usage/api';
+    import type {
+      ProviderInfo, UsageClient, UsageRefresh, UsageReport, UsageResult, UsageSelection,
+    } from 'pi-universal-usage/api';
+
+    export async function consume(registry: ModelRegistry) {
+      const client: UsageClient = createUsageClient({ modelRegistry: registry });
+      const providers: ProviderInfo[] = client.listProviders();
+      const refresh: UsageRefresh = 'cached';
+      const selections: readonly UsageSelection[] = [
+        { active: true },
+        { providers: ['deepseek'] as const },
+        { models: [{ provider: 'deepseek', modelId: 'chat' }] as const },
+      ];
+      try {
+        for (const selection of selections) {
+          const report: UsageReport = await client.read({ selection, refresh });
+          const result: UsageResult | undefined = report.results[0];
+          const version: 1 = report.schemaVersion;
+          const text: string = formatUsageReport(report);
+          void [result, version, text];
+        }
+        // Guard against a missing/untyped type entry appearing to compile.
+        // @ts-expect-error selections must remain mutually exclusive
+        const mixed: UsageSelection = { active: true, providers: ['deepseek'] };
+        // @ts-expect-error public reads reject unsupported refresh modes
+        void client.read({ refresh: 'always' });
+        void mixed;
+        return providers;
+      } finally {
+        client.dispose();
+      }
+    }
+  `);
+  // Use the host compiler as a tool, not as a production package dependency.
+  // Explicit --project isolates the external consumer from repository settings;
+  // neither allowImportingTsExtensions nor rewriteRelativeImportExtensions is set.
+  const child = spawnSync(process.execPath, [join(dependencies, "typescript", "bin", "tsc"),
+    "--project", join(consumer, "tsconfig.json"), "--pretty", "false"],
+  { cwd: consumer, env, encoding: "utf8", timeout: 30_000 });
+  assert.ifError(child.error);
+  assert.equal(child.status, 0, `installed public types must compile with ordinary NodeNext settings:\n${child.stdout}\n${child.stderr}`);
 }
 
 // The same external plain-Node consumer verifies tarball and source installs.
