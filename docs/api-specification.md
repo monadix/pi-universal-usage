@@ -225,6 +225,4 @@ endpoints, a runtime loader and a CLI.
   normalization, selection invalidation, UI modes and deduplicated warnings.
 
 Tests use fake registries and fetches, injected clocks and explicit gates, never
-live credentials/inference/network. Host checks and runtime load/package checks
-must run outside the specification author's turn; this document is not evidence
-that those checks passed.
+live credentials/inference/network.
