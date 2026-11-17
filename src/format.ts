@@ -6,7 +6,7 @@
 import { secondsUntil } from "./headers.ts";
 import { plainText } from "./text.ts";
 import type { TargetSnapshot, UsageMetric } from "./types.ts";
-import type { UsageConfig } from "./config.ts";
+import { publicConfigProblem, type UsageConfig } from "./config.ts";
 
 function trimNumber(value: number): string {
   if (!Number.isFinite(value)) return "unknown";
@@ -273,6 +273,6 @@ export function formatReport(
       lines.push(`  next attempt: in ${formatDuration((snapshot.nextRetryAt - now) / 1000)}`);
     }
   }
-  for (const problem of config.problems) lines.push(`config: ${problem}`);
+  for (const problem of config.problems) lines.push(`config: ${publicConfigProblem(problem)}`);
   return lines.map((line) => plainText(line));
 }

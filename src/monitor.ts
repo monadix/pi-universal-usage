@@ -5,8 +5,9 @@
  * the promise concurrent refreshes join and the controller that cancels it.
  * Passive header parsing never writes the cache: the last measurement is kept
  * per entry, tagged with the model that produced it, so a target with nothing
- * to request can still report it. Nothing here writes to a provider or mutates
- * Pi state.
+ * to request can still report it for that model. Such a no-request answer is
+ * resolved for each caller instead of being shared as account-level run work.
+ * Nothing here writes to a provider or mutates Pi state.
  */
 
 import { planEndpoints, type EndpointPlan, type PlannedRequest } from "./endpoints.ts";
@@ -46,6 +47,13 @@ interface OptionalDeferral {
  */
 interface Run {
   readonly controller: AbortController;
+  /**
+   * Callers outside the host lifecycle (the headless API and its agent tools)
+   * currently waiting for this run. Host-level activation cancels its own
+   * pending reads but must not cancel work such a caller still waits for, even
+   * when the host started the request first.
+   */
+  externalWaiters: number;
   /**
    * The sequence's result. Assigned in the same synchronous frame that installs
    * the run; the record is installed first, so a path that answers without a
@@ -218,19 +226,73 @@ export class UsageMonitor {
     return this.entries.get(key)?.snapshot;
   }
 
+  /**
+   * The existing measurement or failure state for a target without requesting
+   * anything. A passive measurement belongs to the model whose inference
+   * produced it, so another model of the same account cannot consume it here.
+   * An unsupported or failed attempt is not a measurement, so it must not hide
+   * this model's later passive measurement; a cached endpoint measurement still
+   * takes precedence.
+   */
+  knownSnapshot(target: ResolvedTarget): TargetSnapshot | undefined {
+    const entry = this.entries.get(target.identity.key);
+    if (entry === undefined) return undefined;
+    const snapshot = entry.snapshot;
+    if (snapshot !== undefined && snapshot.source !== "cache") return snapshot;
+    const passive = entry.lastPassive;
+    const measured = passive !== undefined && passive.modelId === target.identity.modelId ? passive.snapshot : undefined;
+    return measured ?? snapshot;
+  }
+
   isStale(snapshot: TargetSnapshot, config: UsageConfig): boolean {
     return this.now() - snapshot.fetchedAt > config.refreshSeconds * 2000;
   }
 
   /**
+   * A disabled provider reports its disabled state instead of any measurement,
+   * including a passive one recorded before it was disabled.
+   */
+  private disabledSnapshot(target: ResolvedTarget, entry: Entry): TargetSnapshot {
+    const snapshot = emptySnapshot(target, "unsupported", this.now(), "disabled in pi-universal-usage.json");
+    entry.snapshot = snapshot;
+    entry.nextAttemptAt = this.now() + AUTH_FAILURE_BACKOFF_MS;
+    return snapshot;
+  }
+
+  /**
+   * Answer a target that has nothing to request: this model's own passive
+   * measurement with its original timestamp, or the plan's explanation that no
+   * quota can be requested. The caller resolves this per model rather than
+   * through a run, so a shared account entry neither delivers one model's
+   * passive headers under another model's identity nor lets a model without a
+   * measurement hide the producing model's valid one.
+   */
+  private passiveFallback(
+    target: ResolvedTarget,
+    entry: Entry,
+    plan: Extract<EndpointPlan, { kind: "none" }>,
+  ): TargetSnapshot {
+    const passive = entry.lastPassive;
+    if (passive !== undefined && passive.modelId === target.identity.modelId) {
+      entry.nextAttemptAt = this.now() + AUTH_FAILURE_BACKOFF_MS;
+      return passive.snapshot;
+    }
+    const snapshot = emptySnapshot(target, plan.status, this.now(), plan.notice);
+    entry.snapshot = snapshot;
+    entry.nextAttemptAt = this.now() + AUTH_FAILURE_BACKOFF_MS;
+    return snapshot;
+  }
+
+  /**
    * Refresh one target. Concurrent calls for the same identity share one request
-   * sequence and its account-scoped result.
+   * sequence and its account-scoped HTTP result; an answer that cannot request
+   * anything is model-scoped and resolved separately for its caller.
    */
   refresh(
     target: ResolvedTarget,
     provider: ProviderConfig | undefined,
     config: UsageConfig,
-    options: { force?: boolean; signal?: AbortSignal } = {},
+    options: { force?: boolean; signal?: AbortSignal; external?: boolean } = {},
   ): Promise<TargetSnapshot> {
     if (this.closed) return Promise.resolve(emptySnapshot(target, "unknown", this.now(), "monitor is shut down"));
     const key = target.identity.key;
@@ -245,19 +307,49 @@ export class UsageMonitor {
       if (cached !== undefined) return Promise.resolve(cached);
       return Promise.resolve(emptySnapshot(target, "unknown", this.now(), "waiting before the next attempt"));
     }
-    if (current.run !== undefined) return current.run.promise;
+    if (current.run !== undefined) return this.joinRun(current.run, options.external === true);
+
+    // An answer that issues no request must never become an account-level run:
+    // another model of the same account could join it and receive a passive
+    // measurement that belongs to the model whose inference produced it, or
+    // replace that model's measurement with its own missing result. Resolving
+    // the fallback per caller keeps real HTTP results shareable without sharing
+    // passive attribution.
+    if (options.signal?.aborted === true) {
+      // An already-cancelled caller must not leave state or a joinable run behind.
+      return Promise.resolve(cancelledSnapshot(target, this.now()));
+    }
+    if (provider?.enabled === false) return Promise.resolve(this.disabledSnapshot(target, current));
+    const plan = planEndpoints(target, provider, config);
+    if (plan.kind === "none") return Promise.resolve(this.passiveFallback(target, current, plan));
 
     // One record owns the request sequence and the controller that cancels it.
-    // Install it before any work starts, so even a path that answers without a
-    // network await is joinable and cancellable through its entry; its promise
-    // is attached immediately below.
-    const run: Run = { controller: new AbortController() } as Run;
+    // Install it before any work starts, so the run is joinable and cancellable
+    // through its entry; its promise is attached immediately below.
+    const run = { controller: new AbortController(), externalWaiters: 0 } as Run;
     current.run = run;
-    run.promise = this.executeRun(target, provider, config, current, run, options.signal).finally(() => {
+    run.promise = this.executeRun(target, config, current, run, options.signal, plan).finally(() => {
       // A cancelled entry may already have installed a replacement run.
       if (current.run === run) current.run = undefined;
     });
-    return run.promise;
+    return this.joinRun(run, options.external === true);
+  }
+
+  /**
+   * Wait for an installed run. A caller outside the host lifecycle is remembered
+   * until the run settles, so host selection cannot abort shared work that such
+   * a caller still waits for; a non-external caller joins the run unchanged.
+   */
+  private joinRun(run: Run, external: boolean): Promise<TargetSnapshot> {
+    if (!external) return run.promise;
+    run.externalWaiters++;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      run.externalWaiters = Math.max(0, run.externalWaiters - 1);
+    };
+    return run.promise.finally(release);
   }
 
   /**
@@ -302,11 +394,20 @@ export class UsageMonitor {
   }
 
   /**
-   * Abort every in-flight run and detach it from its entry, so a replacement
-   * refresh starts new work instead of joining the cancelled run. Each run is
-   * reachable through the entry that owns it.
+   * Abort host-owned in-flight runs and detach them from their entries, so a
+   * replacement refresh starts new work instead of joining the cancelled run.
+   * Work that a caller outside the host lifecycle (the headless API or its
+   * tools) still waits for stays joinable; shutdown still aborts it.
    */
   cancel(): void {
+    for (const entry of this.entries.values()) {
+      const run = entry.run;
+      if (run !== undefined && run.externalWaiters === 0) this.detach(entry, run);
+    }
+  }
+
+  /** Abort every in-flight run, including externally waited work. */
+  private cancelAll(): void {
     for (const entry of this.entries.values()) {
       const run = entry.run;
       if (run !== undefined) this.detach(entry, run);
@@ -326,7 +427,7 @@ export class UsageMonitor {
   /** Idempotent shutdown: abort in-flight requests, forget cached state, refuse new work. */
   dispose(): void {
     if (this.closed) return;
-    this.cancel();
+    this.cancelAll();
     this.entries.clear();
     this.closed = true;
   }
@@ -348,11 +449,11 @@ export class UsageMonitor {
    */
   private async executeRun(
     target: ResolvedTarget,
-    provider: ProviderConfig | undefined,
     config: UsageConfig,
     entry: Entry,
     run: Run,
     parent: AbortSignal | undefined,
+    plan: Extract<EndpointPlan, { kind: "requests" }>,
   ): Promise<TargetSnapshot> {
     const abortFromParent = () => this.detach(entry, run);
     const forwardParent = parent !== undefined && !parent.aborted;
@@ -364,7 +465,7 @@ export class UsageMonitor {
         this.detach(entry, run);
         return cancelledSnapshot(target, this.now());
       }
-      return await this.runPlan(target, provider, config, entry, run);
+      return await this.runPlan(target, config, entry, run, plan);
     } finally {
       if (forwardParent) parent?.removeEventListener("abort", abortFromParent);
     }
@@ -372,35 +473,12 @@ export class UsageMonitor {
 
   private async runPlan(
     target: ResolvedTarget,
-    provider: ProviderConfig | undefined,
     config: UsageConfig,
     entry: Entry,
     run: Run,
+    plan: Extract<EndpointPlan, { kind: "requests" }>,
   ): Promise<TargetSnapshot> {
     const signal = run.controller.signal;
-    if (provider?.enabled === false) {
-      const snapshot = emptySnapshot(target, "unsupported", this.now(), "disabled in pi-universal-usage.json");
-      entry.snapshot = snapshot;
-      entry.nextAttemptAt = this.now() + AUTH_FAILURE_BACKOFF_MS;
-      return snapshot;
-    }
-
-    const plan = planEndpoints(target, provider, config);
-    if (plan.kind === "none") {
-      // Nothing can be requested, so a forced `/usage` refresh reports this
-      // model's last passive measurement with its original timestamp instead of
-      // erasing it. Another model's measurement is never reused.
-      const passive = entry.lastPassive;
-      if (passive !== undefined && passive.modelId === target.identity.modelId) {
-        entry.nextAttemptAt = this.now() + AUTH_FAILURE_BACKOFF_MS;
-        return passive.snapshot;
-      }
-      const snapshot = emptySnapshot(target, plan.status, this.now(), plan.notice);
-      entry.snapshot = snapshot;
-      entry.nextAttemptAt = this.now() + AUTH_FAILURE_BACKOFF_MS;
-      return snapshot;
-    }
-
     const requests = this.orderedRequests(entry, plan);
     let lastError = "no quota endpoint responded with usable data";
     let lastStatus: TargetStatus = "unknown";

@@ -16,7 +16,10 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
   ExtensionContext,
+  ExtensionToolContext,
+  ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { createUsageClient, type ProviderInfo, type UsageClient, type UsageRefresh, type UsageReport } from "./api.ts";
 import { resolveTarget, type ResolvedTarget, type TargetResolution } from "./auth.ts";
 import { loadConfig, STATUS_KEY, type UsageConfig } from "./config.ts";
 import { formatCompact, formatCompactRateLimit, formatReport, isUsableMetric } from "./format.ts";
@@ -88,6 +91,39 @@ function sameStamp(left: Stamp, right: Stamp): boolean {
   );
 }
 
+function toolArguments(value: unknown): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("invalid usage tool arguments");
+  }
+  return value as Record<string, unknown>;
+}
+
+function providerSummary(providers: readonly ProviderInfo[]): string {
+  if (providers.length === 0) return "No providers are registered, configured, or selected.";
+  const entries = providers.map((provider) => {
+    const states = [provider.active ? "active" : "", provider.enabled ? "" : "disabled"].filter((state) => state !== "");
+    return `${plainText(provider.provider)}${states.length > 0 ? ` (${states.join(", ")})` : ""}`;
+  });
+  return `Providers: ${entries.join(", ")}`;
+}
+
+/** Compact model-facing summary; details carry the complete report. */
+function usageReportSummary(report: UsageReport): string {
+  if (report.results.length === 0) return "No usage data is available.";
+  return report.results.map((result) => {
+    const metrics = result.metrics.slice(0, 2).map((metric) => {
+      const value = metric.usedPercent !== undefined
+        ? `${metric.usedPercent}%`
+        : metric.remaining !== undefined
+          ? `${metric.remaining}${metric.unit !== undefined ? ` ${metric.unit}` : ""}`
+          : metric.status ?? "";
+      return `${plainText(metric.label)}${value !== "" ? ` ${value}` : ""}`;
+    });
+    const state = metrics.length > 0 ? metrics.join(", ") : result.status;
+    return `${plainText(result.provider)}: ${plainText(state)}`;
+  }).join("; ");
+}
+
 export class UniversalUsageHost {
   private readonly pi: ExtensionAPI;
   private readonly monitor: UsageMonitor;
@@ -127,7 +163,7 @@ export class UniversalUsageHost {
     this.config = config ?? this.readConfig();
   }
 
-  /** Register command and lifecycle handlers. Nothing here opens a socket. */
+  /** Register command, lifecycle handlers, and read-only agent tools. Nothing here opens a socket. */
   register(): void {
     this.pi.registerCommand(COMMAND_NAME, {
       description: "Show read-only provider usage, quota windows, and balances",
@@ -136,6 +172,8 @@ export class UniversalUsageHost {
         else await this.report(ctx, args);
       },
     });
+
+    for (const tool of this.usageTools()) this.pi.registerTool(tool);
 
     this.pi.on("session_start", async (_event, ctx) => {
       // A startup emission an earlier handler already started can reach this
@@ -147,7 +185,7 @@ export class UniversalUsageHost {
       this.startTimer(ctx);
       const model = ctx.model;
       if (model === undefined) return;
-      const refresh = this.backgroundAllowed(ctx);
+      const refresh = this.startupRefreshAllowed(ctx);
       if (this.active === undefined) {
         void this.activate(ctx, model, { refresh }).catch(() => undefined);
       } else if (refresh) {
@@ -640,13 +678,116 @@ export class UniversalUsageHost {
   }
 
   /**
+   * The two read-only tools share this host's monitor, cache, config, and clock,
+   * so a tool read joins the same account sequence as `/usage` and the footer.
+   */
+  private usageTools(): ToolDefinition<any, any>[] {
+    return [
+      {
+        name: "usage_providers",
+        label: "Usage providers",
+        description:
+          "List registered, configured and active provider IDs for the usage monitor. " +
+          "Read-only and network-free; this does not verify credentials or endpoint usability.",
+        parameters: {
+          type: "object",
+          properties: {},
+          additionalProperties: false,
+        },
+        execute: async (_toolCallId: string, params: unknown, _signal: AbortSignal | undefined, _onUpdate: unknown, ctx: ExtensionToolContext) => {
+          const args = toolArguments(params);
+          if (Object.keys(args).length > 0) throw new Error("usage_providers accepts no arguments");
+          const client = this.usageClient(ctx);
+          try {
+            const providers = client.listProviders();
+            return {
+              content: [{ type: "text" as const, text: providerSummary(providers) }],
+              details: { providers },
+            };
+          } finally {
+            client.dispose();
+          }
+        },
+      },
+      {
+        name: "usage_read",
+        label: "Read usage",
+        description:
+          "Read a usage report from authenticated, bounded, read-only quota GET requests. " +
+          "Makes no inference calls and requests no configuration changes. " +
+          "Omitted providers reads the active model only; explicit providers select only those IDs.",
+        parameters: {
+          type: "object",
+          properties: {
+            providers: {
+              type: "array",
+              items: { type: "string", minLength: 1 },
+              minItems: 1,
+              description: "Exact provider IDs to read; omitting this selects the active provider only.",
+            },
+            refresh: {
+              type: "string",
+              enum: ["cached", "if-needed", "force"],
+              description: "Cache behavior; defaults to if-needed.",
+            },
+          },
+          additionalProperties: false,
+        },
+        execute: async (_toolCallId: string, params: unknown, signal: AbortSignal | undefined, _onUpdate: unknown, ctx: ExtensionToolContext) => {
+          const args = toolArguments(params);
+          for (const key of Object.keys(args)) {
+            if (key !== "providers" && key !== "refresh") throw new Error("usage_read accepts only providers and refresh");
+          }
+          const selection = args.providers === undefined
+            ? { active: true as const }
+            : { providers: args.providers as readonly string[] };
+          const refresh = args.refresh as UsageRefresh | undefined;
+          const client = this.usageClient(ctx);
+          try {
+            const report = await client.read({
+              selection,
+              ...(refresh !== undefined ? { refresh } : {}),
+              ...(signal !== undefined ? { signal } : {}),
+            });
+            return {
+              content: [{ type: "text" as const, text: usageReportSummary(report) }],
+              details: report,
+            };
+          } finally {
+            client.dispose();
+          }
+        },
+      },
+    ];
+  }
+
+  private usageClient(ctx: ExtensionToolContext): UsageClient {
+    return createUsageClient({
+      modelRegistry: ctx.modelRegistry,
+      getActiveModel: () => ctx.model,
+      config: this.config,
+      now: this.now,
+      monitor: this.monitor,
+    });
+  }
+
+  /**
    * Automatic reads are TUI-only and obey `autoRefresh`; explicit `/usage` is
    * unaffected. A disposed host answers before it reads any context field, so a
    * late `agent_end` cannot touch a context Pi has already invalidated.
    */
   private backgroundAllowed(ctx: ExtensionContext): boolean {
+    if (this.disposed || !this.timersEnabled) return false;
+    return this.config.autoRefresh && ctx.mode === "tui";
+  }
+
+  /**
+   * Startup reads follow `autoRefresh` in TUI mode even when the periodic timer
+   * is disabled; `timers` only controls the interval.
+   */
+  private startupRefreshAllowed(ctx: ExtensionContext): boolean {
     if (this.disposed) return false;
-    return this.timersEnabled && this.config.autoRefresh && ctx.mode === "tui";
+    return this.config.autoRefresh && ctx.mode === "tui";
   }
 
   private autoRefreshAllowed(ctx: ExtensionContext): boolean {

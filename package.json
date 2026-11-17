@@ -14,9 +14,11 @@
     "balance"
   ],
   "files": [
+    "dist",
     "extensions",
     "src",
     "scripts",
+    "types",
     "docs",
     "CONTRIBUTING.md",
     "README.md",
@@ -27,10 +29,20 @@
       "./extensions/index.ts"
     ]
   },
+  "exports": {
+    "./api": {
+      "types": "./types/api.d.ts",
+      "default": "./dist/api.js"
+    }
+  },
   "engines": {
     "node": ">=22.19.0"
   },
   "scripts": {
+    "build": "node --disable-warning=ExperimentalWarning src/build-api.ts",
+    "prepare": "node --disable-warning=ExperimentalWarning src/build-api.ts",
+    "pretypecheck": "npm run build",
+    "pretest": "npm run build",
     "test": "node --test \"test/**/*.test.ts\"",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm test",
