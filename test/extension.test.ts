@@ -2328,6 +2328,86 @@ describe("usage agent tool contracts", { timeout: 5000 }, () => {
     } finally { host.shutdown(fake.ctx); }
   });
 
+  for (const firstModel of ["chat-a", "chat-b"] as const) {
+    it(`keeps passive measurements model-scoped across overlapping forced tools (${firstModel} first)`, async () => {
+      const model = fakeModel({ provider: "openai", id: "chat-a", baseUrl: "https://api.openai.com/v1" });
+      const other = fakeModel({ ...model, id: "chat-b" });
+      const selection = { current: model };
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      let holdNextResolution = false;
+      const heldModels: string[] = [];
+      const { fetchImpl, calls } = sequenceFetch([codexBody(42)]);
+      const { pi, host, registry, advance } = buildHost({ fetchImpl, models: [model, other], timers: false,
+        config: normalizeConfig({ autoRefresh: false }),
+        auth: (selected) => {
+          const auth = statusOf(selected);
+          if (!holdNextResolution) return auth;
+          holdNextResolution = false;
+          heldModels.push(selected.id);
+          return { ...auth, wait: gate };
+        } });
+      const fake = fakeContext({ modelRef: selection, registry, idle: false });
+      const select = async (selected: typeof model) => {
+        selection.current = selected;
+        await pi.emit("model_select", { model: selected }, fake.ctx);
+      };
+      try {
+        await host.activate(fake.ctx, model, { refresh: false });
+        await pi.emit("turn_start", {}, fake.ctx);
+        await pi.emit("after_provider_response", { status: 200, headers: {
+          "x-ratelimit-limit-requests": "100", "x-ratelimit-remaining-requests": "25",
+          "x-ratelimit-limit-tokens": "1000", "x-ratelimit-remaining-tokens": "500",
+        } }, fake.ctx);
+        const observedAt = 1_768_000_000_000;
+        advance(1000);
+
+        const first = firstModel === model.id ? model : other;
+        const second = first === model ? other : model;
+        if (first !== model) await select(first);
+        holdNextResolution = true;
+        const firstRead = executeUsageTool(pi, fake.ctx, { refresh: "force" });
+        await waitFor(() => heldModels.length === 1);
+        // Selection adoption resolves normally while the earlier tool remains
+        // held. Only the next tool's credential lookup joins the same gate.
+        await select(second);
+        holdNextResolution = true;
+        const secondRead = executeUsageTool(pi, fake.ctx, { refresh: "force" });
+        await waitFor(() => heldModels.length === 2);
+        assert.deepEqual(heldModels, [first.id, second.id]);
+        const presentation = { statuses: [...fake.statuses], widgets: [...fake.widgets],
+          notifications: [...fake.notifications], entries: [...pi.entries] };
+
+        // Release both lookups together, in their registration order. Account
+        // work may be shared; a model's passive fallback must not be shared.
+        release();
+        const responses = await Promise.all([firstRead, secondRead]);
+        const reports = responses.map(toolReport);
+        assert.deepEqual(reports.map((report) => report.results.map((result) => result.modelId)), [[first.id], [second.id]]);
+        const measured = reports[first === model ? 0 : 1]!.results[0]!;
+        assert.equal(measured.provider, "openai"); assert.equal(measured.status, "ok");
+        assert.equal(measured.source, "headers"); assert.equal(measured.observedAt, observedAt);
+        assert.equal(measured.freshness, "fresh"); assert.equal(measured.cacheHit, true);
+        assert.deepEqual(measured.metrics.map((metric) => metric.kind).sort(), ["request-limit", "token-limit"]);
+        const requests = measured.metrics.find((metric) => metric.kind === "request-limit")!;
+        assert.equal(requests.limit, 100); assert.equal(requests.remaining, 25); assert.equal(requests.usedPercent, 75);
+        const tokens = measured.metrics.find((metric) => metric.kind === "token-limit")!;
+        assert.equal(tokens.limit, 1000); assert.equal(tokens.remaining, 500); assert.equal(tokens.usedPercent, 50);
+        const unmeasured = reports[first === other ? 0 : 1]!.results[0]!;
+        assert.equal(unmeasured.provider, "openai");
+        assert.deepEqual(unmeasured.metrics, []); assert.equal(unmeasured.freshness, "missing");
+        assert.equal(Object.hasOwn(unmeasured, "source"), false);
+        assert.equal(Object.hasOwn(unmeasured, "observedAt"), false);
+        const unmeasuredText = responses[first === other ? 0 : 1]!.content
+          .filter((part) => part.type === "text").map((part) => part.text).join("\n");
+        assert.doesNotMatch(unmeasuredText, /75%|50%/u, "tool text cannot leak the other model's measurements either");
+        assert.equal(calls.length, 0, "official OpenAI passive fallback issues no quota HTTP");
+        assert.deepEqual({ statuses: fake.statuses, widgets: fake.widgets,
+          notifications: fake.notifications, entries: pi.entries }, presentation);
+      } finally { release(); host.shutdown(fake.ctx); }
+    });
+  }
+
   it("does not revive disabled providers from passive headers or forced tools", async () => {
     const model = fakeModel({ provider: "openai", id: "chat", baseUrl: "https://api.openai.com/v1" });
     const { fetchImpl, calls } = sequenceFetch([codexBody(42)]);
