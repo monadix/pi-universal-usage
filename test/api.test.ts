@@ -244,6 +244,58 @@ describe("public headless usage API", { timeout: 5000 }, () => {
     } finally { f.client.dispose(); }
   });
 
+  for (const [delay, freshness] of [[1, "fresh"], [2, "stale"]] as const) {
+    it(`evaluates aggregate freshness at report generation (${freshness} at TTL${delay === 1 ? "" : "+1"})`, async () => {
+      const peer = fakeModel({ ...deepseek, provider: "peer", baseUrl: "https://peer.example/v1" });
+      const gate = deferred();
+      let peerStarted = false;
+      const requests: string[] = [];
+      const f = setup({ models: [deepseek, peer], rawConfig: { reportConcurrency: 1 },
+        fetchImpl: (async (input) => {
+          const host = new URL(String(input)).hostname;
+          requests.push(host);
+          if (host === "peer.example") {
+            peerStarted = true;
+            await gate.promise;
+          }
+          return balance();
+        }) as typeof fetch });
+      try {
+        const initial = only(await f.client.read());
+        assert.equal(initial.observedAt, NOW); assert.equal(initial.source, "http");
+        assert.equal(initial.freshness, "fresh"); assert.equal(initial.cacheHit, false);
+        f.advance(299_999);
+        const pending = f.client.read({ selection: { providers: ["deepseek", "peer"] } });
+        // Serial work ensures the first result was delivered from its cache
+        // before the second provider starts; time then moves during collection.
+        await until(() => peerStarted);
+        f.advance(delay);
+        gate.resolve();
+        const report = await pending;
+        assert.equal(report.generatedAt, NOW + 299_999 + delay);
+        assert.deepEqual(report.results.map((r) => r.provider), ["deepseek", "peer"]);
+        const cached = report.results[0]!;
+        assert.equal(cached.freshness, freshness, "age is measured against the final report time, with an inclusive TTL");
+        assert.equal(cached.observedAt, initial.observedAt);
+        assert.equal(cached.source, initial.source); assert.equal(cached.cacheHit, true);
+        assert.equal(cached.status, "ok"); assert.deepEqual(cached.metrics, initial.metrics);
+        assert.equal(report.results[1]?.status, "ok");
+        assert.equal(report.results[1]?.freshness, "fresh");
+        assert.deepEqual(requests, ["api.deepseek.com", "peer.example"], "report completion does not re-request the early provider");
+        for (const result of report.results) {
+          if (result.freshness === "fresh") {
+            assert.ok(result.observedAt !== undefined);
+            assert.ok(report.generatedAt - result.observedAt <= 300_000);
+          }
+        }
+        const text = formatUsageReport(report);
+        if (freshness === "stale") assert.match(text, /\bstale\b/i);
+        else assert.doesNotMatch(text, /\bstale\b/i);
+        publicShape(report);
+      } finally { gate.resolve(); f.client.dispose(); }
+    });
+  }
+
   for (const [httpStatus, status, delay] of [
     [401, "rejected", 1_800_000], [429, "rate-limited", 300_000],
     [503, "unavailable", 300_000], [500, "error", 60_000], [404, "unsupported", 1_800_000],
