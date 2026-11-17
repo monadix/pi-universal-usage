@@ -68,8 +68,10 @@ const reviewSchema = {
     limitations: { type: 'string' },
   }, required: ['status', 'summary', 'findings', 'limitations'],
 };
+// Each supervisor-approved launch gets six reviews; total implementation passes stay bounded.
 // Bounds are checkpoint limits, not acceptance criteria; exhausting one never means completion.
-while (implementationPasses < 16 && reviewPasses < 6) {
+const reviewLimit = reviewPasses + 6;
+while (implementationPasses < 16 && reviewPasses < reviewLimit) {
   if (!reviewPending) {
     implementationPasses++;
     const implemented = await runs.run('implementation-' + implementationPasses, {
