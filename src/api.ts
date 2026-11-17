@@ -225,21 +225,30 @@ function parseSelection(value: unknown): ParsedSelection {
   return { kind: "models", models };
 }
 
+function isRefreshMode(value: unknown): value is UsageRefresh {
+  return typeof value === "string" && (REFRESH_MODES as readonly string[]).includes(value);
+}
+
 function parseReadOptions(options: UsageReadOptions): { selection: ParsedSelection; refresh: UsageRefresh; signal?: AbortSignal } {
-  if (!isObject(options)) throw invalidArgument("read options must be an object");
-  if (!exactKeys(options, ["selection", "refresh", "signal"])) {
+  // Validate the untyped view: narrowing the declared parameter through an
+  // index-signature predicate would discard the option types.
+  const raw: unknown = options;
+  if (!isObject(raw)) throw invalidArgument("read options must be an object");
+  if (!exactKeys(raw, ["selection", "refresh", "signal"])) {
     throw invalidArgument("read accepts only selection, refresh, and signal");
   }
-  const selection = options.selection === undefined ? { kind: "active" as const } : parseSelection(options.selection);
-  const refresh = options.refresh ?? "if-needed";
-  if (!REFRESH_MODES.includes(refresh)) throw invalidArgument("refresh must be cached, if-needed, or force");
-  if (options.signal !== undefined && !(options.signal instanceof AbortSignal)) {
+  const selection = raw.selection === undefined ? { kind: "active" as const } : parseSelection(raw.selection);
+  const refresh: unknown = raw.refresh === undefined ? "if-needed" : raw.refresh;
+  if (!isRefreshMode(refresh)) throw invalidArgument("refresh must be cached, if-needed, or force");
+  const rawSignal = raw.signal;
+  if (rawSignal !== undefined && !(rawSignal instanceof AbortSignal)) {
     throw invalidArgument("signal must be an AbortSignal");
   }
+  const signal = rawSignal instanceof AbortSignal ? rawSignal : undefined;
   return {
     selection,
     refresh,
-    ...(options.signal !== undefined ? { signal: options.signal } : {}),
+    ...(signal !== undefined ? { signal } : {}),
   };
 }
 
