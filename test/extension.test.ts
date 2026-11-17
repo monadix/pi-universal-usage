@@ -2131,6 +2131,44 @@ describe("usage agent tool contracts", { timeout: 5000 }, () => {
     } finally { host.shutdown(fake.ctx); }
   });
 
+  it("sanitizes provider enumeration text and details without changing raw-ID flags or resolving auth", async () => {
+    const registeredId = "a-registered\u001b[31m\u202e";
+    const configuredId = "m-configured\u009b31m\u2066\u0007";
+    const activeId = "z-active\u001b]0;title\u0007\u2069";
+    const model = fakeModel({ provider: registeredId, id: "chat", baseUrl: "https://api.deepseek.com" });
+    const active = fakeModel({ ...model, provider: activeId });
+    let resolutions = 0;
+    const { fetchImpl, calls } = sequenceFetch([codexBody(10)]);
+    const { pi, host, registry } = buildHost({ fetchImpl, models: [model, model], timers: false,
+      auth: () => { resolutions++; throw new Error("enumeration must not resolve credentials"); },
+      config: normalizeConfig({ providers: { [registeredId]: { enabled: false }, [configuredId]: {} } }) });
+    const selection = { current: active };
+    const fake = fakeContext({ modelRef: selection, registry });
+    try {
+      const tool = usageTool(pi, "usage_providers");
+      for (const selected of [active, model]) {
+        selection.current = selected;
+        const result = await tool.execute("providers", {}, undefined, undefined, fake.ctx as ExtensionToolContext);
+        assert.deepEqual(result.details, { providers: [
+          { provider: "a-registered", enabled: false, active: selected === model },
+          { provider: "m-configured", enabled: true, active: false },
+          ...(selected === active ? [{ provider: "z-active", enabled: true, active: true }] : []),
+        ] });
+        if (result.structuredContent !== undefined) assert.deepEqual(result.structuredContent, result.details);
+        assert.notEqual(result.isError, true);
+        for (const entry of result.details.providers) {
+          assert.doesNotMatch(entry.provider, /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u);
+        }
+        const text = result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+        assert.match(text, /a-registered/);
+        assert.match(text, /m-configured/);
+        assert.doesNotMatch(text, /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u);
+      }
+      assert.equal(resolutions, 0); assert.equal(calls.length, 0);
+      assert.equal(fake.statuses.length + fake.widgets.length + fake.notifications.length + pi.entries.length, 0);
+    } finally { host.shutdown(fake.ctx); }
+  });
+
   it("keeps tool defaults active-only and explicit providers exact, unlike /usage defaults", async () => {
     const active = fakeModel({ provider: "cpa", id: "chat", baseUrl: "https://active.example/v1" });
     const peer = fakeModel({ provider: "deepseek", id: "chat", baseUrl: "https://api.deepseek.com" });
@@ -2240,6 +2278,56 @@ describe("usage agent tool contracts", { timeout: 5000 }, () => {
     } finally { host.shutdown(fake.ctx); }
   });
 
+  it("serves later passive measurements over earlier unsupported state before and after force, only for their model", async () => {
+    const model = fakeModel({ provider: "openai", id: "chat-a", baseUrl: "https://api.openai.com/v1" });
+    const other = fakeModel({ ...model, id: "chat-b" });
+    const selection = { current: model };
+    const { fetchImpl, calls } = sequenceFetch([codexBody(42)]);
+    const { pi, host, registry, advance } = buildHost({ fetchImpl, models: [model, other], timers: false });
+    const fake = fakeContext({ modelRef: selection, registry, idle: false });
+    try {
+      // Normal startup has already attempted quota discovery before inference.
+      await host.activate(fake.ctx, model);
+      const initial = toolReport(await executeUsageTool(pi, fake.ctx, { refresh: "cached" })).results[0]!;
+      assert.equal(initial.status, "unsupported"); assert.equal(initial.freshness, "missing");
+      assert.deepEqual(initial.metrics, []); assert.equal(initial.source, undefined);
+      advance(2000);
+      await pi.emit("turn_start", {}, fake.ctx);
+      await pi.emit("after_provider_response", { status: 200, headers: {
+        "x-ratelimit-limit-requests": "100", "x-ratelimit-remaining-requests": "25",
+        "x-ratelimit-limit-tokens": "1000", "x-ratelimit-remaining-tokens": "500",
+      } }, fake.ctx);
+      const observedAt = 1_768_000_002_000;
+      advance(1000);
+      const assertMeasurement = (report: UsageReport) => {
+        const result = report.results[0]!;
+        assert.equal(result.modelId, "chat-a"); assert.equal(result.status, "ok");
+        assert.equal(result.source, "headers"); assert.equal(result.observedAt, observedAt);
+        assert.equal(result.freshness, "fresh"); assert.equal(result.cacheHit, true);
+        assert.deepEqual(result.metrics.map((metric) => metric.kind).sort(), ["request-limit", "token-limit"]);
+        const requests = result.metrics.find((metric) => metric.kind === "request-limit")!;
+        assert.equal(requests.limit, 100); assert.equal(requests.remaining, 25); assert.equal(requests.usedPercent, 75);
+        const tokens = result.metrics.find((metric) => metric.kind === "token-limit")!;
+        assert.equal(tokens.limit, 1000); assert.equal(tokens.remaining, 500); assert.equal(tokens.usedPercent, 50);
+      };
+      for (const forceFirst of [false, true]) {
+        if (forceFirst) assertMeasurement(toolReport(await executeUsageTool(pi, fake.ctx, { refresh: "force" })));
+        for (const args of [{ refresh: "cached" }, {}, { refresh: "if-needed" }]) {
+          assertMeasurement(toolReport(await executeUsageTool(pi, fake.ctx, args)));
+        }
+        advance(1000);
+      }
+      selection.current = other;
+      await pi.emit("model_select", { model: other }, fake.ctx);
+      for (const args of [{ refresh: "cached" }, {}, { refresh: "force" }]) {
+        const changed = toolReport(await executeUsageTool(pi, fake.ctx, args)).results[0]!;
+        assert.equal(changed.modelId, "chat-b"); assert.equal(changed.freshness, "missing");
+        assert.deepEqual(changed.metrics, []); assert.equal(changed.observedAt, undefined); assert.equal(changed.source, undefined);
+      }
+      assert.equal(calls.length, 0, "neither passive reuse nor unsupported discovery issues quota HTTP");
+    } finally { host.shutdown(fake.ctx); }
+  });
+
   it("does not revive disabled providers from passive headers or forced tools", async () => {
     const model = fakeModel({ provider: "openai", id: "chat", baseUrl: "https://api.openai.com/v1" });
     const { fetchImpl, calls } = sequenceFetch([codexBody(42)]);
@@ -2309,6 +2397,81 @@ describe("usage agent tool contracts", { timeout: 5000 }, () => {
       assert.deepEqual(fake.statuses, afterSelection);
       assert.equal(fake.widgets.length + fake.notifications.length + pi.entries.length, 0);
     } finally { release(); host.shutdown(fake.ctx); }
+  });
+
+  for (const initiator of ["background", "command"] as const) {
+    for (const change of ["model switch", "same-model reselection", "same-model route change"] as const) {
+      it(`preserves a tool waiter joining ${initiator}-started work across ${change}`, async () => {
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => { release = resolve; });
+        let requestSignal: AbortSignal | null | undefined;
+        const { fetchImpl, calls } = sequenceFetch([async () => { await gate; return codexBody(77); }]);
+        const wrapped = (async (input, init) => { requestSignal = init?.signal; return fetchImpl(input, init); }) as typeof fetch;
+        const active = fakeModel({ provider: "cpa", id: "chat-a", baseUrl: "https://active.example/v1" });
+        const peer = fakeModel({ provider: "deepseek", id: "chat-b", baseUrl: "https://api.deepseek.com" });
+        const selection = { current: active };
+        const { pi, host, registry } = buildHost({ fetchImpl: wrapped, models: [active, peer], timers: false,
+          config: normalizeConfig({ autoRefresh: false }) });
+        const fake = fakeContext({ modelRef: selection, registry });
+        try {
+          await host.activate(fake.ctx, active, { refresh: false });
+          const hostRead = initiator === "background"
+            ? host.refreshActive(fake.ctx, {})
+            : pi.commands.get(COMMAND_NAME)!.handler("", fake.ctx as ExtensionCommandContext);
+          await waitFor(() => calls.length === 1);
+          let toolSettled = false;
+          const tool = executeUsageTool(pi, fake.ctx).then((result) => { toolSettled = true; return result; });
+          // The injected resolver is immediate: drain its queued continuations
+          // before selection, while the shared HTTP response is still gated.
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          assert.equal(toolSettled, false, "the joining tool is still waiting for the gated measurement");
+          assert.equal(calls.length, 1);
+          const next = change === "model switch" ? peer
+            : change === "same-model route change" ? { ...active, baseUrl: "https://replacement.example/v1" }
+            : { ...active };
+          selection.current = next;
+          await pi.emit("model_select", { model: next }, fake.ctx);
+          const afterSelection = { statuses: [...fake.statuses], widgets: [...fake.widgets],
+            notifications: [...fake.notifications], entries: [...pi.entries] };
+          assert.equal(requestSignal?.aborted, false, "host selection cannot cancel a live tool waiter's work");
+          release();
+          const [result] = await Promise.all([tool, hostRead]);
+          const measurement = toolReport(result).results[0]!;
+          assert.equal(measurement.provider, "cpa"); assert.equal(measurement.modelId, "chat-a");
+          assert.equal(measurement.status, "ok"); assert.equal(measurement.source, "http");
+          assert.equal(measurement.metrics[0]?.usedPercent, 77);
+          assert.equal(requestSignal?.aborted, false);
+          assert.equal(calls.length, 1, "no replacement or substitute request is needed");
+          if (change !== "same-model reselection") {
+            assert.deepEqual({ statuses: fake.statuses, widgets: fake.widgets,
+              notifications: fake.notifications, entries: pi.entries }, afterSelection,
+              "the original measurement must not publish under the new selection or route");
+          }
+        } finally { release(); host.shutdown(fake.ctx); }
+      });
+    }
+  }
+
+  it("keeps arbitrary invalid scheme values private in unresolved-provider tool output", async () => {
+    for (const invalidScheme of ['bad"PRIVATE_CONFIG_DOUBLE_SUFFIX', 'bad"PRIVATE_CONFIG_QUOTED_SUFFIX"tail',
+      'bad\\"PRIVATE_CONFIG_ESCAPED_SUFFIX', "bad-PRIVATE_CONFIG_UNRELATED_VALUE"]) {
+      let resolutions = 0;
+      const { fetchImpl, calls } = sequenceFetch([codexBody(42)]);
+      const { pi, host, registry } = buildHost({ fetchImpl, models: [], timers: false,
+        auth: () => { resolutions++; throw new Error("an unresolved provider has no credentials"); },
+        config: normalizeConfig({ providers: { unresolved: { scheme: invalidScheme } } }) });
+      const fake = fakeContext({ registry });
+      try {
+        const result = await executeUsageTool(pi, fake.ctx, { providers: ["unresolved"] });
+        const report = toolReport(result);
+        assert.equal(report.results[0]?.status, "unknown");
+        assert.ok(report.configProblems.some((problem) => /scheme/i.test(problem)));
+        assert.doesNotMatch(JSON.stringify(result), /PRIVATE_CONFIG_/u,
+          "text, canonical details and optional structured output must omit the whole private value");
+        assert.equal(resolutions, 0); assert.equal(calls.length, 0);
+        assert.equal(fake.statuses.length + fake.widgets.length + fake.notifications.length + pi.entries.length, 0);
+      } finally { host.shutdown(fake.ctx); }
+    }
   });
 
   it("keeps provider exceptions private across tool text, details and optional structured output", async () => {

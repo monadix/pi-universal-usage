@@ -134,6 +134,35 @@ describe("public headless usage API", { timeout: 5000 }, () => {
     } finally { f.client.dispose(); }
   });
 
+  it("sanitizes enumeration IDs while preserving raw-ID deduplication, order and state flags", () => {
+    const registeredId = "a-registered\u001b[31m\u202e";
+    const configuredId = "m-configured\u009b31m\u2066\u0007";
+    const activeId = "z-active\u001b]0;title\u0007\u2069";
+    const registered = fakeModel({ ...deepseek, provider: registeredId });
+    let resolutions = 0;
+    const f = setup({ models: [registered, registered],
+      auth: () => { resolutions++; throw new Error("enumeration must not resolve credentials"); },
+      rawConfig: { providers: { [registeredId]: { enabled: false }, [configuredId]: {} } } });
+    try {
+      f.select(fakeModel({ ...deepseek, provider: activeId }));
+      const providers = f.client.listProviders();
+      for (const entry of providers) {
+        assert.doesNotMatch(entry.provider, /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u);
+      }
+      assert.deepEqual(providers, [
+        { provider: "a-registered", enabled: false, active: false },
+        { provider: "m-configured", enabled: true, active: false },
+        { provider: "z-active", enabled: true, active: true },
+      ]);
+      f.select(registered);
+      assert.deepEqual(f.client.listProviders(), [
+        { provider: "a-registered", enabled: false, active: true },
+        { provider: "m-configured", enabled: true, active: false },
+      ]);
+      assert.equal(resolutions, 0); assert.equal(f.calls.length, 0);
+    } finally { f.client.dispose(); }
+  });
+
   it("defaults to active only, deduplicates selections in order, and reports unresolved IDs", async () => {
     const peer = fakeModel({ ...deepseek, provider: "peer" });
     const f = setup({ models: [deepseek, peer], rawConfig: { providers: { peer: { enabled: true } } } });
@@ -365,6 +394,31 @@ describe("public headless usage API", { timeout: 5000 }, () => {
       const report = await d.client.read(); publicShape(report);
       assert.doesNotMatch(JSON.stringify(report), /SYNTHETIC_PRIVATE_|\\u001b|\\u202e/i);
     } finally { d.client.dispose(); }
+  });
+
+  it("omits arbitrary invalid scheme values without relying on resolved credentials or quote boundaries", async () => {
+    for (const invalidScheme of [
+      'bad"PRIVATE_CONFIG_DOUBLE_SUFFIX',
+      'bad"PRIVATE_CONFIG_QUOTED_SUFFIX"tail',
+      'bad\\"PRIVATE_CONFIG_ESCAPED_SUFFIX',
+      "bad-PRIVATE_CONFIG_UNRELATED_VALUE",
+    ]) {
+      let resolutions = 0;
+      const f = setup({ models: [],
+        auth: () => { resolutions++; throw new Error("an unresolved provider has no credentials"); },
+        rawConfig: { providers: { unresolved: { scheme: invalidScheme } } } });
+      try {
+        const report = await f.client.read({ selection: { providers: ["unresolved"] } });
+        assert.equal(only(report).status, "unknown");
+        assert.ok(report.configProblems.some((problem) => /scheme/i.test(problem)), "retain a useful configuration diagnostic");
+        publicShape(report);
+        for (const output of [JSON.stringify(report), formatUsageReport(report)]) {
+          assert.equal(output.includes(invalidScheme), false);
+          assert.doesNotMatch(output, /PRIVATE_CONFIG_/u, "no private suffix may survive an embedded delimiter");
+        }
+        assert.equal(resolutions, 0); assert.equal(f.calls.length, 0);
+      } finally { f.client.dispose(); }
+    }
   });
 
   it("preserves safe model scopes and declared durations while sanitizing private metric dimensions", async () => {
