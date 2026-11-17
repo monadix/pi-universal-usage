@@ -47,11 +47,12 @@ interface OptionalDeferral {
 interface Run {
   readonly controller: AbortController;
   /**
-   * A caller outside the host lifecycle, such as the headless API. Host-level
-   * activation cancels its own pending reads but must not cancel work a caller
-   * still waits for and owns.
+   * Callers outside the host lifecycle (the headless API and its agent tools)
+   * currently waiting for this run. Host-level activation cancels its own
+   * pending reads but must not cancel work such a caller still waits for, even
+   * when the host started the request first.
    */
-  readonly external: boolean;
+  externalWaiters: number;
   /**
    * The sequence's result. Assigned in the same synchronous frame that installs
    * the run; the record is installed first, so a path that answers without a
@@ -228,13 +229,18 @@ export class UsageMonitor {
    * The existing measurement or failure state for a target without requesting
    * anything. A passive measurement belongs to the model whose inference
    * produced it, so another model of the same account cannot consume it here.
+   * An unsupported or failed attempt is not a measurement, so it must not hide
+   * this model's later passive measurement; a cached endpoint measurement still
+   * takes precedence.
    */
   knownSnapshot(target: ResolvedTarget): TargetSnapshot | undefined {
     const entry = this.entries.get(target.identity.key);
     if (entry === undefined) return undefined;
-    if (entry.snapshot !== undefined) return entry.snapshot;
+    const snapshot = entry.snapshot;
+    if (snapshot !== undefined && snapshot.source !== "cache") return snapshot;
     const passive = entry.lastPassive;
-    return passive !== undefined && passive.modelId === target.identity.modelId ? passive.snapshot : undefined;
+    const measured = passive !== undefined && passive.modelId === target.identity.modelId ? passive.snapshot : undefined;
+    return measured ?? snapshot;
   }
 
   isStale(snapshot: TargetSnapshot, config: UsageConfig): boolean {
@@ -264,19 +270,36 @@ export class UsageMonitor {
       if (cached !== undefined) return Promise.resolve(cached);
       return Promise.resolve(emptySnapshot(target, "unknown", this.now(), "waiting before the next attempt"));
     }
-    if (current.run !== undefined) return current.run.promise;
+    if (current.run !== undefined) return this.joinRun(current.run, options.external === true);
 
     // One record owns the request sequence and the controller that cancels it.
     // Install it before any work starts, so even a path that answers without a
     // network await is joinable and cancellable through its entry; its promise
     // is attached immediately below.
-    const run = { controller: new AbortController(), external: options.external === true } as Run;
+    const run = { controller: new AbortController(), externalWaiters: 0 } as Run;
     current.run = run;
     run.promise = this.executeRun(target, provider, config, current, run, options.signal).finally(() => {
       // A cancelled entry may already have installed a replacement run.
       if (current.run === run) current.run = undefined;
     });
-    return run.promise;
+    return this.joinRun(run, options.external === true);
+  }
+
+  /**
+   * Wait for an installed run. A caller outside the host lifecycle is remembered
+   * until the run settles, so host selection cannot abort shared work that such
+   * a caller still waits for; a non-external caller joins the run unchanged.
+   */
+  private joinRun(run: Run, external: boolean): Promise<TargetSnapshot> {
+    if (!external) return run.promise;
+    run.externalWaiters++;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      run.externalWaiters = Math.max(0, run.externalWaiters - 1);
+    };
+    return run.promise.finally(release);
   }
 
   /**
@@ -323,17 +346,17 @@ export class UsageMonitor {
   /**
    * Abort host-owned in-flight runs and detach them from their entries, so a
    * replacement refresh starts new work instead of joining the cancelled run.
-   * Work started by an external caller (the headless API) stays joinable for its
-   * owner; shutdown still aborts it.
+   * Work that a caller outside the host lifecycle (the headless API or its
+   * tools) still waits for stays joinable; shutdown still aborts it.
    */
   cancel(): void {
     for (const entry of this.entries.values()) {
       const run = entry.run;
-      if (run !== undefined && !run.external) this.detach(entry, run);
+      if (run !== undefined && run.externalWaiters === 0) this.detach(entry, run);
     }
   }
 
-  /** Abort every in-flight run, including externally owned work. */
+  /** Abort every in-flight run, including externally waited work. */
   private cancelAll(): void {
     for (const entry of this.entries.values()) {
       const run = entry.run;

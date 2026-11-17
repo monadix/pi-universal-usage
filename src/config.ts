@@ -258,3 +258,16 @@ export function providerConfig(config: UsageConfig, providerId: string): Provide
 export function providerEnabled(config: UsageConfig, providerId: string): boolean {
   return providerConfig(config, providerId)?.enabled !== false;
 }
+
+const INVALID_SCHEME_PROBLEM = /\.scheme\b[\s\S]*is not a known scheme/iu;
+
+/**
+ * The rejected scheme name is arbitrary user input: it may contain private text
+ * or delimiters whose boundaries cannot be recovered once interpolated into a
+ * message. Public diagnostics keep the useful reason and drop the value.
+ */
+export function publicConfigProblem(problem: string): string {
+  return INVALID_SCHEME_PROBLEM.test(problem)
+    ? 'a configured provider scheme is not a known scheme; using "auto"'
+    : problem;
+}

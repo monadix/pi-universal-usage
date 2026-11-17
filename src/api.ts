@@ -9,7 +9,7 @@
 import type { Model } from "@earendil-works/pi-ai";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { resolveTarget, type ResolvedTarget, type TargetResolution } from "./auth.ts";
-import { loadConfig, providerEnabled, type UsageConfig } from "./config.ts";
+import { loadConfig, providerEnabled, publicConfigProblem, type UsageConfig } from "./config.ts";
 import { formatDuration } from "./format.ts";
 import { UsageMonitor } from "./monitor.ts";
 import { plainText } from "./text.ts";
@@ -404,9 +404,7 @@ function allRegisteredModels(registry: ModelRegistry): Model<any>[] {
 }
 
 function sanitizeConfigProblem(problem: string, sanitize: (value: string) => string): string {
-  // A rejected scheme is arbitrary user input and may contain private data; the
-  // provider id and reason stay useful without echoing the value.
-  return sanitize(problem).replace(/scheme\s+"[^"]*"/giu, 'scheme "[redacted]"');
+  return sanitize(publicConfigProblem(problem));
 }
 
 class HeadlessUsageClient implements UsageClient {
@@ -442,7 +440,9 @@ class HeadlessUsageClient implements UsageClient {
     return [...providers]
       .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0))
       .map((provider) => ({
-        provider,
+        // Runtime registrations and configuration keys are public IDs at this
+        // boundary; the raw value stays authoritative for state comparisons.
+        provider: plainText(provider),
         enabled: providerEnabled(this.config, provider),
         active: active?.provider === provider,
       }));
