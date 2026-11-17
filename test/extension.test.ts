@@ -2088,7 +2088,10 @@ describe("usage agent tool contracts", { timeout: 5000 }, () => {
       assert.throws(() => validateToolArguments(tool, { type: "toolCall", id: "v", name, arguments: { url: "https://other.invalid" } }));
     }
     const read = usageTool(pi);
-    for (const args of [{ providers: [] }, { refresh: "always" }, { concurrency: 999 }, { auth: "private" }]) {
+    const invalidArgs: Array<Parameters<typeof validateToolArguments>[1]["arguments"]> = [
+      { providers: [] }, { refresh: "always" }, { concurrency: 999 }, { auth: "private" },
+    ];
+    for (const args of invalidArgs) {
       assert.throws(() => validateToolArguments(read, { type: "toolCall", id: "v", name: read.name, arguments: args }));
     }
     for (const refresh of ["cached", "if-needed", "force"]) {
