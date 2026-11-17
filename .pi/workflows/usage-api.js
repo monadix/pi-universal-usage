@@ -48,6 +48,8 @@ let feedback = args.recovery ? args.recovery.feedback :
   'Implement the complete specification and satisfy the independently authored tests. Read ' + specPath + ' and all feature tests.';
 let implementationPasses = args.recovery ? args.recovery.implementationPasses : 0;
 let reviewPasses = args.recovery ? args.recovery.reviewPasses : 0;
+let reviewPending = Boolean(args.recovery && args.recovery.reviewPending);
+if (reviewPending && !evidence.testsPassed) return { status: 'invalid-green-review-checkpoint' };
 const reviewSchema = {
   type: 'object', additionalProperties: false,
   properties: {
@@ -68,23 +70,26 @@ const reviewSchema = {
 };
 // Bounds are checkpoint limits, not acceptance criteria; exhausting one never means completion.
 while (implementationPasses < 16 && reviewPasses < 6) {
-  implementationPasses++;
-  const implemented = await runs.run('implementation-' + implementationPasses, {
-    label: 'Edit implementation pass ' + implementationPasses,
-    agent: 'usage-implementer-opencode', model: 'opencode-go/deepseek-v4.1-flash', cwd,
-    task: common + docs + `\nRead ${specPath}; it is the contract. You are the ONLY production writer. Do not change tests/spec or orchestration. You MUST NOT execute tests, typechecking, validation, inline project code, installs or live requests. Make production edits only and finish; the host gate validates and commits afterwards.\nFeedback:\n${feedback}\nPrior host check results (read referenced full logs for diagnostics):\n${JSON.stringify(evidence)}\nInitial spec author's report:\n${specification.output}`,
-    output: 'reports/implementation-' + implementationPasses + '.md',
-    timeoutMs: 3600000, checkpointBeforeDeadlineMs: 120000,
-    gate: { command: 'node .pi/workflows/usage-api-gate.cjs implementation ' + implementationPasses,
-      output: 'json', timeoutMs: 600000 },
-  });
-  if (!implemented.ok || !implemented.structuredOutput) return { status: 'blocked-implementation', implementationPasses, result: implemented };
-  evidence = implemented.structuredOutput;
-  emit({ stage: 'implementation', pass: implementationPasses, evidence });
-  if (!evidence.testsPassed) {
-    feedback = 'The host-run repository checks failed. Read their full logs, fix the production defects, do not weaken or edit tests, and do not run checks yourself. Make a focused complete fix iteration. Escalate incorrect tests with evidence rather than editing them.';
-    continue;
+  if (!reviewPending) {
+    implementationPasses++;
+    const implemented = await runs.run('implementation-' + implementationPasses, {
+      label: 'Edit implementation pass ' + implementationPasses,
+      agent: 'usage-implementer-opencode', model: 'opencode-go/deepseek-v4.1-flash', cwd,
+      task: common + docs + `\nRead ${specPath}; it is the contract. You are the ONLY production writer. Do not change tests/spec or orchestration. You MUST NOT execute tests, typechecking, validation, inline project code, installs or live requests. Make production edits only and finish; the host gate validates and commits afterwards.\nFeedback:\n${feedback}\nPrior host check results (read referenced full logs for diagnostics):\n${JSON.stringify(evidence)}\nInitial spec author's report:\n${specification.output}`,
+      output: 'reports/implementation-' + implementationPasses + '.md',
+      timeoutMs: 3600000, checkpointBeforeDeadlineMs: 120000,
+      gate: { command: 'node .pi/workflows/usage-api-gate.cjs implementation ' + implementationPasses,
+        output: 'json', timeoutMs: 600000 },
+    });
+    if (!implemented.ok || !implemented.structuredOutput) return { status: 'blocked-implementation', implementationPasses, result: implemented };
+    evidence = implemented.structuredOutput;
+    emit({ stage: 'implementation', pass: implementationPasses, evidence });
+    if (!evidence.testsPassed) {
+      feedback = 'The host-run repository checks failed. Read their full logs, fix the production defects, do not weaken or edit tests, and do not run checks yourself. Make a focused complete fix iteration. Escalate incorrect tests with evidence rather than editing them.';
+      continue;
+    }
   }
+  reviewPending = false;
   reviewPasses++;
   const reviewed = await runs.run('review-' + reviewPasses, {
     label: 'Review quality and correctness pass ' + reviewPasses,
